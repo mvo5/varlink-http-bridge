@@ -1,0 +1,22 @@
+[package]
+name = "varlink-proxy-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+axum = "0.8.8"
+serde_json = "1.0.149"
+tokio = { version = "1.49.0", features = ["full"] }
+varlink = { version = "13.0", features = ["tokio"] }
+varlink_parser = "6.0.0"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["color", "humantime"] }
+argh = "0.1"
+
+[dev-dependencies]
+tempfile = "3.10"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+test-with = { version = "0.14", default-features = false, features = ["runtime"] }
+scopeguard = "1.2"
+gethostname = "1.1.0"
