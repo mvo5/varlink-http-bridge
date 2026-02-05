@@ -60,8 +60,12 @@ $ curl -s http://localhost:8080/info/io.systemd.Hostname/io.systemd.Hostname | j
   ]
 }
 
-$ curl -s -X POST http://localhost:8080/call/io.systemd.Hostname/io.systemd.Hostname.Describe -d {} | jq .StaticHostname
+$ curl -s -H "Content-Type: application/json" -X POST http://localhost:8080/call/io.systemd.Hostname/io.systemd.Hostname.Describe -d {} | jq .StaticHostname
 "top"
+
+# streaming support both with SSE and x-ndjson (more curl/jq firendly) and eventually web sockets
+curl -s -H "Accept: application/x-ndjson" -H "Content-Type: application/json"   http://localhost:8080/call/io.systemd.Multiplexer/io.systemd.UserDatabase.GetUserRecord -d '{"service":"io.systemd.Multiplexer"}'|jq
+
 ```
 
 

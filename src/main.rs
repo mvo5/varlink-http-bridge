@@ -1,10 +1,15 @@
 use anyhow::bail;
 use argh::FromArgs;
+use async_stream::stream;
 use axum::{
     Router,
+    body::Body,
     extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use log::{debug, error};
@@ -190,23 +195,102 @@ async fn route_info_address_interface_get(
     Ok(axum::Json(json!({"method_names": iface.method_keys})))
 }
 
+fn varlink_call_to_sse(
+    mut call: varlink::AsyncMethodCall<Value, Value, varlink::Error>,
+) -> Sse<impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let stream = stream! {
+        loop {
+            match call.recv().await {
+                Ok(reply) => {
+                    let json_str = serde_json::to_string(&reply).unwrap_or_default();
+                    yield Ok::<_, std::convert::Infallible>(Event::default().data(json_str));
+                    if !call.continues() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    use varlink::error::ErrorKind::ConnectionClosed;
+                    if !matches!(e.kind(), ConnectionClosed) {
+                        let error_json = json!({"error": e.to_string()});
+                        yield Ok(Event::default().event("error").data(error_json.to_string()));
+                    }
+                    break;
+                }
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn varlink_call_to_ndjson(
+    mut call: varlink::AsyncMethodCall<Value, Value, varlink::Error>,
+) -> Response {
+    let stream = stream! {
+        loop {
+            match call.recv().await {
+                Ok(reply) => {
+                    let mut json_str = serde_json::to_string(&reply).unwrap_or_default();
+                    json_str.push('\n');
+                    yield Ok::<_, std::convert::Infallible>(json_str);
+                    if !call.continues() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    use varlink::error::ErrorKind::ConnectionClosed;
+                    if !matches!(e.kind(), ConnectionClosed) {
+                        let mut error_json = json!({"error": e.to_string()}).to_string();
+                        error_json.push('\n');
+                        yield Ok(error_json);
+                    }
+                    break;
+                }
+            }
+        }
+    };
+    Response::builder()
+        .header("Content-Type", "application/x-ndjson")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// Call a varlink method.
+/// - Default: returns single JSON response
+/// - With `Accept: text/event-stream`: streams responses as SSE (for browser EventSource)
+/// - With `Accept: application/x-ndjson`: streams responses as newline-delimited JSON
 async fn route_call_post(
     Path((address, method)): Path<(String, String)>,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::Json(call_args): axum::Json<Value>,
-) -> Result<axum::Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     debug!("POST call for address: {address}, method: {method}");
     let connection = get_varlink_connection(&address, &state).await?;
+
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
 
     let mut call = varlink::AsyncMethodCall::<Value, Value, varlink::Error>::new(
         connection, method, call_args,
     );
-    // XXX: handle more and protocol switch
-    // XXX2: switch to websocket right away(?)
-    let reply = call.call().await?;
-    // XXX: we need to check for "more" here in the reply and switch protocol
 
-    Ok(axum::Json(reply))
+    match () {
+        _ if accept.contains("application/x-ndjson") => {
+            call.more()
+                .await
+                .map_err(|e| AppError::bad_gateway(format!("failed to initiate stream: {e}")))?;
+            Ok(varlink_call_to_ndjson(call))
+        }
+        _ if accept.contains("text/event-stream") => {
+            call.more()
+                .await
+                .map_err(|e| AppError::bad_gateway(format!("failed to initiate stream: {e}")))?;
+            Ok(varlink_call_to_sse(call).into_response())
+        }
+        _ => Ok(axum::Json(call.call().await?).into_response()),
+    }
 }
 
 fn create_router(varlink_sockets_dir: String) -> anyhow::Result<Router> {
@@ -280,7 +364,6 @@ async fn main() -> anyhow::Result<()> {
     run_server(cli.varlink_sockets_dir, listener).await
 }
 
-#[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,8 +372,10 @@ mod tests {
     use scopeguard::defer;
     use tokio::task::JoinSet;
 
-    async fn run_test_server() -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
-        let varlink_sockets_dir = "/run/systemd".to_string();
+    async fn run_test_server_with_dir(
+        dir: &str,
+    ) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+        let varlink_sockets_dir = dir.to_string();
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -308,6 +393,11 @@ mod tests {
         (task_handle, local_addr)
     }
 
+    async fn run_test_server() -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+        run_test_server_with_dir("/run/systemd").await
+    }
+
+    #[test_with::path(/run/systemd/io.systemd.Hostname)]
     #[tokio::test]
     async fn test_integration_real_systemd_hostname_post() {
         let (server, local_addr) = run_test_server().await;
@@ -330,6 +420,7 @@ mod tests {
         assert_eq!(body["product"], "systemd (systemd-hostnamed)");
     }
 
+    #[test_with::path(/run/systemd/io.systemd.Hostname)]
     #[tokio::test]
     async fn test_integration_real_systemd_info_address_get() {
         let (server, local_addr) = run_test_server().await;
@@ -349,6 +440,7 @@ mod tests {
         assert_eq!(body["product"], "systemd (systemd-hostnamed)");
     }
 
+    #[test_with::path(/run/systemd/io.systemd.Hostname)]
     #[tokio::test]
     async fn test_integration_real_systemd_info_get() {
         let (server, local_addr) = run_test_server().await;
@@ -373,6 +465,7 @@ mod tests {
         );
     }
 
+    #[test_with::path(/run/systemd/io.systemd.Hostname)]
     #[tokio::test]
     async fn test_integration_real_systemd_info_interface_get() {
         let (server, local_addr) = run_test_server().await;
@@ -395,6 +488,7 @@ mod tests {
         assert_eq!(body.get("method_names").unwrap(), &json!(["Describe"]));
     }
 
+    #[test_with::path(/run/systemd/io.systemd.Hostname)]
     #[tokio::test]
     async fn test_integration_real_systemd_hostname_parallel() {
         let (server, local_addr) = run_test_server().await;
@@ -439,6 +533,91 @@ mod tests {
         assert_eq!(count, NUM_TASKS);
     }
 
+    #[test_with::path(/run/systemd/userdb/io.systemd.Multiplexer)]
+    #[tokio::test]
+    async fn test_integration_real_systemd_userdatabase_post_sse() {
+        let (server, local_addr) = run_test_server_with_dir("/run/systemd/userdb").await;
+        defer! {
+            server.abort();
+        };
+
+        let client = Client::new();
+        let res = client
+            .post(format!(
+                "http://{}/call/io.systemd.Multiplexer/io.systemd.UserDatabase.GetUserRecord",
+                local_addr,
+            ))
+            .header("Accept", "text/event-stream")
+            .json(&json!({"service": "io.systemd.Multiplexer"}))
+            .send()
+            .await
+            .expect("failed to post to test server");
+        assert_eq!(res.status(), 200);
+
+        let body = res.text().await.expect("failed to read response body");
+        let records: Vec<Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|json_str| serde_json::from_str(json_str.trim()).expect("SSE data is not valid JSON"))
+            .collect();
+
+        // GetUserRecord with no filter enumerates users, so we expect multiple streamed records
+        assert!(
+            records.len() > 1,
+            "expected multiple SSE records for user enumeration, got {}",
+            records.len()
+        );
+        // root should always be present
+        assert!(
+            records.iter().any(|r| r["record"]["userName"] == "root"),
+            "expected 'root' user in SSE records"
+        );
+    }
+
+    #[test_with::path(/run/systemd/userdb/io.systemd.Multiplexer)]
+    #[tokio::test]
+    async fn test_integration_real_systemd_userdatabase_post_ndjson() {
+        let (server, local_addr) = run_test_server_with_dir("/run/systemd/userdb").await;
+        defer! {
+            server.abort();
+        };
+
+        let client = Client::new();
+        let res = client
+            .post(format!(
+                "http://{}/call/io.systemd.Multiplexer/io.systemd.UserDatabase.GetUserRecord",
+                local_addr,
+            ))
+            .header("Accept", "application/x-ndjson")
+            .json(&json!({"service": "io.systemd.Multiplexer"}))
+            .send()
+            .await
+            .expect("failed to post to test server");
+        assert_eq!(res.status(), 200);
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "application/x-ndjson"
+        );
+
+        let body = res.text().await.expect("failed to read response body");
+        let records: Vec<Value> = body
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("NDJSON line is not valid JSON"))
+            .collect();
+
+        assert!(
+            records.len() > 1,
+            "expected multiple NDJSON records for user enumeration, got {}",
+            records.len()
+        );
+        assert!(
+            records.iter().any(|r| r["record"]["userName"] == "root"),
+            "expected 'root' user in NDJSON records"
+        );
+    }
+
+    #[test_with::path(/run/systemd/io.systemd.Hostname)]
     #[tokio::test]
     async fn test_error_bad_request_on_malformed_json() {
         let (server, local_addr) = run_test_server().await;
@@ -461,6 +640,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[test_with::path(/run/systemd)]
     #[tokio::test]
     async fn test_error_unknown_varlink_address() {
         let (server, local_addr) = run_test_server().await;
@@ -483,6 +663,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
     }
 
+    #[test_with::path(/run/systemd/io.systemd.Hostname)]
     #[tokio::test]
     async fn test_error_404_for_missing_method() {
         let (server, local_addr) = run_test_server().await;
@@ -504,6 +685,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
+    #[test_with::path(/run/systemd)]
     #[tokio::test]
     async fn test_error_bad_request_for_unclean_address() {
         let (server, local_addr) = run_test_server().await;
@@ -526,6 +708,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[test_with::path(/run/systemd)]
     #[tokio::test]
     async fn test_error_bad_request_for_invalid_chars_in_address() {
         let (server, local_addr) = run_test_server().await;
@@ -548,6 +731,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[test_with::path(/run/systemd)]
     #[tokio::test]
     async fn test_health_endpoint() {
         let (server, local_addr) = run_test_server().await;
@@ -581,6 +765,7 @@ mod tests {
         );
     }
 
+    #[test_with::path(/run/systemd/io.systemd.Hostname)]
     #[tokio::test]
     async fn test_unix_sockets_in_follows_symlinks() {
         let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
