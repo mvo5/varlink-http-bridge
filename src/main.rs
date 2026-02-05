@@ -2,7 +2,10 @@ use anyhow::bail;
 use argh::FromArgs;
 use axum::{
     Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{
+        DefaultBodyLimit, Path, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -201,12 +204,101 @@ async fn route_call_post(
     let mut call = varlink::AsyncMethodCall::<Value, Value, varlink::Error>::new(
         connection, method, call_args,
     );
-    // XXX: handle more and protocol switch
-    // XXX2: switch to websocket right away(?)
     let reply = call.call().await?;
-    // XXX: we need to check for "more" here in the reply and switch protocol
 
     Ok(axum::Json(reply))
+}
+
+/// WebSocket endpoint for streaming varlink calls.
+/// Client sends: {"method": "Interface.Method", "params": {...}, "more": true}
+/// Server responds with: {"response": {...}} for each reply, or {"error": "..."}
+async fn route_ws(
+    Path(address): Path<String>,
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, AppError> {
+    validate_address(&address)?;
+    let varlink_sockets_dir = state.varlink_sockets_dir.clone();
+
+    Ok(ws.on_upgrade(move |socket| handle_ws(socket, address, varlink_sockets_dir)))
+}
+
+fn ws_msg(v: Value) -> Message {
+    Message::Text(v.to_string().into())
+}
+
+async fn ws_varlink_stream(
+    socket: &mut WebSocket,
+    mut call: varlink::AsyncMethodCall<Value, Value, varlink::Error>,
+) {
+    loop {
+        match call.recv().await {
+            Ok(reply) => {
+                let _ = socket.send(ws_msg(json!({"response": reply}))).await;
+            }
+            Err(e) => {
+                use varlink::error::ErrorKind::ConnectionClosed;
+                if !matches!(e.kind(), ConnectionClosed) {
+                    let _ = socket.send(ws_msg(json!({"error": e.to_string()}))).await;
+                }
+                break;
+            }
+        }
+    }
+}
+
+async fn handle_ws(mut socket: WebSocket, address: String, varlink_sockets_dir: String) {
+    let varlink_socket_path = format!("unix:{}/{}", varlink_sockets_dir, address);
+
+    while let Some(Ok(msg)) = socket.recv().await {
+        let Message::Text(text) = msg else {
+            continue;
+        };
+
+        let request: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = socket.send(ws_msg(json!({"error": e.to_string()}))).await;
+                continue;
+            }
+        };
+
+        let method = match request.get("method").and_then(|v| v.as_str()) {
+            Some(m) => m.to_string(),
+            None => {
+                let _ = socket.send(ws_msg(json!({"error": "missing 'method' field"}))).await;
+                continue;
+            }
+        };
+
+        let params = request.get("params").cloned().unwrap_or(Value::Object(Default::default()));
+        let wants_more = request.get("more").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let connection = match varlink::AsyncConnection::with_address(&varlink_socket_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = socket.send(ws_msg(json!({"error": e.to_string()}))).await;
+                continue;
+            }
+        };
+
+        let mut call = varlink::AsyncMethodCall::<Value, Value, varlink::Error>::new(
+            connection, method, params,
+        );
+
+        if wants_more {
+            if let Err(e) = call.more().await {
+                let _ = socket.send(ws_msg(json!({"error": e.to_string()}))).await;
+                continue;
+            }
+            ws_varlink_stream(&mut socket, call).await;
+        } else {
+            match call.call().await {
+                Ok(reply) => { socket.send(ws_msg(json!({"response": reply}))).await.ok(); }
+                Err(e) => { socket.send(ws_msg(json!({"error": e.to_string()}))).await.ok(); }
+            }
+        }
+    }
 }
 
 fn create_router(varlink_sockets_dir: String) -> anyhow::Result<Router> {
@@ -227,6 +319,7 @@ fn create_router(varlink_sockets_dir: String) -> anyhow::Result<Router> {
             get(route_info_address_interface_get),
         )
         .route("/call/{address}/{method}", post(route_call_post))
+        .route("/ws/{address}", get(route_ws))
         // the limit is arbitrary - DO WE NEED IT?
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .with_state(shared_state);
@@ -598,5 +691,37 @@ mod tests {
             "symlinked socket not found, got: {:?}",
             sockets
         );
+    }
+
+    #[tokio::test]
+    async fn test_websocket_single_call() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+
+        let (server, local_addr) = run_test_server().await;
+        defer! {
+            server.abort();
+        };
+
+        let url = format!("ws://{}/ws/io.systemd.Hostname", local_addr);
+        let (mut ws, _) = connect_async(&url).await.expect("failed to connect");
+
+        // Send a single call request
+        let request = json!({
+            "method": "org.varlink.service.GetInfo",
+            "params": {}
+        });
+        ws.send(WsMessage::Text(request.to_string().into()))
+            .await
+            .expect("failed to send");
+
+        // Receive response
+        let msg = ws.next().await.expect("no response").expect("ws error");
+        let WsMessage::Text(text) = msg else {
+            panic!("expected text message");
+        };
+
+        let response: Value = serde_json::from_str(&text).expect("invalid json");
+        assert_eq!(response["response"]["product"], "systemd (systemd-hostnamed)");
     }
 }
