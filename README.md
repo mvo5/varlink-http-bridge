@@ -13,18 +13,22 @@ in the dir as needed.
 
 ```
 POST /call/{method}                    → invoke method (c.f. varlink call, supports ?socket=)
+POST /call/{socket}/{method}           → invoke method on an explicitly given socket
 GET  /sockets                          → list available sockets (c.f. valinkctl list-registry)
 GET  /sockets/{socket}                 → socket info (c.f. varlinkctl info)
 GET  /sockets/{socket}/{interface}     → interface details, including method names (c.f. varlinkctl list-methods)
+GET  /openapi/{socket}/{interface}     → OpenAPI 3.1 description generated from varlink IDL
 
 GET  /health                           → health check
 ```
 
-For `/call`, the socket is derived from the method name by stripping
-the last `.Component` (e.g. `io.systemd.Hostname.Describe` connects
-to socket `io.systemd.Hostname`). The `?socket=` query parameter
-overrides this for cross-interface calls, e.g. to call
+For `/call/{method}`, the socket is derived from the method name by
+stripping the last `.Component` (e.g. `io.systemd.Hostname.Describe`
+connects to socket `io.systemd.Hostname`). The `?socket=` query
+parameter overrides this for cross-interface calls, e.g. to call
 `io.systemd.service.SetLogLevel` on the `io.systemd.Hostname` socket.
+The `/call/{socket}/{method}` form makes the socket explicit instead;
+this is the form the generated OpenAPI descriptions use.
 
 For `/call` the parameters are POSTed as regular JSON.
 

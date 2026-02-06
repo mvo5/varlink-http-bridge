@@ -156,6 +156,10 @@ async fn run_test_server_with_auth(
     varlink_sockets_path: &str,
     authenticators: Vec<Box<dyn Authenticator>>,
 ) -> TestServer<std::net::SocketAddr> {
+    // the logger is process-global and installed once, so leaving it to
+    // individual tests makes debug output depend on execution order
+    init_test_logger();
+
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port failed");
@@ -176,6 +180,19 @@ async fn run_test_server_with_auth(
     });
 
     TestServer { handle, addr }
+}
+
+/// GET the generated `OpenAPI` document for `socket`/`interface`.
+async fn fetch_openapi(addr: std::net::SocketAddr, socket: &str, interface: &str) -> Value {
+    let res = Client::new()
+        .get(format!("http://{addr}/openapi/{socket}/{interface}"))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("failed to get openapi for {socket}/{interface}: {e}"));
+    assert_eq!(res.status(), 200, "GET openapi for {socket}/{interface}");
+    res.json()
+        .await
+        .unwrap_or_else(|e| panic!("invalid openapi json for {socket}/{interface}: {e}"))
 }
 
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
@@ -561,6 +578,56 @@ async fn test_varlink_unix_sockets_in_skips_dangling_symlinks() {
         .await
         .expect("list_sockets should not fail on dangling symlinks");
     assert_eq!(sockets, vec!["io.systemd.Hostname"]);
+}
+
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_integration_real_systemd_openapi_get() {
+    let server = run_test_server("/run/systemd").await;
+
+    let body = fetch_openapi(server.addr, "io.systemd.Hostname", "io.systemd.Hostname").await;
+    assert_eq!(body["openapi"], "3.1.0");
+    assert!(body.get("paths").is_some(), "missing 'paths' key");
+    assert!(body.get("info").is_some(), "missing 'info' key");
+    assert_eq!(body["info"]["title"], "io.systemd.Hostname");
+}
+
+// Guards against the generated document and the router drifting apart:
+// every documented path must be served (may fail for other reasons, but
+// never 404), and calling a documented method must work end to end.
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_integration_openapi_paths_are_routable() {
+    let server = run_test_server("/run/systemd").await;
+
+    let client = Client::new();
+    let doc = fetch_openapi(server.addr, "io.systemd.Hostname", "io.systemd.Hostname").await;
+
+    let paths = doc["paths"].as_object().expect("missing 'paths' object");
+    for path in paths.keys() {
+        let res = client
+            .post(format!("http://{}{path}", server.addr))
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("failed to post to documented path");
+        assert_ne!(res.status(), 404, "documented path '{path}' is not routed");
+    }
+
+    let describe_path = "/call/io.systemd.Hostname/io.systemd.Hostname.Describe";
+    assert!(
+        paths.contains_key(describe_path),
+        "expected '{describe_path}' in generated paths"
+    );
+    let res = client
+        .post(format!("http://{}{describe_path}", server.addr))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("failed to post to documented Describe path");
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.expect("varlink body invalid");
+    assert!(body["Hostname"].as_str().is_some_and(|h| !h.is_empty()));
 }
 
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
@@ -1990,3 +2057,374 @@ mod sshauth_tests {
         assert_hostname_reply(&output);
     }
 } // mod sshauth_tests
+
+// A varlink IDL that exercises all type features: methods with typed
+// input/output, a struct typedef, an enum typedef, an error with
+// parameters, arrays, dicts, optionals, and doc strings.
+const TEST_IDL: &str = "\
+# A test interface
+interface com.example.test
+
+# Status values
+type Status (enabled: bool, tag: ?string)
+
+# Priority levels
+type Priority (low, medium, high)
+
+# Item not found
+error ItemNotFound (id: int)
+
+# Get an item by id
+method GetItem(
+  # The item identifier
+  id: int,
+  options: ?object
+) -> (
+  name: string,
+  score: float,
+  status: Status,
+  tags: []string,
+  metadata: [string]int,
+  mode: (on, off, auto)
+)
+
+# List all items
+# [Supports 'more' flag]
+method ListItems() -> (
+  name: string,
+  id: int
+)
+
+# Watch for item changes
+# [Requires 'more' flag]
+method WatchItems() -> (
+  name: string,
+  event: string
+)
+
+# Count items. Unlike WatchItems this does not use [Requires 'more' flag].
+method CountItems() -> (count: int)
+";
+
+#[test]
+fn test_idl_to_openapi() {
+    let iface: zlink::idl::Interface = TEST_IDL.try_into().expect("failed to parse test IDL");
+    let doc = openapi::idl_to_openapi("com.example.test", &iface);
+
+    // top-level structure
+    assert_eq!(doc["openapi"], "3.1.0");
+    assert_eq!(doc["info"]["title"], "com.example.test");
+    assert_eq!(doc["info"]["version"], "0.0.0");
+    assert_eq!(doc["info"]["description"], "A test interface");
+
+    // paths - one POST for GetItem
+    let path = &doc["paths"]["/call/com.example.test/com.example.test.GetItem"];
+    assert!(path.is_object(), "missing path for GetItem");
+    let post = &path["post"];
+    assert_eq!(post["operationId"], "com.example.test.GetItem");
+    assert_eq!(post["description"], "Get an item by id");
+
+    // request body schema
+    let req_schema = &post["requestBody"]["content"]["application/json"]["schema"];
+    assert_eq!(req_schema["type"], "object");
+    assert_eq!(req_schema["properties"]["id"]["type"], "integer");
+    assert_eq!(req_schema["properties"]["id"]["format"], "int64");
+    assert_eq!(
+        req_schema["properties"]["id"]["description"],
+        "The item identifier"
+    );
+    // `?object` accepts null as well as an object
+    assert_eq!(
+        req_schema["properties"]["options"]["type"],
+        json!(["object", "null"])
+    );
+    // "id" is required, "options" is optional
+    let required: Vec<&str> = req_schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(required.contains(&"id"));
+    assert!(!required.contains(&"options"));
+
+    // response schema: GetItem does NOT support 'more', so no json-seq
+    let resp_content = &post["responses"]["200"]["content"];
+    assert!(
+        resp_content.get("application/json-seq").is_none(),
+        "GetItem should not have json-seq response (no 'more' flag)"
+    );
+    let resp_schema = &resp_content["application/json"]["schema"];
+    assert_eq!(resp_schema["properties"]["name"]["type"], "string");
+    assert_eq!(resp_schema["properties"]["score"]["type"], "number");
+    assert_eq!(
+        resp_schema["properties"]["status"]["$ref"],
+        "#/components/schemas/Status"
+    );
+    // array type
+    assert_eq!(resp_schema["properties"]["tags"]["type"], "array");
+    assert_eq!(resp_schema["properties"]["tags"]["items"]["type"], "string");
+    // dict type
+    assert_eq!(resp_schema["properties"]["metadata"]["type"], "object");
+    assert_eq!(
+        resp_schema["properties"]["metadata"]["additionalProperties"]["type"],
+        "integer"
+    );
+    // inline enum type
+    assert_eq!(resp_schema["properties"]["mode"]["type"], "string");
+    assert_eq!(
+        resp_schema["properties"]["mode"]["enum"],
+        json!(["on", "off", "auto"])
+    );
+
+    // components/schemas - struct typedef
+    let status_schema = &doc["components"]["schemas"]["Status"];
+    assert_eq!(status_schema["type"], "object");
+    assert_eq!(status_schema["description"], "Status values");
+    assert_eq!(status_schema["properties"]["enabled"]["type"], "boolean");
+    assert_eq!(
+        status_schema["properties"]["tag"]["type"],
+        json!(["string", "null"])
+    );
+    // "enabled" required, "tag" optional
+    let status_required: Vec<&str> = status_schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(status_required.contains(&"enabled"));
+    assert!(!status_required.contains(&"tag"));
+
+    // components/schemas - enum typedef
+    let priority_schema = &doc["components"]["schemas"]["Priority"];
+    assert_eq!(priority_schema["type"], "string");
+    assert_eq!(priority_schema["description"], "Priority levels");
+    assert_eq!(priority_schema["enum"], json!(["low", "medium", "high"]));
+
+    // components/schemas - error
+    let error_schema = &doc["components"]["schemas"]["ItemNotFound"];
+    assert_eq!(error_schema["type"], "object");
+    assert_eq!(error_schema["description"], "Item not found");
+    assert_eq!(error_schema["properties"]["id"]["type"], "integer");
+    assert_eq!(error_schema["properties"]["id"]["format"], "int64");
+}
+
+#[test]
+fn test_idl_to_openapi_more_flag() {
+    let iface: zlink::idl::Interface = TEST_IDL.try_into().expect("failed to parse test IDL");
+    let doc = openapi::idl_to_openapi("com.example.test", &iface);
+
+    // ListItems supports 'more', should have both json and json-seq responses
+    let list_path = &doc["paths"]["/call/com.example.test/com.example.test.ListItems"];
+    assert!(list_path.is_object(), "missing path for ListItems");
+    let list_post = &list_path["post"];
+    assert_eq!(list_post["operationId"], "com.example.test.ListItems");
+    // the marker line is stripped from the prose description
+    assert_eq!(list_post["description"], "List all items");
+    let list_resp = &list_post["responses"]["200"]["content"];
+    assert!(
+        list_resp["application/json"]["schema"].is_object(),
+        "ListItems should have json response"
+    );
+    // the streaming note belongs on the Response Object; a Media Type Object
+    // may not carry a description
+    assert!(
+        list_post["responses"]["200"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("RFC 7464"),
+        "streaming response should document RFC 7464 on the response object"
+    );
+    for media_type in ["application/json", "application/json-seq"] {
+        let keys: Vec<&String> = list_resp[media_type].as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            vec!["schema"],
+            "{media_type} media type object must only carry 'schema'"
+        );
+    }
+    assert_eq!(
+        list_resp["application/json-seq"]["schema"], list_resp["application/json"]["schema"],
+        "json-seq and json schemas should match"
+    );
+
+    // WatchItems uses [Requires 'more' flag], should have ONLY json-seq
+    let watch_path = &doc["paths"]["/call/com.example.test/com.example.test.WatchItems"];
+    assert!(watch_path.is_object(), "missing path for WatchItems");
+    let watch_resp = &watch_path["post"]["responses"]["200"]["content"];
+    assert!(
+        watch_resp["application/json-seq"].is_object(),
+        "WatchItems should have json-seq response ([Requires 'more' flag])"
+    );
+    assert!(
+        watch_resp.get("application/json").is_none(),
+        "WatchItems should NOT have plain json response ([Requires 'more' flag])"
+    );
+
+    // CountItems only mentions a marker in prose; that must not count
+    // as a marker line
+    let count_path = &doc["paths"]["/call/com.example.test/com.example.test.CountItems"];
+    assert!(count_path.is_object(), "missing path for CountItems");
+    let count_resp = &count_path["post"]["responses"]["200"]["content"];
+    assert!(
+        count_resp["application/json"]["schema"].is_object(),
+        "CountItems should have json response (marker only mentioned in prose)"
+    );
+    assert!(
+        count_resp.get("application/json-seq").is_none(),
+        "CountItems should NOT have json-seq response (marker only mentioned in prose)"
+    );
+}
+
+// Optional fields arrive as an explicit JSON null rather than a missing key,
+// so every `?T` has to widen to accept null.
+const NULLABLE_IDL: &str = "\
+interface com.example.nullable
+
+type Inner (a: int)
+
+method Get() -> (
+  plain: ?string,
+  custom: ?Inner,
+  choice: ?(on, off),
+  anything: ?any,
+  list: []?string,
+  dict: [string]?int
+)
+";
+
+#[test]
+fn test_idl_to_openapi_nullable() {
+    let iface: zlink::idl::Interface = NULLABLE_IDL.try_into().expect("failed to parse test IDL");
+    let doc = openapi::idl_to_openapi("com.example.nullable", &iface);
+
+    let props = &doc["paths"]["/call/com.example.nullable/com.example.nullable.Get"]["post"]["responses"]
+        ["200"]["content"]["application/json"]["schema"]["properties"];
+
+    // plain scalar widens its type
+    assert_eq!(props["plain"]["type"], json!(["string", "null"]));
+
+    // a $ref cannot carry a sibling type, so null becomes an alternative
+    assert_eq!(
+        props["custom"],
+        json!({"anyOf": [{"$ref": "#/components/schemas/Inner"}, {"type": "null"}]})
+    );
+
+    // an enum has to list null as an allowed value too
+    assert_eq!(props["choice"]["type"], json!(["string", "null"]));
+    assert_eq!(props["choice"]["enum"], json!(["on", "off", null]));
+
+    // `any` already accepts null
+    assert_eq!(props["anything"], json!({}));
+
+    // nullability inside containers is preserved
+    assert_eq!(props["list"]["items"]["type"], json!(["string", "null"]));
+    assert_eq!(
+        props["dict"]["additionalProperties"]["type"],
+        json!(["integer", "null"])
+    );
+}
+
+// ?socket= belongs to the other /call route; on the explicit-socket route it
+// is rejected rather than silently ignored, whatever it points at.
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_integration_call_socket_rejects_query_param() {
+    let server = run_test_server("/run/systemd").await;
+    let client = Client::new();
+
+    for socket in ["io.systemd.Login", "io.systemd.Hostname"] {
+        let res = client
+            .post(format!(
+                "http://{}/call/io.systemd.Hostname/io.systemd.Hostname.Describe?socket={socket}",
+                server.addr,
+            ))
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("failed to post to test server");
+        assert_eq!(res.status(), 400, "?socket={socket} should be rejected");
+    }
+
+    // without the query parameter the same call succeeds
+    let res = client
+        .post(format!(
+            "http://{}/call/io.systemd.Hostname/io.systemd.Hostname.Describe",
+            server.addr,
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("failed to post to test server");
+    assert_eq!(res.status(), 200);
+}
+
+#[test_with::path(/run/varlink/registry/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_integration_openapi_no_more_flag() {
+    let server = run_test_server("/run/varlink/registry").await;
+
+    let res = fetch_openapi(server.addr, "io.systemd.Hostname", "io.systemd.Hostname").await;
+
+    let describe = &res["paths"]["/call/io.systemd.Hostname/io.systemd.Hostname.Describe"]["post"];
+    let content = &describe["responses"]["200"]["content"];
+    assert!(
+        content["application/json"]["schema"].is_object(),
+        "Describe should have json response"
+    );
+    assert!(
+        content.get("application/json-seq").is_none(),
+        "Describe should NOT have json-seq response (no 'more' flag)"
+    );
+}
+
+#[test_with::path(/run/varlink/registry/io.systemd.UserDatabase)]
+#[tokio::test]
+async fn test_integration_openapi_supports_more_flag() {
+    let server = run_test_server("/run/varlink/registry").await;
+
+    let res = fetch_openapi(
+        server.addr,
+        "io.systemd.UserDatabase",
+        "io.systemd.UserDatabase",
+    )
+    .await;
+
+    let get_user = &res["paths"]["/call/io.systemd.UserDatabase/io.systemd.UserDatabase.GetUserRecord"]
+        ["post"];
+    let content = &get_user["responses"]["200"]["content"];
+    assert!(
+        content["application/json"]["schema"].is_object(),
+        "GetUserRecord should have json response (supports 'more')"
+    );
+    assert!(
+        content["application/json-seq"].is_object(),
+        "GetUserRecord should have json-seq response (supports 'more')"
+    );
+}
+
+#[test_with::path(/run/varlink/registry/io.systemd.MachineImage)]
+#[tokio::test]
+async fn test_integration_openapi_requires_more_flag() {
+    let server = run_test_server("/run/varlink/registry").await;
+
+    let res = fetch_openapi(
+        server.addr,
+        "io.systemd.MachineImage",
+        "io.systemd.MachineImage",
+    )
+    .await;
+
+    let clean_pool =
+        &res["paths"]["/call/io.systemd.MachineImage/io.systemd.MachineImage.CleanPool"]["post"];
+    let content = &clean_pool["responses"]["200"]["content"];
+    assert!(
+        content["application/json-seq"].is_object(),
+        "CleanPool should have json-seq response (requires 'more')"
+    );
+    assert!(
+        content.get("application/json").is_none(),
+        "CleanPool should NOT have json response (requires 'more')"
+    );
+}

@@ -38,6 +38,7 @@ use zlink::varlink_service::Proxy;
 mod auth_ssh;
 #[cfg(feature = "sshauth")]
 mod import_ssh;
+mod openapi;
 mod ws_framing;
 
 use ws_framing::VarlinkFramer;
@@ -660,6 +661,64 @@ struct AppState {
     authenticators: Arc<Vec<Box<dyn Authenticator>>>,
 }
 
+/// The IDL of one interface, as fetched from a varlink socket.
+///
+/// A parsed [`zlink::idl::Interface`] borrows from the IDL text, so fetching
+/// and parsing cannot collapse into a single call. Holding the unparsed text
+/// in its own type keeps the two halves and their error mapping together.
+struct InterfaceIdl(zlink::varlink_service::InterfaceDescription<'static>);
+
+impl InterfaceIdl {
+    /// Fetch the IDL of `interface` from `socket`.
+    ///
+    /// The connection guard is dropped before returning: the IDL is owned, so
+    /// parsing it needs no connection and must not keep other callers of the
+    /// same socket waiting.
+    async fn fetch(
+        socket: &str,
+        interface: &str,
+        state: &AppState,
+        conn_cache: &VarlinkConnCache,
+    ) -> Result<Self, AppError> {
+        let conn_arc = get_varlink_connection(socket, state, conn_cache).await?;
+        let mut connection = conn_arc.lock().await;
+
+        let description = connection
+            .get_interface_description(interface)
+            .await?
+            .map_err(|e| AppError::bad_gateway(format!("service error: {e}")))?;
+        Ok(Self(description))
+    }
+
+    fn parse(&self) -> Result<zlink::idl::Interface<'_>, AppError> {
+        self.0
+            .parse()
+            .map_err(|e| AppError::bad_gateway(format!("upstream IDL parse error: {e}")))
+    }
+}
+
+async fn route_openapi_get(
+    ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
+    Path((socket, interface)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<axum::Json<Value>, AppError> {
+    debug!("GET openapi for socket: {socket}, interface: {interface}");
+    let idl = InterfaceIdl::fetch(&socket, &interface, &state, &conn_cache).await?;
+    let iface = idl.parse()?;
+
+    // the title and every generated path come from the returned description,
+    // so a service that ignores the requested name would hand out a document
+    // for a different API with nothing to indicate it
+    if iface.name() != interface {
+        return Err(AppError::bad_gateway(format!(
+            "upstream described interface '{}' but '{interface}' was requested",
+            iface.name()
+        )));
+    }
+
+    Ok(axum::Json(openapi::idl_to_openapi(&socket, &iface)))
+}
+
 async fn route_sockets_get(State(state): State<AppState>) -> Result<axum::Json<Value>, AppError> {
     debug!("GET sockets");
     let all_sockets = state.varlink_sockets.list_sockets().await?;
@@ -688,17 +747,8 @@ async fn route_socket_interface_get(
     State(state): State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
     debug!("GET socket: {socket}, interface: {interface}");
-    let conn_arc = get_varlink_connection(&socket, &state, &conn_cache).await?;
-    let mut connection = conn_arc.lock().await;
-
-    let description = connection
-        .get_interface_description(&interface)
-        .await?
-        .map_err(|e| AppError::bad_gateway(format!("service error: {e}")))?;
-
-    let iface = description
-        .parse()
-        .map_err(|e| AppError::bad_gateway(format!("upstream IDL parse error: {e}")))?;
+    let idl = InterfaceIdl::fetch(&socket, &interface, &state, &conn_cache).await?;
+    let iface = idl.parse()?;
 
     let method_names: Vec<&str> = iface.methods().map(zlink::idl::Method::name).collect();
     Ok(axum::Json(json!({"method_names": method_names})))
@@ -741,11 +791,48 @@ fn varlink_call_to_jsonseq(
         .unwrap()
 }
 
-/// Call a varlink method.
+/// Call a varlink method on the given socket.
 ///
 /// - Default: single JSON response via varlink `call`
 /// - `Accept: application/json-seq`: stream replies via varlink `more`
 ///   as a JSON text sequence (RFC 7464)
+async fn call_varlink_method(
+    socket: &str,
+    method: &str,
+    state: &AppState,
+    conn_cache: &VarlinkConnCache,
+    headers: &axum::http::HeaderMap,
+    call_args: &HashMap<String, Value>,
+) -> Result<Response, AppError> {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+
+    let method_call = DynMethod {
+        method,
+        parameters: Some(call_args),
+    };
+
+    let conn_arc = get_varlink_connection(socket, state, conn_cache).await?;
+    let mut connection = conn_arc.lock_owned().await;
+    if accept.contains("application/json-seq") {
+        connection
+            .send_call(&zlink::Call::new(&method_call).set_more(true), vec![])
+            .await?;
+        Ok(varlink_call_to_jsonseq(connection))
+    } else {
+        connection
+            .call_method::<_, DynReply, DynReplyError>(&method_call.into(), vec![])
+            .await?
+            .0
+            .map(|r| r.into_parameters().unwrap_or_default().into_response())
+            .map_err(AppError::from)
+    }
+}
+
+/// Call a varlink method, deriving the socket from the method's
+/// interface prefix unless overridden via `?socket=`.
 async fn route_call_post(
     ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
     Path(method): Path<String>,
@@ -770,31 +857,30 @@ async fn route_call_post(
             .to_string()
     };
 
-    let accept = headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+    call_varlink_method(&socket, &method, &state, &conn_cache, &headers, &call_args).await
+}
 
-    let method_call = DynMethod {
-        method: &method,
-        parameters: Some(&call_args),
-    };
+/// Call a varlink method with the socket given explicitly in the path.
+/// This is the form the generated `OpenAPI` documents use.
+async fn route_call_socket_post(
+    ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
+    Path((socket, method)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::Json(call_args): axum::Json<HashMap<String, Value>>,
+) -> Result<Response, AppError> {
+    debug!("POST call for socket: {socket}, method: {method}");
 
-    let conn_arc = get_varlink_connection(&socket, &state, &conn_cache).await?;
-    let mut connection = conn_arc.lock_owned().await;
-    if accept.contains("application/json-seq") {
-        connection
-            .send_call(&zlink::Call::new(&method_call).set_more(true), vec![])
-            .await?;
-        Ok(varlink_call_to_jsonseq(connection))
-    } else {
-        connection
-            .call_method::<_, DynReply, DynReplyError>(&method_call.into(), vec![])
-            .await?
-            .0
-            .map(|r| r.into_parameters().unwrap_or_default().into_response())
-            .map_err(AppError::from)
+    // `?socket=` is the override for the other /call route and has no meaning
+    // here; accepting it would suggest it does something
+    if params.contains_key("socket") {
+        return Err(AppError::bad_request(
+            "?socket= is not supported here, the socket is already given in the path",
+        ));
     }
+
+    call_varlink_method(&socket, &method, &state, &conn_cache, &headers, &call_args).await
 }
 
 async fn route_ws(
@@ -918,7 +1004,9 @@ fn create_router(
             "/sockets/{socket}/{interface}",
             get(route_socket_interface_get),
         )
+        .route("/openapi/{socket}/{interface}", get(route_openapi_get))
         .route("/call/{method}", post(route_call_post))
+        .route("/call/{socket}/{method}", post(route_call_socket_post))
         .route("/ws/sockets/{socket}", get(route_ws))
         .layer(axum::middleware::from_fn_with_state(
             shared_state.clone(),
