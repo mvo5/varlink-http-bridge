@@ -28,8 +28,25 @@ overrides this for cross-interface calls, e.g. to call
 
 For `/call` the parameters are POSTed as regular JSON.
 
+### Websocket support
 
-## Examples
+```
+GET  /ws/sockets/{socket}              → transparent varlink-over-websocket proxy
+```
+
+The websocket endpoint is a transparent proxy that forwards raw bytes
+between the websocket and the varlink unix socket in both directions.
+Clients are expected to speak raw varlink wire protocol.
+
+This makes the bridge compatible with libvarlink `varlink --brige`
+via `websocat --binary`, enabling full varlink features (including
+`--more`) over the network.
+
+
+## Examples (curl)
+
+Using curl for direct calls is usually more convenient/ergonimic than
+using the websocket endpoint.
 
 ```console
 $ systemd-run --user ./target/debug/varlink-http-bridge
@@ -88,6 +105,58 @@ $ curl -s -X POST http://localhost:8080/call/org.varlink.service.GetInfo?socket=
   "url": "https://systemd.io/",
   "vendor": "The systemd Project",
   "version": "259 (259-1)"
+}
+
+```
+
+### Examples (websocket)
+
+The examples use websocat because curl for websockets support is relatively new and
+still a bit cumbersome to use.
+
+```console
+$ cargo install websocat
+...
+
+# call via websocat: note that this is the raw procotol so the result is wrapped in "paramters"
+# note that the reply also contains the raw \0 so we filter them
+$ printf '{"method":"io.systemd.Hostname.Describe","parameters":{}}\0' | websocat ws://localhost:8080/ws/sockets/io.systemd.Hostname | tr -d '\0' | jq
+{
+  "parameters": {
+    "Hostname": "top",
+...
+
+# io.systemd.Unit.List streams the output
+$ printf '{"method":"io.systemd.Unit.List","parameters":{}, "more": true}\0' | websocat  --no-close  ws://localhost:8080/ws/sockets/io.systemd.Manager| tr -d '\0' | jq
+{
+  "parameters": {
+    "context": {
+      "Type": "device",
+...
+
+# and user records come via "continues": true
+$ printf '{"method":"io.systemd.UserDatabase.GetUserRecord", "parameters": {"service":"io.systemd.Multiplexer"}, "more": true}\0' | websocat --no-close ws://localhost:8080/ws/sockets/io.systemd.Multiplexer | tr '\0' '\n'|jq
+{
+  "parameters": {
+    "record": {
+      "userName": "root",
+      "uid": 0,
+      "gid": 0,
+...
+
+# libvarlink bridge mode gives full varlink CLI support over the network
+# TODO: extend varlinkctl to support something similar (exec:cmd is a bit too limited right now)
+$ varlink --bridge "websocat --binary ws://localhost:8080/ws/sockets/io.systemd.Hostname" info
+Vendor: The systemd Project
+Product: systemd (systemd-hostnamed)
+...
+
+$ varlink --bridge "websocat --binary ws://localhost:8080/ws/sockets/io.systemd.Hostname" \
+    call io.systemd.Hostname.Describe
+{
+  "Hostname": "top",
+  "StaticHostname": "top",
+  ...
 }
 
 ```

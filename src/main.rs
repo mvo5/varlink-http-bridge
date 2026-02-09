@@ -2,18 +2,21 @@ use anyhow::bail;
 use argh::FromArgs;
 use axum::{
     Router,
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use log::{debug, error};
+use log::{debug, error, warn};
 use regex_lite::Regex;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::os::unix::fs::FileTypeExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UnixStream};
 use tokio::signal;
 use varlink_parser::IDL;
 
@@ -207,12 +210,140 @@ async fn route_call_post(
     let mut call = varlink::AsyncMethodCall::<Value, Value, varlink::Error>::new(
         connection, method, call_args,
     );
-    // XXX: handle more and protocol switch
-    // XXX2: switch to websocket right away(?)
     let reply = call.call().await?;
-    // XXX: we need to check for "more" here in the reply and switch protocol
 
     Ok(axum::Json(reply))
+}
+
+async fn route_ws(
+    Path(varlink_socket): Path<String>,
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, AppError> {
+    // Validate before upgrade so we can return a proper HTTP 400
+    if !varlink_interface_name_is_valid(&varlink_socket) {
+        return Err(AppError::bad_request(format!(
+            "invalid socket name (must be a valid varlink interface name): {varlink_socket}"
+        )));
+    }
+
+    let unix_path = format!("{}/{}", state.varlink_sockets_dir, varlink_socket);
+    // Connect eagerly so connection failures return proper HTTP errors
+    let varlink_socket = UnixStream::connect(&unix_path)
+        .await
+        .map_err(|e| AppError::bad_gateway(format!("cannot connect to {unix_path}: {e}")))?;
+
+    Ok(ws.on_upgrade(move |ws_socket| handle_ws(ws_socket, varlink_socket)))
+}
+
+// Forwards raw bytes between the websocket and the varlink unix
+// socket in both directions. Each NUL-delimited varlink message is
+// sent as one WS binary frame. Once a protocol upgrade happens this is
+// dropped and its just a raw byte stream.
+async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
+    let (unix_read, mut unix_write) = tokio::io::split(unix);
+    let mut unix_reader = tokio::io::BufReader::new(unix_read);
+    let (varlink_msg_tx, mut varlink_msg_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+    // the complexity here is a bit ugly but without it the websocket is very hard
+    // to use from tools like "websocat" which will add a \n or \0 after each "message"
+    let varlink_connection_upgraded = Arc::new(AtomicBool::new(false));
+
+    // read_until is not cancel-safe, so run it in a separate task and we need read_until
+    // to ensure we keep the \0 boundaries and send these via a varlink_msg channel.
+    //
+    // After a varlink protocol upgrade the connection carries raw bytes without \0
+    // delimiters, so the reader switches to plain read() once "upgraded" is set.
+    let reader_task = tokio::spawn({
+        let varlink_connection_upgraded = varlink_connection_upgraded.clone();
+        async move {
+            loop {
+                let mut buf = Vec::new();
+                let res = if varlink_connection_upgraded.load(Ordering::Relaxed) {
+                    buf.reserve(8192);
+                    unix_reader.read_buf(&mut buf).await
+                } else {
+                    unix_reader.read_until(0, &mut buf).await
+                };
+                match res {
+                    Err(e) => {
+                        warn!("varlink read error: {e}");
+                        break;
+                    }
+                    Ok(0) => {
+                        debug!("varlink socket closed (read returned 0)");
+                        break;
+                    }
+                    Ok(_) => {
+                        if varlink_msg_tx.send(buf).await.is_err() {
+                            warn!("varlink_msg channel closed, ws gone?");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            ws_msg = ws.recv() => {
+                let Some(Ok(msg)) = ws_msg else {
+                    debug!("ws.recv() returned None or error, client disconnected");
+                    break;
+                };
+                let data = match msg {
+                    Message::Binary(bin) => {
+                        debug!("ws recv binary: {} bytes", bin.len());
+                        bin.to_vec()
+                    }
+                    Message::Text(text) => {
+                        debug!("ws recv text: {} bytes", text.len());
+                        text.as_bytes().to_vec()
+                    }
+                    Message::Close(frame) => {
+                        debug!("ws recv close frame: {frame:?}");
+                        break;
+                    }
+                    other => {
+                        debug!("ws recv other: {other:?}");
+                        continue;
+                    }
+                };
+                // Detect varlink protocol upgrade request
+                if !varlink_connection_upgraded.load(Ordering::Relaxed) {
+                    let json_bytes = data.strip_suffix(&[0]).unwrap_or(&data);
+                    match serde_json::from_slice::<Value>(json_bytes) {
+                        Ok(v) => {
+                            if v.get("upgrade").and_then(Value::as_bool).unwrap_or(false) {
+                                debug!("varlink protocol upgrade detected");
+                                varlink_connection_upgraded.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("failed to parse ws message as JSON for upgrade detection: {e}");
+                        }
+                    }
+                }
+                if let Err(e) = unix_write.write_all(&data).await {
+                    warn!("varlink write error: {e}");
+                    break;
+                }
+            }
+            Some(data) = varlink_msg_rx.recv() => {
+                if let Err(e) = ws.send(Message::Binary(data.into())).await {
+                    warn!("ws send error: {e}");
+                    break;
+                }
+            }
+            else => {
+                debug!("select: all branches closed");
+                break;
+            }
+        }
+    }
+    debug!("handle_ws loop exited");
+
+    reader_task.abort();
 }
 
 fn create_router(varlink_sockets_dir: String) -> anyhow::Result<Router> {
@@ -232,6 +363,7 @@ fn create_router(varlink_sockets_dir: String) -> anyhow::Result<Router> {
             get(route_socket_interface_get),
         )
         .route("/call/{method}", post(route_call_post))
+        .route("/ws/sockets/{socket}", get(route_ws))
         // the limit is arbitrary - DO WE NEED IT?
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .with_state(shared_state);
