@@ -17,6 +17,8 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use varlink_parser::IDL;
 
+mod auth;
+
 #[derive(Debug)]
 struct AppError {
     status: StatusCode,
@@ -215,7 +217,10 @@ async fn route_call_post(
     Ok(axum::Json(reply))
 }
 
-fn create_router(varlink_sockets_dir: String) -> anyhow::Result<Router> {
+fn create_router(
+    varlink_sockets_dir: String,
+    authenticator: Option<Arc<dyn auth::Authenticator>>,
+) -> anyhow::Result<Router> {
     if !std::path::Path::new(&varlink_sockets_dir).is_dir() {
         bail!("path {varlink_sockets_dir} is not a directory");
     }
@@ -231,7 +236,18 @@ fn create_router(varlink_sockets_dir: String) -> anyhow::Result<Router> {
             "/sockets/{socket}/{interface}",
             get(route_socket_interface_get),
         )
-        .route("/call/{method}", post(route_call_post))
+        .route("/call/{method}", post(route_call_post));
+
+    let app = if let Some(auth) = authenticator {
+        app.layer(axum::middleware::from_fn(move |req, next| {
+            let auth = auth.clone();
+            auth::basic_auth_middleware(req, next, auth)
+        }))
+    } else {
+        app
+    };
+
+    let app = app
         // the limit is arbitrary - DO WE NEED IT?
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .with_state(shared_state);
@@ -244,8 +260,12 @@ async fn shutdown_signal() {
     println!("Shutdown signal received, stopping server...");
 }
 
-async fn run_server(varlink_sockets_dir: String, listener: TcpListener) -> anyhow::Result<()> {
-    let app = create_router(varlink_sockets_dir)?;
+async fn run_server(
+    varlink_sockets_dir: String,
+    listener: TcpListener,
+    authenticator: Option<Arc<dyn auth::Authenticator>>,
+) -> anyhow::Result<()> {
+    let app = create_router(varlink_sockets_dir, authenticator)?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -261,6 +281,10 @@ struct Cli {
     #[argh(option, default = "String::from(\"127.0.0.1:8080\")")]
     bind: String,
 
+    /// authentication mode: "basic-pam" (PAM, requires root) or "insecure" (accepts anything)
+    #[argh(option)]
+    auth: Option<String>,
+
     /// varlink unix socket dir to proxy, contains the sockets or symlinks to sockets
     #[argh(positional, default = "String::from(\"/run/systemd/registry\")")]
     varlink_sockets_dir: String,
@@ -274,6 +298,19 @@ async fn main() -> anyhow::Result<()> {
     // not using "clap" crate as it adds 600kb even with minimal settings
     let cli: Cli = argh::from_env();
 
+    let authenticator: Option<Arc<dyn auth::Authenticator>> = match cli.auth.as_deref() {
+        Some("basic-pam") => {
+            println!("🔐 PAM Basic authentication enabled");
+            Some(Arc::new(auth::PamAuthenticator::new("login")))
+        }
+        Some("insecure") => {
+            println!("⚠️  Insecure authentication enabled (accepts any credentials)");
+            Some(Arc::new(auth::InsecureAuthenticator))
+        }
+        Some(other) => bail!("unknown --auth mode: {other} (expected \"basic-pam\" or \"insecure\")"),
+        None => None,
+    };
+
     let listener = TcpListener::bind(&cli.bind).await?;
     let local_addr = listener.local_addr()?;
 
@@ -282,7 +319,7 @@ async fn main() -> anyhow::Result<()> {
         "🔗 Forwarding HTTP {} -> Varlink dir: {}",
         local_addr, &cli.varlink_sockets_dir
     );
-    run_server(cli.varlink_sockets_dir, listener).await
+    run_server(cli.varlink_sockets_dir, listener, authenticator).await
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ async fn run_test_server() -> (tokio::task::JoinHandle<()>, std::net::SocketAddr
         .expect("failed to extract local address");
 
     let task_handle = tokio::spawn(async {
-        run_server(varlink_sockets_dir, listener)
+        run_server(varlink_sockets_dir, listener, None)
             .await
             .expect("server failed")
     });
@@ -354,7 +354,7 @@ async fn test_varlink_sockets_dir_missing() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port failed");
-    let res = run_server(varlink_sockets_dir, listener).await;
+    let res = run_server(varlink_sockets_dir, listener, None).await;
 
     assert!(res.is_err());
     assert_eq!(
