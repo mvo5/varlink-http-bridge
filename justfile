@@ -1,7 +1,7 @@
 binary := "target/release/varlink-http-bridge"
 # max_size_kb is a bit arbitrary but it should ensure we don't increase size too much
-# without noticing (currently at 2.8Mb)
-max_size := "3 * 1024 * 1024"
+# without noticing (currently at 3.2MB)
+max_size := "4 * 1024 * 1024"
 
 check: check_binary_size
 	cargo fmt --check
