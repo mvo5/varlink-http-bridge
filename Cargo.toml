@@ -25,3 +25,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 test-with = { version = "0.14", default-features = false, features = ["runtime"] }
 scopeguard = "1.2"
 gethostname = "1.1.0"
+tower = { version = "0.5", features = ["util"] }

@@ -2,12 +2,16 @@ use anyhow::bail;
 use argh::FromArgs;
 use axum::{
     Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
+    extract::connect_info::Connected,
     http::StatusCode,
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
+    serve::IncomingStream,
 };
 use log::{debug, error};
+use openssl::nid::Nid;
 use regex_lite::Regex;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -78,6 +82,114 @@ impl From<std::io::Error> for AppError {
     }
 }
 
+// -- Connection info & authentication ---
+
+#[derive(Clone, Debug)]
+struct ConnectionInfo {
+    remote_addr: std::net::SocketAddr,
+    /// DER-encoded peer certificate, None for plain TCP or no client cert
+    peer_cert_der: Option<Vec<u8>>,
+}
+
+impl Connected<IncomingStream<'_, TlsListener>> for ConnectionInfo {
+    fn connect_info(stream: IncomingStream<'_, TlsListener>) -> Self {
+        let peer_cert_der = stream
+            .io()
+            .ssl()
+            .peer_certificate()
+            .and_then(|cert| cert.to_der().ok());
+        ConnectionInfo {
+            remote_addr: *stream.remote_addr(),
+            peer_cert_der,
+        }
+    }
+}
+
+impl Connected<IncomingStream<'_, TcpListener>> for ConnectionInfo {
+    fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
+        ConnectionInfo {
+            remote_addr: *stream.remote_addr(),
+            peer_cert_der: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Identity {
+    subject_cn: String,
+    #[allow(dead_code)]
+    cert_der: Vec<u8>,
+}
+
+trait Authenticator: Send + Sync + 'static {
+    /// Ok(Some(id)) = authenticated, Ok(None) = not applicable, Err = reject
+    fn authenticate(
+        &self,
+        conn_info: &ConnectionInfo,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<Option<Identity>, Response>;
+}
+
+/// Authenticates clients by extracting the CN from a peer certificate.
+///
+/// This authenticator does NOT verify the certificate signature — it relies on
+/// OpenSSL having already validated the cert against the configured CA during the
+/// TLS handshake (see `load_tls_acceptor`). It must only be used behind a TLS
+/// listener with `set_ca_file` / `SslVerifyMode::PEER` configured.
+struct ClientCertAuthenticator;
+
+impl Authenticator for ClientCertAuthenticator {
+    fn authenticate(
+        &self,
+        conn_info: &ConnectionInfo,
+        _headers: &axum::http::HeaderMap,
+    ) -> Result<Option<Identity>, Response> {
+        let Some(cert_der) = &conn_info.peer_cert_der else {
+            return Ok(None);
+        };
+        let cert = openssl::x509::X509::from_der(cert_der).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid client certificate: {e}"),
+            )
+                .into_response()
+        })?;
+        let cn = cert
+            .subject_name()
+            .entries_by_nid(Nid::COMMONNAME)
+            .next()
+            .and_then(|entry| entry.data().as_utf8().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        Ok(Some(Identity {
+            subject_cn: cn,
+            cert_der: cert_der.clone(),
+        }))
+    }
+}
+
+async fn auth_middleware(
+    ConnectInfo(conn_info): ConnectInfo<ConnectionInfo>,
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, Response> {
+    if state.authenticators.is_empty() {
+        return Ok(next.run(request).await);
+    }
+    for auth in state.authenticators.iter() {
+        match auth.authenticate(&conn_info, request.headers()) {
+            Ok(Some(identity)) => {
+                request.extensions_mut().insert(identity);
+                return Ok(next.run(request).await);
+            }
+            Ok(None) => continue,
+            Err(resp) => return Err(resp),
+        }
+    }
+    Err((StatusCode::UNAUTHORIZED, "authentication required").into_response())
+}
+
 // see https://varlink.org/Interface-Definition (interface_name there)
 fn varlink_interface_name_is_valid(name: &str) -> bool {
     static RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -108,6 +220,7 @@ struct AppState {
     // this is cloned for each request so we could use Arc<str> here but its a tiny str
     // so the extra clone is fine
     varlink_sockets_dir: String,
+    authenticators: Arc<Vec<Box<dyn Authenticator>>>,
 }
 
 async fn varlink_unix_sockets_in(varlink_sockets_dir: &str) -> Result<Vec<String>, AppError> {
@@ -275,22 +388,25 @@ fn load_tls_acceptor(
 
     if let Some(ca_path) = client_ca_path {
         builder.set_ca_file(ca_path)?;
-        builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        builder.set_verify(SslVerifyMode::PEER);
     }
 
     Ok(builder.build())
 }
 
-fn create_router(varlink_sockets_dir: String) -> anyhow::Result<Router> {
+fn create_router(
+    varlink_sockets_dir: String,
+    authenticators: Vec<Box<dyn Authenticator>>,
+) -> anyhow::Result<Router> {
     if !std::path::Path::new(&varlink_sockets_dir).is_dir() {
         bail!("path {varlink_sockets_dir} is not a directory");
     }
     let shared_state = AppState {
         varlink_sockets_dir,
+        authenticators: Arc::new(authenticators),
     };
 
-    let app = Router::new()
-        .route("/health", get(|| async { StatusCode::OK }))
+    let api_routes = Router::new()
         .route("/sockets", get(route_sockets_get))
         .route("/sockets/{socket}", get(route_socket_get))
         .route(
@@ -298,6 +414,14 @@ fn create_router(varlink_sockets_dir: String) -> anyhow::Result<Router> {
             get(route_socket_interface_get),
         )
         .route("/call/{method}", post(route_call_post))
+        .route_layer(axum::middleware::from_fn_with_state(
+            shared_state.clone(),
+            auth_middleware,
+        ));
+
+    let app = Router::new()
+        .route("/health", get(|| async { StatusCode::OK }))
+        .merge(api_routes)
         // the limit is arbitrary - DO WE NEED IT?
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .with_state(shared_state);
@@ -314,21 +438,28 @@ async fn run_server(
     varlink_sockets_dir: String,
     listener: TcpListener,
     tls_acceptor: Option<openssl::ssl::SslAcceptor>,
+    authenticators: Vec<Box<dyn Authenticator>>,
 ) -> anyhow::Result<()> {
-    let app = create_router(varlink_sockets_dir)?;
+    let app = create_router(varlink_sockets_dir, authenticators)?;
 
     if let Some(acceptor) = tls_acceptor {
         let tls_listener = TlsListener {
             inner: listener,
             acceptor,
         };
-        axum::serve(tls_listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        axum::serve(
+            tls_listener,
+            app.into_make_service_with_connect_info::<ConnectionInfo>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     } else {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<ConnectionInfo>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     }
 
     Ok(())
@@ -353,6 +484,10 @@ struct Cli {
     /// path to CA certificate PEM file for client certificate verification (mTLS)
     #[argh(option)]
     tls_client_ca: Option<String>,
+
+    /// allow running without any authentication (DANGEROUS)
+    #[argh(switch)]
+    insecure: bool,
 
     /// varlink unix socket dir to proxy, contains the sockets or symlinks to sockets
     #[argh(positional, default = "String::from(\"/run/systemd/registry\")")]
@@ -380,6 +515,21 @@ async fn main() -> anyhow::Result<()> {
         _ => bail!("--tls-cert and --tls-key must be specified together"),
     };
 
+    let mut authenticators: Vec<Box<dyn Authenticator>> = Vec::new();
+    if cli.tls_client_ca.is_some() {
+        authenticators.push(Box::new(ClientCertAuthenticator));
+    }
+
+    if authenticators.is_empty() && !cli.insecure {
+        bail!(
+            "no authenticator configured; use --tls-client-ca for mTLS \
+             or --insecure to allow unauthenticated access (DANGEROUS)"
+        );
+    }
+    if authenticators.is_empty() {
+        eprintln!("WARNING: running without authentication (--insecure)");
+    }
+
     let listener = TcpListener::bind(&cli.bind).await?;
     let local_addr = listener.local_addr()?;
     let scheme = if tls_acceptor.is_some() {
@@ -393,7 +543,13 @@ async fn main() -> anyhow::Result<()> {
         "🔗 Forwarding {scheme} {local_addr} -> Varlink dir: {}",
         &cli.varlink_sockets_dir
     );
-    run_server(cli.varlink_sockets_dir, listener, tls_acceptor).await
+    run_server(
+        cli.varlink_sockets_dir,
+        listener,
+        tls_acceptor,
+        authenticators,
+    )
+    .await
 }
 
 #[cfg(test)]
