@@ -6,6 +6,18 @@ use scopeguard::defer;
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
+/// Path to the varlinkctl-helper binary built by cargo alongside the test binary.
+fn helper_binary() -> std::path::PathBuf {
+    let test_exe = std::env::current_exe().expect("failed to get test exe path");
+    // test binary is in target/debug/deps/, helper is in target/debug/
+    test_exe
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("varlinkctl-helper")
+}
+
 async fn run_test_server(
     varlink_sockets_dir: &str,
 ) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
@@ -486,6 +498,97 @@ async fn test_ws_userdb_get_user_record_more() {
             .unwrap_or(false)
         {
             break;
+        }
+    }
+
+    // we expect at least root + current user
+    assert!(
+        users.len() >= 2,
+        "expected at least 2 user records, got users {users:#?}"
+    );
+}
+
+#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_varlinkctl_helper_hostname_describe() {
+    let (server, local_addr) = run_test_server("/run/systemd").await;
+    defer! {
+        server.abort();
+    };
+
+    let bridge_url = format!("http://{local_addr}/ws/sockets/io.systemd.Hostname");
+    let output = tokio::process::Command::new("varlinkctl")
+        .args([
+            "call",
+            "--json=short",
+            &format!("exec:{}", helper_binary().display()),
+            "io.systemd.Hostname.Describe",
+            "{}",
+        ])
+        .env("VARLINK_BRIDGE_URL", &bridge_url)
+        .output()
+        .await
+        .expect("failed to run varlinkctl");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "varlinkctl failed (stderr: {stderr})"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("invalid UTF-8 in varlinkctl output");
+    let line = stdout.trim().trim_start_matches('\x1e');
+    let body: Value =
+        serde_json::from_str(line).expect("varlinkctl output not valid JSON: {e}: {line:?}");
+
+    let expected_hostname = gethostname().into_string().expect("failed to get hostname");
+    assert_eq!(body["Hostname"], expected_hostname);
+}
+
+#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::path(/run/systemd/userdb/io.systemd.Multiplexer)]
+#[tokio::test]
+async fn test_varlinkctl_helper_userdb_get_user_record() {
+    let (server, local_addr) = run_test_server("/run/systemd/userdb").await;
+    defer! {
+        server.abort();
+    };
+
+    let bridge_url = format!("http://{local_addr}/ws/sockets/io.systemd.Multiplexer");
+    let output = tokio::process::Command::new("varlinkctl")
+        .args([
+            "call",
+            "--more",
+            "--json=short",
+            &format!("exec:{}", helper_binary().display()),
+            "io.systemd.UserDatabase.GetUserRecord",
+            r#"{"service":"io.systemd.Multiplexer"}"#,
+        ])
+        .env("VARLINK_BRIDGE_URL", &bridge_url)
+        .output()
+        .await
+        .expect("failed to run varlinkctl");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "varlinkctl failed (stderr: {stderr})"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("invalid UTF-8 in varlinkctl output");
+    let mut users = Vec::new();
+    for line in stdout.lines() {
+        // varlinkctl uses JSON Text Sequences (RFC 7464): each record is
+        // prefixed with U+001E (Record Separator)
+        let line = line.trim().trim_start_matches('\x1e');
+        if line.is_empty() {
+            continue;
+        }
+        let body: Value =
+            serde_json::from_str(line).expect("varlinkctl output not valid JSON: {e}: {line:?}");
+        if let Some(name) = body["record"]["userName"].as_str() {
+            users.push(name.to_string());
         }
     }
 
