@@ -144,8 +144,13 @@ $ printf '{"method":"io.systemd.UserDatabase.GetUserRecord", "parameters": {"ser
       "gid": 0,
 ...
 
+# varlinkctl is supported via our varlinkctl-helper
+$ VARLINK_BRIDGE_URL=http://localhost:8080/ws/sockets/io.systemd.Multiplexer \
+    varlinkctl call --more /usr/libexec/varlinkctl-helper \
+	io.systemd.UserDatabase.GetUserRecord '{"service":"io.systemd.Multiplexer"}'
+
+
 # libvarlink bridge mode gives full varlink CLI support over the network
-# TODO: extend varlinkctl to support something similar (exec:cmd is a bit too limited right now)
 $ varlink --bridge "websocat --binary ws://localhost:8080/ws/sockets/io.systemd.Hostname" info
 Vendor: The systemd Project
 Product: systemd (systemd-hostnamed)
