@@ -88,20 +88,99 @@ fn varlink_interface_name_is_valid(name: &str) -> bool {
     RE.is_match(name)
 }
 
+enum VarlinkSockets {
+    SocketDir { dirfd: OwnedFd },
+    SingleSocket { dirfd: OwnedFd, name: String },
+}
+
+impl VarlinkSockets {
+    fn from_socket_dir(dir_path: &str) -> anyhow::Result<Self> {
+        let dir_file =
+            std::fs::File::open(dir_path).with_context(|| format!("failed to open {dir_path}"))?;
+        Ok(VarlinkSockets::SocketDir {
+            dirfd: OwnedFd::from(dir_file),
+        })
+    }
+
+    fn from_socket(socket_path: &str) -> anyhow::Result<Self> {
+        let path = std::path::Path::new(socket_path);
+        let socket_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("cannot extract socket name from {socket_path}"))?;
+        let dir_path = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("cannot extract parent directory from {socket_path}"))?;
+        let dir_file = std::fs::File::open(dir_path)
+            .with_context(|| format!("failed to open parent directory {}", dir_path.display()))?;
+
+        Ok(VarlinkSockets::SingleSocket {
+            dirfd: OwnedFd::from(dir_file),
+            name: socket_name.to_string(),
+        })
+    }
+
+    fn resolve_socket_with_validate(&self, name: &str) -> Result<String, AppError> {
+        if !varlink_interface_name_is_valid(name) {
+            return Err(AppError::bad_request(format!(
+                "invalid socket name (must be a valid varlink interface name): {name}"
+            )));
+        }
+
+        match self {
+            VarlinkSockets::SocketDir { dirfd } => {
+                Ok(format!("unix:/proc/self/fd/{}/{name}", dirfd.as_raw_fd()))
+            }
+            VarlinkSockets::SingleSocket {
+                dirfd,
+                name: expected,
+            } => {
+                if name == expected {
+                    Ok(format!("unix:/proc/self/fd/{}/{name}", dirfd.as_raw_fd()))
+                } else {
+                    Err(AppError::bad_gateway(format!(
+                        "socket '{name}' not available (only '{expected}' is available)"
+                    )))
+                }
+            }
+        }
+    }
+
+    async fn list_sockets(&self) -> Result<Vec<String>, AppError> {
+        match self {
+            VarlinkSockets::SocketDir { dirfd } => {
+                let mut socket_names = Vec::new();
+                let mut entries =
+                    tokio::fs::read_dir(format!("/proc/self/fd/{}", dirfd.as_raw_fd())).await?;
+
+                while let Some(entry) = entries.next_entry().await? {
+                    let path = entry.path();
+                    // we cannot reuse entry() here, we need fs::metadata() so
+                    // that it follows symlinks. Skip entries where metadata fails to avoid
+                    // a single bad entry bringing down the entire service.
+                    let Ok(metadata) = tokio::fs::metadata(&path).await else {
+                        continue;
+                    };
+                    if metadata.file_type().is_socket()
+                        && let Some(name) = path.file_name().and_then(|fname| fname.to_str())
+                        && varlink_interface_name_is_valid(name)
+                    {
+                        socket_names.push(name.to_string());
+                    }
+                }
+                socket_names.sort();
+                Ok(socket_names)
+            }
+            VarlinkSockets::SingleSocket { name, .. } => Ok(vec![name.clone()]),
+        }
+    }
+}
+
 async fn get_varlink_connection_with_validate_socket(
     socket: &str,
     state: &AppState,
 ) -> Result<Arc<varlink::AsyncConnection>, AppError> {
-    if !varlink_interface_name_is_valid(socket) {
-        return Err(AppError::bad_request(format!(
-            "invalid socket name (must be a valid varlink interface name): {socket}"
-        )));
-    }
-
-    let varlink_socket_path = format!(
-        "unix:/proc/self/fd/{sockets_dir_fd}/{socket}",
-        sockets_dir_fd = state.varlink_sockets_dirfd.as_raw_fd(),
-    );
+    let varlink_socket_path = state.varlink_sockets.resolve_socket_with_validate(socket)?;
     debug!("Creating varlink connection for: {varlink_socket_path}");
 
     let connection = varlink::AsyncConnection::with_address(varlink_socket_path).await?;
@@ -110,39 +189,12 @@ async fn get_varlink_connection_with_validate_socket(
 
 #[derive(Clone)]
 struct AppState {
-    varlink_sockets_dirfd: Arc<OwnedFd>,
-}
-
-async fn varlink_unix_sockets_in(varlink_sockets_dirfd: &OwnedFd) -> Result<Vec<String>, AppError> {
-    let mut socket_names = Vec::new();
-    let mut entries = tokio::fs::read_dir(format!(
-        "/proc/self/fd/{}",
-        varlink_sockets_dirfd.as_raw_fd()
-    ))
-    .await?;
-
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        // we cannot reuse entry() here, we need fs::metadata() so
-        // that it follows symlinks. Skip entries where metadata fails to avoid
-        // a single bad entry bringing down the entire service.
-        let Ok(metadata) = tokio::fs::metadata(&path).await else {
-            continue;
-        };
-        if metadata.file_type().is_socket()
-            && let Some(name) = path.file_name().and_then(|fname| fname.to_str())
-            && varlink_interface_name_is_valid(name)
-        {
-            socket_names.push(name.to_string());
-        }
-    }
-    socket_names.sort();
-    Ok(socket_names)
+    varlink_sockets: Arc<VarlinkSockets>,
 }
 
 async fn route_sockets_get(State(state): State<AppState>) -> Result<axum::Json<Value>, AppError> {
     debug!("GET sockets");
-    let all_sockets = varlink_unix_sockets_in(&state.varlink_sockets_dirfd).await?;
+    let all_sockets = state.varlink_sockets.list_sockets().await?;
     Ok(axum::Json(json!({"sockets": all_sockets})))
 }
 
@@ -222,14 +274,18 @@ async fn route_call_post(
     Ok(axum::Json(reply))
 }
 
-fn create_router(varlink_sockets_dir: &str) -> anyhow::Result<Router> {
-    let dir_file = std::fs::File::open(varlink_sockets_dir)
-        .with_context(|| format!("failed to open {varlink_sockets_dir}"))?;
-    if !dir_file.metadata()?.is_dir() {
-        bail!("path {varlink_sockets_dir} is not a directory");
-    }
+fn create_router(varlink_sockets_path: &str) -> anyhow::Result<Router> {
+    let metadata = std::fs::metadata(varlink_sockets_path)
+        .with_context(|| format!("failed to stat {varlink_sockets_path}"))?;
+
     let shared_state = AppState {
-        varlink_sockets_dirfd: Arc::new(dir_file.into()),
+        varlink_sockets: Arc::new(if metadata.is_dir() {
+            VarlinkSockets::from_socket_dir(varlink_sockets_path)?
+        } else if metadata.file_type().is_socket() {
+            VarlinkSockets::from_socket(varlink_sockets_path)?
+        } else {
+            bail!("path {varlink_sockets_path} is neither a directory nor a socket");
+        }),
     };
 
     let app = Router::new()
@@ -259,8 +315,8 @@ async fn shutdown_signal() {
     println!("Shutdown signal received, stopping server...");
 }
 
-async fn run_server(varlink_sockets_dir: &str, listener: TcpListener) -> anyhow::Result<()> {
-    let app = create_router(varlink_sockets_dir)?;
+async fn run_server(varlink_sockets_path: &str, listener: TcpListener) -> anyhow::Result<()> {
+    let app = create_router(varlink_sockets_path)?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -276,9 +332,9 @@ struct Cli {
     #[argh(option, default = "String::from(\"127.0.0.1:8080\")")]
     bind: String,
 
-    /// varlink unix socket dir to proxy, contains the sockets or symlinks to sockets
+    /// varlink unix socket path to proxy: a directory of sockets/symlinks or a single socket
     #[argh(positional, default = "String::from(\"/run/systemd/registry\")")]
-    varlink_sockets_dir: String,
+    varlink_sockets_path: String,
 }
 
 #[tokio::main]
@@ -302,10 +358,10 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!("Varlink proxy started");
     eprintln!(
-        "Forwarding HTTP {local_addr} -> Varlink dir: {varlink_sockets_dir}",
-        varlink_sockets_dir = &cli.varlink_sockets_dir
+        "Forwarding HTTP {local_addr} -> Varlink: {varlink_sockets_path}",
+        varlink_sockets_path = &cli.varlink_sockets_path
     );
-    run_server(&cli.varlink_sockets_dir, listener).await
+    run_server(&cli.varlink_sockets_path, listener).await
 }
 
 #[cfg(test)]

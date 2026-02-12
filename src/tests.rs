@@ -5,9 +5,9 @@ use scopeguard::defer;
 use std::os::fd::OwnedFd;
 use tokio::task::JoinSet;
 
-async fn run_test_server() -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
-    let varlink_sockets_dir = "/run/systemd";
-
+async fn run_test_server(
+    varlink_sockets_path: &str,
+) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port failed");
@@ -15,8 +15,9 @@ async fn run_test_server() -> (tokio::task::JoinHandle<()>, std::net::SocketAddr
         .local_addr()
         .expect("failed to extract local address");
 
+    let varlink_sockets_path = varlink_sockets_path.to_string();
     let task_handle = tokio::spawn(async move {
-        run_server(&varlink_sockets_dir, listener)
+        run_server(&varlink_sockets_path, listener)
             .await
             .expect("server failed")
     });
@@ -27,7 +28,7 @@ async fn run_test_server() -> (tokio::task::JoinHandle<()>, std::net::SocketAddr
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_hostname_post() {
-    let (server, local_addr) = run_test_server().await;
+    let (server, local_addr) = run_test_server("/run/systemd").await;
     defer! {
         server.abort();
     };
@@ -50,7 +51,7 @@ async fn test_integration_real_systemd_hostname_post() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_socket_get() {
-    let (server, local_addr) = run_test_server().await;
+    let (server, local_addr) = run_test_server("/run/systemd").await;
     defer! {
         server.abort();
     };
@@ -69,7 +70,7 @@ async fn test_integration_real_systemd_socket_get() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_sockets_get() {
-    let (server, local_addr) = run_test_server().await;
+    let (server, local_addr) = run_test_server("/run/systemd").await;
     defer! {
         server.abort();
     };
@@ -93,7 +94,7 @@ async fn test_integration_real_systemd_sockets_get() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_socket_interface_get() {
-    let (server, local_addr) = run_test_server().await;
+    let (server, local_addr) = run_test_server("/run/systemd").await;
     defer! {
         server.abort();
     };
@@ -115,7 +116,7 @@ async fn test_integration_real_systemd_socket_interface_get() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_hostname_parallel() {
-    let (server, local_addr) = run_test_server().await;
+    let (server, local_addr) = run_test_server("/run/systemd").await;
     defer! {
         server.abort();
     };
@@ -157,7 +158,7 @@ async fn test_integration_real_systemd_hostname_parallel() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_socket_query_param() {
-    let (server, local_addr) = run_test_server().await;
+    let (server, local_addr) = run_test_server("/run/systemd").await;
     defer! {
         server.abort();
     };
@@ -180,7 +181,7 @@ async fn test_integration_real_systemd_socket_query_param() {
 #[test_with::path(/run/systemd)]
 #[tokio::test]
 async fn test_error_bad_request_on_malformed_json() {
-    let (server, local_addr) = run_test_server().await;
+    let (server, local_addr) = run_test_server("/run/systemd").await;
     defer! {
         server.abort();
     };
@@ -203,7 +204,7 @@ async fn test_error_bad_request_on_malformed_json() {
 #[test_with::path(/run/systemd)]
 #[tokio::test]
 async fn test_error_unknown_varlink_address() {
-    let (server, local_addr) = run_test_server().await;
+    let (server, local_addr) = run_test_server("/run/systemd").await;
     defer! {
         server.abort();
     };
@@ -229,7 +230,7 @@ async fn test_error_unknown_varlink_address() {
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_error_404_for_missing_method() {
-    let (server, local_addr) = run_test_server().await;
+    let (server, local_addr) = run_test_server("/run/systemd").await;
     defer! {
         server.abort();
     };
@@ -253,7 +254,7 @@ async fn test_error_404_for_missing_method() {
 #[test_with::path(/run/systemd)]
 #[tokio::test]
 async fn test_error_bad_request_for_unclean_address() {
-    let (server, local_addr) = run_test_server().await;
+    let (server, local_addr) = run_test_server("/run/systemd").await;
     defer! {
         server.abort();
     };
@@ -281,7 +282,7 @@ async fn test_error_bad_request_for_unclean_address() {
 #[test_with::path(/run/systemd)]
 #[tokio::test]
 async fn test_error_bad_request_for_invalid_chars_in_address() {
-    let (server, local_addr) = run_test_server().await;
+    let (server, local_addr) = run_test_server("/run/systemd").await;
     defer! {
         server.abort();
     };
@@ -309,7 +310,7 @@ async fn test_error_bad_request_for_invalid_chars_in_address() {
 #[test_with::path(/run/systemd)]
 #[tokio::test]
 async fn test_error_bad_request_for_method_without_dots() {
-    let (server, local_addr) = run_test_server().await;
+    let (server, local_addr) = run_test_server("/run/systemd").await;
     defer! {
         server.abort();
     };
@@ -333,7 +334,7 @@ async fn test_error_bad_request_for_method_without_dots() {
 #[test_with::path(/run/systemd)]
 #[tokio::test]
 async fn test_health_endpoint() {
-    let (server, local_addr) = run_test_server().await;
+    let (server, local_addr) = run_test_server("/run/systemd").await;
     defer! {
         server.abort();
     };
@@ -349,19 +350,68 @@ async fn test_health_endpoint() {
 }
 
 #[tokio::test]
-async fn test_varlink_sockets_dir_missing() {
-    let varlink_sockets_dir = "/does-not-exist".to_string();
+async fn test_varlink_sockets_dir_or_file_missing() {
+    let varlink_sockets_dir_or_file = "/does-not-exist".to_string();
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port failed");
-    let res = run_server(&varlink_sockets_dir, listener).await;
+    let res = run_server(&varlink_sockets_dir_or_file, listener).await;
 
     assert!(res.is_err());
     assert!(
         res.unwrap_err()
             .to_string()
-            .contains("failed to open /does-not-exist"),
+            .contains("failed to stat /does-not-exist"),
+    );
+}
+
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_single_socket_post() {
+    let (server, local_addr) = run_test_server("/run/systemd/io.systemd.Hostname").await;
+    defer! {
+        server.abort();
+    };
+
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "http://{}/call/io.systemd.Hostname.Describe",
+            local_addr,
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("failed to post to test server");
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.expect("varlink body invalid");
+    assert!(body["Hostname"].as_str().is_some_and(|h| !h.is_empty()));
+}
+
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_single_socket_rejects_wrong_name() {
+    let (server, local_addr) = run_test_server("/run/systemd/io.systemd.Hostname").await;
+    defer! {
+        server.abort();
+    };
+
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "http://{}/call/io.systemd.Wrong.Describe",
+            local_addr,
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("failed to post to test server");
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    let body: Value = res.json().await.expect("error body invalid");
+    assert_eq!(
+        body["error"],
+        "socket 'io.systemd.Wrong' not available (only 'io.systemd.Hostname' is available)"
     );
 }
 
@@ -375,9 +425,8 @@ async fn test_varlink_unix_sockets_in_follows_symlinks() {
         .expect("failed to create symlink");
 
     let dir_fd = OwnedFd::from(std::fs::File::open(tmpdir.path()).unwrap());
-    let sockets = varlink_unix_sockets_in(&dir_fd)
-        .await
-        .expect("varlink_unix_sockets_in failed");
+    let vs = VarlinkSockets::SocketDir { dirfd: dir_fd };
+    let sockets = vs.list_sockets().await.expect("list_sockets failed");
     assert_eq!(sockets, vec!["io.systemd.Hostname"]);
 }
 
@@ -394,8 +443,10 @@ async fn test_varlink_unix_sockets_in_skips_dangling_symlinks() {
     std::os::unix::fs::symlink("/no/such/socket", &bad).expect("failed to create dangling symlink");
 
     let dir_fd = OwnedFd::from(std::fs::File::open(tmpdir.path()).unwrap());
-    let sockets = varlink_unix_sockets_in(&dir_fd)
+    let vs = VarlinkSockets::SocketDir { dirfd: dir_fd };
+    let sockets = vs
+        .list_sockets()
         .await
-        .expect("varlink_unix_sockets_in should not fail on dangling symlinks");
+        .expect("list_sockets should not fail on dangling symlinks");
     assert_eq!(sockets, vec!["io.systemd.Hostname"]);
 }
