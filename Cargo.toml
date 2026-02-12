@@ -18,8 +18,8 @@ regex-lite = "0.1"
 listenfd = "1.0.2"
 
 [dev-dependencies]
-tempfile = "3.10"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 test-with = { version = "0.14", default-features = false, features = ["runtime"] }
 scopeguard = "1.2"
 gethostname = "1.1.0"
+tempfile = "3.10"
