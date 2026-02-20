@@ -109,6 +109,24 @@ $ curl -s -X POST http://localhost:8080/call/org.varlink.service.GetInfo?socket=
 
 ```
 
+### Example (varlinkctl transparent bridge mode)
+
+Sytemd version v260+ support pluggable protocols for varlink, with that the bridge
+becomes even nicer.
+
+```console
+# copy varlinkctl-helper into /usr/lib/systemd/varlink-bridges/http
+# (or use SYSTEMD_VARLINK_BRIDGES_DIR)
+$ varlinkctl introspect http://localhost:8080/ws/sockets/io.systemd.Hostname
+interface io.systemd
+...
+
+$ varlinkctl call http://localhost:8080/ws/sockets/io.systemd.Hostname io.systemd.Hostname.Describe {}
+{
+        "Hostname" : "top",
+...
+```
+
 ### Examples (websocket)
 
 The examples use websocat because curl for websockets support is relatively new and
