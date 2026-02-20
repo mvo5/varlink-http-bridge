@@ -1123,15 +1123,18 @@ async fn test_ssh_auth_rejects_expired_timestamp() {
     builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
     let signer = builder.build().unwrap();
 
+    let nonce = "test-nonce-expired";
     let mut tb = signer.sign_for();
-    tb.action("method", "GET").action("path", "/sockets");
+    tb.action("method", "GET")
+        .action("path", "/sockets")
+        .action("nonce", nonce);
     let token = tb.sign().await.unwrap();
 
     // Wait for the token to become stale (max_skew is 0)
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let header = format!("Bearer {}", token.encode());
-    let result = auth.check_request("GET", "/sockets", &header);
+    let result = auth.check_request("GET", "/sockets", &header, Some(nonce));
     assert!(result.is_err(), "expired token should be rejected");
 }
 
@@ -1170,12 +1173,15 @@ async fn test_ssh_auth_rejects_unknown_fingerprint() {
     builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
     let signer = builder.build().unwrap();
 
+    let nonce = "test-nonce-unknown-fp";
     let mut tb = signer.sign_for();
-    tb.action("method", "GET").action("path", "/sockets");
+    tb.action("method", "GET")
+        .action("path", "/sockets")
+        .action("nonce", nonce);
     let token = tb.sign().await.unwrap();
 
     let header = format!("Bearer {}", token.encode());
-    let result = auth.check_request("GET", "/sockets", &header);
+    let result = auth.check_request("GET", "/sockets", &header, Some(nonce));
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("unknown key fingerprint"));
 }
@@ -1203,12 +1209,15 @@ async fn test_ssh_auth_verify_ed25519() {
     builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
     let signer = builder.build().unwrap();
 
+    let nonce = "test-nonce-verify";
     let mut tb = signer.sign_for();
-    tb.action("method", "GET").action("path", "/sockets");
+    tb.action("method", "GET")
+        .action("path", "/sockets")
+        .action("nonce", nonce);
     let token = tb.sign().await.unwrap();
 
     let header = format!("Bearer {}", token.encode());
-    auth.check_request("GET", "/sockets", &header)
+    auth.check_request("GET", "/sockets", &header, Some(nonce))
         .expect("valid ed25519 token should pass");
 }
 
@@ -1290,4 +1299,82 @@ async fn test_ssh_auth_no_authenticators_allows_all() {
         .unwrap();
     // No authenticators = open access; 200 even though the socket dir is empty
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_ssh_auth_rejects_replayed_nonce() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let key_path = tmpdir.path().join("test_ed25519");
+    let status = std::process::Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-f"])
+        .arg(&key_path)
+        .args(["-N", "", "-q"])
+        .status()
+        .expect("ssh-keygen failed to run");
+    assert!(status.success(), "ssh-keygen failed");
+
+    let pubkey_line = std::fs::read_to_string(key_path.with_extension("pub")).unwrap();
+    let ak_file = make_test_authorized_keys_file(&[pubkey_line.trim()]);
+    let auth = SshKeyAuthenticator::new(ak_file.path().to_str().unwrap()).unwrap();
+
+    let privkey_pem = std::fs::read_to_string(&key_path).unwrap();
+    let privkey = ssh_key::PrivateKey::from_openssh(&privkey_pem).unwrap();
+
+    let mut builder = sshauth::TokenSigner::using_private_key(privkey).unwrap();
+    builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
+    let signer = builder.build().unwrap();
+
+    let nonce = "replay-me";
+    let mut tb = signer.sign_for();
+    tb.action("method", "GET")
+        .action("path", "/sockets")
+        .action("nonce", nonce);
+    let token = tb.sign().await.unwrap();
+    let header = format!("Bearer {}", token.encode());
+
+    // First use should succeed
+    auth.check_request("GET", "/sockets", &header, Some(nonce))
+        .expect("first use of nonce should pass");
+
+    // Replay with the same nonce should fail
+    let result = auth.check_request("GET", "/sockets", &header, Some(nonce));
+    assert!(result.is_err(), "replayed nonce should be rejected");
+    assert!(
+        result.unwrap_err().contains("nonce already used"),
+        "error should mention nonce replay"
+    );
+}
+
+#[tokio::test]
+async fn test_ssh_auth_rejects_missing_nonce() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let key_path = tmpdir.path().join("test_ed25519");
+    let status = std::process::Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-f"])
+        .arg(&key_path)
+        .args(["-N", "", "-q"])
+        .status()
+        .expect("ssh-keygen failed to run");
+    assert!(status.success(), "ssh-keygen failed");
+
+    let pubkey_line = std::fs::read_to_string(key_path.with_extension("pub")).unwrap();
+    let ak_file = make_test_authorized_keys_file(&[pubkey_line.trim()]);
+    let auth = SshKeyAuthenticator::new(ak_file.path().to_str().unwrap()).unwrap();
+
+    let privkey_pem = std::fs::read_to_string(&key_path).unwrap();
+    let privkey = ssh_key::PrivateKey::from_openssh(&privkey_pem).unwrap();
+
+    let mut builder = sshauth::TokenSigner::using_private_key(privkey).unwrap();
+    builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
+    let signer = builder.build().unwrap();
+
+    let mut tb = signer.sign_for();
+    tb.action("method", "GET").action("path", "/sockets");
+    let token = tb.sign().await.unwrap();
+    let header = format!("Bearer {}", token.encode());
+
+    // Without a nonce, the request should be rejected
+    let result = auth.check_request("GET", "/sockets", &header, None);
+    assert!(result.is_err(), "request without nonce should be rejected");
+    assert!(result.unwrap_err().contains("missing nonce"));
 }

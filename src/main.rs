@@ -294,7 +294,13 @@ fn resolve_tls_acceptor(
 }
 
 trait Authenticator: Send + Sync {
-    fn check_request(&self, method: &str, path: &str, auth_header: &str) -> Result<(), String>;
+    fn check_request(
+        &self,
+        method: &str,
+        path: &str,
+        auth_header: &str,
+        nonce: Option<&str>,
+    ) -> Result<(), String>;
 }
 
 async fn auth_middleware(
@@ -326,6 +332,12 @@ async fn auth_middleware(
         }
     };
 
+    let nonce = request
+        .headers()
+        .get(varlink_http_bridge::SSHAUTH_NONCE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
     let method = request.method().as_str().to_string();
     let path = request
         .uri()
@@ -335,7 +347,7 @@ async fn auth_middleware(
 
     let mut last_err = String::new();
     for authenticator in state.authenticators.iter() {
-        match authenticator.check_request(&method, &path, &auth_header) {
+        match authenticator.check_request(&method, &path, &auth_header, nonce.as_deref()) {
             Ok(()) => return next.run(request).await,
             Err(e) => last_err = e,
         }

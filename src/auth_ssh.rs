@@ -2,8 +2,8 @@ use anyhow::{Context, bail};
 use log::{info, warn};
 use ssh_key::{HashAlg, PublicKey};
 use std::collections::HashMap;
-use std::sync::RwLock;
-use std::time::SystemTime;
+use std::sync::{Mutex, RwLock};
+use std::time::{Instant, SystemTime};
 
 use crate::Authenticator;
 use varlink_http_bridge::SSHAUTH_MAGIC_PREFIX;
@@ -13,10 +13,45 @@ struct KeyCache {
     mtime: SystemTime,
 }
 
+/// Tracks recently seen nonces to prevent replay attacks.
+///
+/// Nonces only need to be remembered for `2 * max_skew` seconds: after that
+/// the timestamp check in sshauth will reject the token anyway.
+struct NonceStore {
+    seen: HashMap<String, Instant>,
+    max_age: std::time::Duration,
+}
+
+impl NonceStore {
+    fn new(max_skew_secs: u64) -> Self {
+        Self {
+            seen: HashMap::new(),
+            max_age: std::time::Duration::from_secs(max_skew_secs * 2),
+        }
+    }
+
+    /// Record a nonce, returning `Err` if it was already seen (replay).
+    fn check_and_insert(&mut self, nonce: &str) -> Result<(), String> {
+        let now = Instant::now();
+
+        // Prune expired nonces
+        self.seen
+            .retain(|_, inserted_at| now.duration_since(*inserted_at) < self.max_age);
+
+        if self.seen.contains_key(nonce) {
+            return Err("nonce already used (possible replay attack)".to_string());
+        }
+
+        self.seen.insert(nonce.to_string(), now);
+        Ok(())
+    }
+}
+
 pub(crate) struct SshKeyAuthenticator {
     path: String,
     max_skew: u64,
     cache: RwLock<KeyCache>,
+    nonces: Mutex<NonceStore>,
 }
 
 /// Parse an `authorized_keys` file, returning only supported (non-RSA) keys.
@@ -59,10 +94,12 @@ impl SshKeyAuthenticator {
             .and_then(|m| m.modified())
             .with_context(|| format!("failed to stat {path}"))?;
 
+        let max_skew = 60;
         Ok(Self {
             path: path.to_string(),
-            max_skew: 300,
+            max_skew,
             cache: RwLock::new(KeyCache { keys, mtime }),
+            nonces: Mutex::new(NonceStore::new(max_skew)),
         })
     }
 
@@ -73,6 +110,7 @@ impl SshKeyAuthenticator {
     #[cfg(test)]
     pub(crate) fn with_max_skew(mut self, max_skew: u64) -> Self {
         self.max_skew = max_skew;
+        self.nonces = Mutex::new(NonceStore::new(max_skew));
         self
     }
 
@@ -132,8 +170,16 @@ impl std::fmt::Debug for SshKeyAuthenticator {
 }
 
 impl Authenticator for SshKeyAuthenticator {
-    fn check_request(&self, method: &str, path: &str, auth_header: &str) -> Result<(), String> {
+    fn check_request(
+        &self,
+        method: &str,
+        path: &str,
+        auth_header: &str,
+        nonce: Option<&str>,
+    ) -> Result<(), String> {
         self.maybe_reload();
+
+        let nonce = nonce.ok_or("missing nonce header (x-auth-nonce)")?;
 
         let token_str = auth_header
             .strip_prefix("Bearer ")
@@ -157,9 +203,13 @@ impl Authenticator for SshKeyAuthenticator {
         v.magic_prefix(SSHAUTH_MAGIC_PREFIX)
             .max_skew_seconds(self.max_skew)
             .action("method", method)
-            .action("path", path);
+            .action("path", path)
+            .action("nonce", nonce);
         v.with_key(pubkey)
             .map_err(|e| format!("token verification failed: {e}"))?;
+
+        // Signature is valid — now check the nonce hasn't been used before
+        self.nonces.lock().unwrap().check_and_insert(nonce)?;
 
         Ok(())
     }

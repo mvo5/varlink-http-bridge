@@ -57,18 +57,32 @@ fn select_signing_key(keys: Vec<ssh_key::PublicKey>) -> Result<ssh_key::PublicKe
         .context("no Ed25519 or ECDSA key in ssh-agent (RSA is not supported)")
 }
 
+/// Generate a random nonce for replay protection (16 bytes, base64-encoded).
+fn generate_nonce() -> String {
+    let mut buf = [0u8; 16];
+    openssl::rand::rand_bytes(&mut buf).expect("openssl PRNG failed");
+    openssl::base64::encode_block(&buf)
+}
+
+struct AuthHeaders {
+    bearer: String,
+    nonce: String,
+}
+
 /// Build a Bearer token by signing via ssh-agent. Returns None if `SSH_AUTH_SOCK` is not set.
-fn build_auth_token(method: &str, path_and_query: &str) -> Result<Option<String>> {
+fn build_auth_token(method: &str, path_and_query: &str) -> Result<Option<AuthHeaders>> {
     let Ok(auth_sock) = std::env::var("SSH_AUTH_SOCK") else {
         return Ok(None);
     };
+
+    let nonce = generate_nonce();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
         .context("creating tokio runtime for SSH agent")?;
 
-    let token = rt.block_on(async {
+    let bearer = rt.block_on(async {
         let keys = sshauth::agent::list_keys(&auth_sock)
             .await
             .context("listing ssh-agent keys")?;
@@ -88,12 +102,14 @@ fn build_auth_token(method: &str, path_and_query: &str) -> Result<Option<String>
         let signer = builder.build()?;
 
         let mut tb = signer.sign_for();
-        tb.action("method", method).action("path", path_and_query);
+        tb.action("method", method)
+            .action("path", path_and_query)
+            .action("nonce", &nonce);
         let token: sshauth::token::Token = tb.sign().await?;
-        Ok::<_, anyhow::Error>(token.encode())
+        Ok::<_, anyhow::Error>(format!("Bearer {}", token.encode()))
     })?;
 
-    Ok(Some(format!("Bearer {token}")))
+    Ok(Some(AuthHeaders { bearer, nonce }))
 }
 
 enum Stream {
@@ -211,7 +227,7 @@ fn connect_ws(url: &str) -> Result<Ws> {
     let path_and_query = uri
         .path_and_query()
         .map_or(uri.path(), tungstenite::http::uri::PathAndQuery::as_str);
-    let auth_header = match build_auth_token("GET", path_and_query) {
+    let auth_headers = match build_auth_token("GET", path_and_query) {
         Ok(h) => h,
         Err(e) => {
             warn!("SSH auth token failed, proceeding without: {e:#}");
@@ -224,10 +240,14 @@ fn connect_ws(url: &str) -> Result<Ws> {
         .into_client_request()
         .context("building WS request")?;
 
-    if let Some(auth) = auth_header {
+    if let Some(auth) = auth_headers {
         request.headers_mut().insert(
             "Authorization",
-            auth.parse().context("invalid auth header value")?,
+            auth.bearer.parse().context("invalid auth header value")?,
+        );
+        request.headers_mut().insert(
+            varlink_http_bridge::SSHAUTH_NONCE_HEADER,
+            auth.nonce.parse().context("invalid nonce header value")?,
         );
     }
 
