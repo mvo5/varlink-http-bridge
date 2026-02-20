@@ -224,3 +224,65 @@ $ VARLINK_BRIDGE_URL=https://myhost:8080/ws/sockets/io.systemd.Hostname \
     varlinkctl call exec:/usr/libexec/varlinkctl-helper \
     io.systemd.Hostname.Describe '{}'
 ```
+
+## SSH key authentication
+
+The bridge can authenticate requests using SSH public keys. If you
+have an SSH agent running clients authenticate automatically with zero
+extra configuration. Note that RSA keys are *not* supported, just
+Ed25519 and ECDSA keys.
+
+### Server setup
+
+Pass `--authorized-keys` with a path to an openssh `authorized_keys`
+file, e.g.:
+
+```console
+$ varlink-http-bridge --authorized-keys ~/.ssh/authorized_keys
+```
+
+When running as a systemd service, the bridge also checks
+`$CREDENTIALS_DIRECTORY/authorized-keys` automatically. So
+a systemd config like below automatically works.
+
+```ini
+[Service]
+LoadCredential=authorized-keys:/etc/ssh/authorized_keys
+```
+
+### Client setup (key selection)
+
+The varlinkctl-helper binary will automatically connect to
+`SSH_AUTH_SOCK` and sign the request with a short lived bearer token
+using the first keys. No setup required.
+
+When the SSH agent has multiple keys, the client uses the first
+Ed25519 or ECDSA key it finds. To select a specific key, set
+`VARLINK_SSH_KEY` to the path of the corresponding public key file:
+
+```console
+$ export VARLINK_SSH_KEY=~/.ssh/id_ed25519.pub
+```
+
+The client reads the public key, matches it by fingerprint against the
+agent's loaded keys, and signs with that key. This also works with
+systemd credentials:
+
+```ini
+[Service]
+Environment=VARLINK_SSH_KEY=/etc/ssh/bridge_key.pub
+```
+
+
+### Combining with TLS
+
+SSH key auth and TLS/mTLS are independent and can be combined. For
+example, use TLS for transport encryption and SSH keys for user
+authentication:
+
+```console
+$ varlink-http-bridge \
+    --tls-cert-file server.pem \
+    --tls-private-key-file server-key.pem \
+    --authorized-keys ~/.ssh/authorized_keys
+```

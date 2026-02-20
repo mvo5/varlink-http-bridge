@@ -23,6 +23,8 @@ signal-hook = "0.3"
 # and nativetls does not support mTLS
 openssl = "0.10"
 tokio-openssl = "0.6"
+ssh-key = { version = "0.6" }
+sshauth = "0.1"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
@@ -32,3 +34,7 @@ gethostname = "1.1.0"
 tempfile = "3.10"
 tokio-tungstenite = "0.28"
 futures-util = { version = "0.3" }
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+strip = true

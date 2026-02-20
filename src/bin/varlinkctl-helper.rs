@@ -8,10 +8,93 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use log::warn;
+use log::{debug, warn};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use rustix::event::{PollFd, PollFlags, poll};
 use tungstenite::{Message, WebSocket};
+
+use varlink_http_bridge::SSHAUTH_MAGIC_PREFIX;
+
+/// Select the signing key from the agent.
+///
+/// If `$VARLINK_SSH_KEY` is set, read the public key from that file and find
+/// the matching key in the agent (by fingerprint). Otherwise pick the first
+/// supported (non-RSA) key.
+fn select_signing_key(keys: Vec<ssh_key::PublicKey>) -> Result<ssh_key::PublicKey> {
+    if let Ok(key_path) = std::env::var("VARLINK_SSH_KEY") {
+        let key_text = std::fs::read_to_string(&key_path)
+            .with_context(|| format!("reading VARLINK_SSH_KEY={key_path}"))?;
+        let wanted = ssh_key::PublicKey::from_openssh(key_text.trim())
+            .with_context(|| format!("parsing public key from {key_path}"))?;
+
+        if matches!(wanted.algorithm(), ssh_key::Algorithm::Rsa { .. }) {
+            bail!(
+                "VARLINK_SSH_KEY={key_path} is an RSA key, which is not supported; use Ed25519 or ECDSA"
+            );
+        }
+
+        let wanted_fp = wanted.fingerprint(ssh_key::HashAlg::Sha256);
+        return keys
+            .into_iter()
+            .find(|k| k.fingerprint(ssh_key::HashAlg::Sha256) == wanted_fp)
+            .with_context(|| {
+                format!("key {wanted_fp} from {key_path} not found in ssh-agent (is it loaded?)")
+            });
+    }
+
+    // No explicit key requested — pick the first supported one, warn about RSA
+    for k in &keys {
+        if matches!(k.algorithm(), ssh_key::Algorithm::Rsa { .. }) {
+            warn!(
+                "skipping RSA key {} ({}): RSA signing is not supported, use Ed25519 or ECDSA",
+                k.fingerprint(ssh_key::HashAlg::Sha256),
+                k.comment(),
+            );
+        }
+    }
+    keys.into_iter()
+        .find(|k| !matches!(k.algorithm(), ssh_key::Algorithm::Rsa { .. }))
+        .context("no Ed25519 or ECDSA key in ssh-agent (RSA is not supported)")
+}
+
+/// Build a Bearer token by signing via ssh-agent. Returns None if `SSH_AUTH_SOCK` is not set.
+fn build_auth_token(method: &str, path_and_query: &str) -> Result<Option<String>> {
+    let Ok(auth_sock) = std::env::var("SSH_AUTH_SOCK") else {
+        return Ok(None);
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .context("creating tokio runtime for SSH agent")?;
+
+    let token = rt.block_on(async {
+        let keys = sshauth::agent::list_keys(&auth_sock)
+            .await
+            .context("listing ssh-agent keys")?;
+        let key = select_signing_key(keys)?;
+        debug!(
+            "SSH auth: using {} key {} ({})",
+            key.algorithm(),
+            key.fingerprint(ssh_key::HashAlg::Sha256),
+            key.comment(),
+        );
+
+        let mut builder = sshauth::TokenSigner::using_authsock(&auth_sock)?;
+        builder
+            .key(key)
+            .include_fingerprint(true)
+            .magic_prefix(SSHAUTH_MAGIC_PREFIX);
+        let signer = builder.build()?;
+
+        let mut tb = signer.sign_for();
+        tb.action("method", method).action("path", path_and_query);
+        let token: sshauth::token::Token = tb.sign().await?;
+        Ok::<_, anyhow::Error>(token.encode())
+    })?;
+
+    Ok(Some(format!("Bearer {token}")))
+}
 
 enum Stream {
     Plain(TcpStream),
@@ -97,6 +180,8 @@ fn build_ssl_connector() -> Result<SslConnector> {
 }
 
 fn connect_ws(url: &str) -> Result<Ws> {
+    use tungstenite::client::IntoClientRequest;
+
     let ws_url = if let Some(rest) = url.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = url.strip_prefix("http://") {
@@ -122,12 +207,36 @@ fn connect_ws(url: &str) -> Result<Ws> {
             Stream::Plain(tcp)
         };
 
+    // Build auth token if ssh-agent is available; proceed without on failure
+    let path_and_query = uri
+        .path_and_query()
+        .map_or(uri.path(), tungstenite::http::uri::PathAndQuery::as_str);
+    let auth_header = match build_auth_token("GET", path_and_query) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("SSH auth token failed, proceeding without: {e:#}");
+            None
+        }
+    };
+
+    // IntoClientRequest auto-generates standard WS upgrade headers
+    let mut request = ws_url
+        .into_client_request()
+        .context("building WS request")?;
+
+    if let Some(auth) = auth_header {
+        request.headers_mut().insert(
+            "Authorization",
+            auth.parse().context("invalid auth header value")?,
+        );
+    }
+
     let ws_context = if use_tls {
         "WebSocket handshake failed: check client cert if server requires mTLS"
     } else {
         "WebSocket handshake failed"
     };
-    let (ws, _) = tungstenite::client(ws_url, stream).context(ws_context)?;
+    let (ws, _) = tungstenite::client(request, stream).context(ws_context)?;
     Ok(ws)
 }
 

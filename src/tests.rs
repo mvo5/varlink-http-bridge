@@ -22,6 +22,13 @@ fn helper_binary() -> std::path::PathBuf {
 async fn run_test_server(
     varlink_sockets_path: &str,
 ) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+    run_test_server_with_auth(varlink_sockets_path, Vec::new()).await
+}
+
+async fn run_test_server_with_auth(
+    varlink_sockets_path: &str,
+    authenticators: Vec<Box<dyn Authenticator>>,
+) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port failed");
@@ -31,7 +38,7 @@ async fn run_test_server(
 
     let varlink_sockets_path = varlink_sockets_path.to_string();
     let task_handle = tokio::spawn(async move {
-        run_server(&varlink_sockets_path, listener, None)
+        run_server(&varlink_sockets_path, listener, None, authenticators)
             .await
             .expect("server failed")
     });
@@ -370,7 +377,7 @@ async fn test_varlink_sockets_dir_or_file_missing() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port failed");
-    let res = run_server(&varlink_sockets_dir_or_file, listener, None).await;
+    let res = run_server(&varlink_sockets_dir_or_file, listener, None, Vec::new()).await;
 
     assert!(res.is_err());
     assert!(
@@ -751,9 +758,14 @@ async fn run_test_tls_server(
 
     let varlink_sockets_path = varlink_sockets_path.to_string();
     let task_handle = tokio::spawn(async move {
-        run_server(&varlink_sockets_path, listener, Some(tls_acceptor))
-            .await
-            .expect("server failed")
+        run_server(
+            &varlink_sockets_path,
+            listener,
+            Some(tls_acceptor),
+            Vec::new(),
+        )
+        .await
+        .expect("server failed")
     });
 
     (task_handle, local_addr)
@@ -1011,4 +1023,271 @@ fn test_tls_credentials_directory_returns_none_without_creds() {
         result.is_none(),
         "empty credentials dir should yield no TLS"
     );
+}
+
+// --- SSH key auth tests ---
+
+fn make_test_authorized_keys_file(pubkeys: &[&str]) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    for key in pubkeys {
+        writeln!(f, "{key}").unwrap();
+    }
+    f
+}
+
+#[test]
+fn test_ssh_auth_parse_authorized_keys_ed25519() {
+    use openssl::pkey::PKey;
+
+    let pkey = PKey::generate_ed25519().unwrap();
+    let raw_pub = pkey.raw_public_key().unwrap();
+
+    // Build SSH blob: string "ssh-ed25519" + string <32 bytes>
+    let mut blob = Vec::new();
+    let algo = b"ssh-ed25519";
+    blob.extend_from_slice(&(algo.len() as u32).to_be_bytes());
+    blob.extend_from_slice(algo);
+    blob.extend_from_slice(&(raw_pub.len() as u32).to_be_bytes());
+    blob.extend_from_slice(&raw_pub);
+
+    let b64_blob = openssl::base64::encode_block(&blob);
+    let line = format!("ssh-ed25519 {b64_blob} testkey@host");
+    let ak_file = make_test_authorized_keys_file(&[&line]);
+    let auth = SshKeyAuthenticator::new(ak_file.path().to_str().unwrap()).unwrap();
+
+    assert_eq!(auth.key_count(), 1);
+}
+
+#[test]
+fn test_ssh_auth_parse_authorized_keys_rsa() {
+    // Use ssh-keygen to generate an RSA key for the test
+    let tmpdir = tempfile::tempdir().unwrap();
+    let key_path = tmpdir.path().join("test_rsa");
+    let status = std::process::Command::new("ssh-keygen")
+        .args(["-t", "rsa", "-b", "2048", "-f"])
+        .arg(&key_path)
+        .args(["-N", "", "-q"])
+        .status()
+        .expect("ssh-keygen failed to run");
+    assert!(status.success(), "ssh-keygen failed");
+
+    let pub_key_content = std::fs::read_to_string(key_path.with_extension("pub")).unwrap();
+    let ak_file = make_test_authorized_keys_file(&[pub_key_content.trim()]);
+    let result = SshKeyAuthenticator::new(ak_file.path().to_str().unwrap());
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("RSA is not supported"),
+        "RSA-only authorized_keys should fail with clear message"
+    );
+}
+
+#[test]
+fn test_ssh_auth_rejects_garbage() {
+    let ak_file = make_test_authorized_keys_file(&["not-a-real-key line", "# comment"]);
+    let result = SshKeyAuthenticator::new(ak_file.path().to_str().unwrap());
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("no valid SSH public keys")
+    );
+}
+
+#[tokio::test]
+async fn test_ssh_auth_rejects_expired_timestamp() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let key_path = tmpdir.path().join("test_ed25519");
+    let status = std::process::Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-f"])
+        .arg(&key_path)
+        .args(["-N", "", "-q"])
+        .status()
+        .expect("ssh-keygen failed to run");
+    assert!(status.success(), "ssh-keygen failed");
+
+    let pubkey_line = std::fs::read_to_string(key_path.with_extension("pub")).unwrap();
+    let ak_file = make_test_authorized_keys_file(&[pubkey_line.trim()]);
+    let auth = SshKeyAuthenticator::new(ak_file.path().to_str().unwrap())
+        .unwrap()
+        .with_max_skew(0);
+
+    let privkey_pem = std::fs::read_to_string(&key_path).unwrap();
+    let privkey = ssh_key::PrivateKey::from_openssh(&privkey_pem).unwrap();
+
+    let mut builder = sshauth::TokenSigner::using_private_key(privkey).unwrap();
+    builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
+    let signer = builder.build().unwrap();
+
+    let mut tb = signer.sign_for();
+    tb.action("method", "GET").action("path", "/sockets");
+    let token = tb.sign().await.unwrap();
+
+    // Wait for the token to become stale (max_skew is 0)
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let header = format!("Bearer {}", token.encode());
+    let result = auth.check_request("GET", "/sockets", &header);
+    assert!(result.is_err(), "expired token should be rejected");
+}
+
+#[tokio::test]
+async fn test_ssh_auth_rejects_unknown_fingerprint() {
+    // Key A: in authorized_keys
+    let tmpdir_a = tempfile::tempdir().unwrap();
+    let key_path_a = tmpdir_a.path().join("key_a");
+    let status = std::process::Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-f"])
+        .arg(&key_path_a)
+        .args(["-N", "", "-q"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let pubkey_a_line = std::fs::read_to_string(key_path_a.with_extension("pub")).unwrap();
+    let ak_file = make_test_authorized_keys_file(&[pubkey_a_line.trim()]);
+    let auth = SshKeyAuthenticator::new(ak_file.path().to_str().unwrap()).unwrap();
+
+    // Key B: NOT in authorized_keys
+    let tmpdir_b = tempfile::tempdir().unwrap();
+    let key_path_b = tmpdir_b.path().join("key_b");
+    let status = std::process::Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-f"])
+        .arg(&key_path_b)
+        .args(["-N", "", "-q"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let privkey_b_pem = std::fs::read_to_string(&key_path_b).unwrap();
+    let privkey_b = ssh_key::PrivateKey::from_openssh(&privkey_b_pem).unwrap();
+
+    let mut builder = sshauth::TokenSigner::using_private_key(privkey_b).unwrap();
+    builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
+    let signer = builder.build().unwrap();
+
+    let mut tb = signer.sign_for();
+    tb.action("method", "GET").action("path", "/sockets");
+    let token = tb.sign().await.unwrap();
+
+    let header = format!("Bearer {}", token.encode());
+    let result = auth.check_request("GET", "/sockets", &header);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("unknown key fingerprint"));
+}
+
+#[tokio::test]
+async fn test_ssh_auth_verify_ed25519() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let key_path = tmpdir.path().join("test_ed25519");
+    let status = std::process::Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-f"])
+        .arg(&key_path)
+        .args(["-N", "", "-q"])
+        .status()
+        .expect("ssh-keygen failed to run");
+    assert!(status.success(), "ssh-keygen failed");
+
+    let pubkey_line = std::fs::read_to_string(key_path.with_extension("pub")).unwrap();
+    let ak_file = make_test_authorized_keys_file(&[pubkey_line.trim()]);
+    let auth = SshKeyAuthenticator::new(ak_file.path().to_str().unwrap()).unwrap();
+
+    let privkey_pem = std::fs::read_to_string(&key_path).unwrap();
+    let privkey = ssh_key::PrivateKey::from_openssh(&privkey_pem).unwrap();
+
+    let mut builder = sshauth::TokenSigner::using_private_key(privkey).unwrap();
+    builder.include_fingerprint(true).magic_prefix(*b"vhbridge");
+    let signer = builder.build().unwrap();
+
+    let mut tb = signer.sign_for();
+    tb.action("method", "GET").action("path", "/sockets");
+    let token = tb.sign().await.unwrap();
+
+    let header = format!("Bearer {}", token.encode());
+    auth.check_request("GET", "/sockets", &header)
+        .expect("valid ed25519 token should pass");
+}
+
+fn make_auth_test_router(authenticators: Vec<Box<dyn Authenticator>>) -> Router {
+    let tmpdir = tempfile::tempdir().unwrap();
+    // Keep tmpdir so it lives for the test duration (but gets cleaned up eventually)
+    let path = tmpdir.keep();
+    create_router(path.to_str().unwrap(), authenticators).unwrap()
+}
+
+#[tokio::test]
+async fn test_ssh_auth_rejects_without_header() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let pkey = openssl::pkey::PKey::generate_ed25519().unwrap();
+    let raw_pub = pkey.raw_public_key().unwrap();
+
+    let mut blob = Vec::new();
+    let algo = b"ssh-ed25519";
+    blob.extend_from_slice(&(algo.len() as u32).to_be_bytes());
+    blob.extend_from_slice(algo);
+    blob.extend_from_slice(&(raw_pub.len() as u32).to_be_bytes());
+    blob.extend_from_slice(&raw_pub);
+
+    let b64_blob = openssl::base64::encode_block(&blob);
+    let line = format!("ssh-ed25519 {b64_blob} testkey@host");
+    let ak_file = make_test_authorized_keys_file(&[&line]);
+    let auth = SshKeyAuthenticator::new(ak_file.path().to_str().unwrap()).unwrap();
+
+    let app = make_auth_test_router(vec![Box::new(auth)]);
+    let response = app
+        .oneshot(Request::get("/sockets").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_ssh_auth_health_always_open() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let pkey = openssl::pkey::PKey::generate_ed25519().unwrap();
+    let raw_pub = pkey.raw_public_key().unwrap();
+
+    let mut blob = Vec::new();
+    let algo = b"ssh-ed25519";
+    blob.extend_from_slice(&(algo.len() as u32).to_be_bytes());
+    blob.extend_from_slice(algo);
+    blob.extend_from_slice(&(raw_pub.len() as u32).to_be_bytes());
+    blob.extend_from_slice(&raw_pub);
+
+    let b64_blob = openssl::base64::encode_block(&blob);
+    let line = format!("ssh-ed25519 {b64_blob} testkey@host");
+    let ak_file = make_test_authorized_keys_file(&[&line]);
+    let auth = SshKeyAuthenticator::new(ak_file.path().to_str().unwrap()).unwrap();
+
+    let app = make_auth_test_router(vec![Box::new(auth)]);
+    let response = app
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_ssh_auth_no_authenticators_allows_all() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let app = make_auth_test_router(Vec::new());
+    let response = app
+        .oneshot(Request::get("/sockets").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    // No authenticators = open access; 200 even though the socket dir is empty
+    assert_eq!(response.status(), StatusCode::OK);
 }
