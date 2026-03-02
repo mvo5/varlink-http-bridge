@@ -41,11 +41,12 @@ it automatically.
 just build release
 
 %install
-DESTDIR=%{buildroot} just install
+DESTDIR=%{buildroot} SYSCONFDIR=%{_sysconfdir} just install
 
 %files
 %{_bindir}/varlink-httpd
 %{_unitdir}/varlink-httpd.service
+%dir %{_sysconfdir}/varlink-httpd
 
 %files -n varlinkctl-http
 %dir %{_prefix}/lib/systemd/varlink-bridges
