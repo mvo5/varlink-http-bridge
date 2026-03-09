@@ -13,7 +13,6 @@ use axum::{
 use listenfd::ListenFd;
 use log::{debug, error, warn};
 use regex_lite::Regex;
-use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -74,7 +73,7 @@ impl From<zlink::Error> for AppError {
             | zlink::Error::SocketWrite
             | zlink::Error::UnexpectedEof
             | zlink::Error::Io(..) => StatusCode::BAD_GATEWAY,
-            zlink::Error::VarlinkService(owned) => match owned.inner() {
+            zlink::Error::VarlinkService(err) => match err {
                 varlink_service::Error::InvalidParameter { .. }
                 | varlink_service::Error::ExpectedMore => StatusCode::BAD_REQUEST,
                 varlink_service::Error::MethodNotFound { .. }
@@ -109,41 +108,11 @@ impl From<serde_json::Error> for AppError {
     }
 }
 
-/// Method call with dynamic method name and parameters for the POST `/call/{method}` route.
-#[derive(Debug, Serialize)]
-struct DynMethod<'m> {
-    method: &'m str,
-    parameters: Option<&'m HashMap<String, Value>>,
-}
-
-/// Successful reply parameters from a dynamic varlink call.
-#[derive(Debug, Default, serde::Deserialize)]
-struct DynReply<'r>(#[serde(borrow)] Option<HashMap<&'r str, Value>>);
-
-impl IntoResponse for DynReply<'_> {
-    fn into_response(self) -> Response {
-        axum::Json(self.0).into_response()
-    }
-}
-
-/// Error reply from a dynamic varlink call (non-standard errors only; standard
-/// `org.varlink.service.*` errors are caught earlier by zlink).
-#[derive(Debug, serde::Deserialize)]
-struct DynReplyError<'e> {
-    error: &'e str,
-    #[serde(default)]
-    parameters: Option<HashMap<&'e str, Value>>,
-}
-
-impl From<DynReplyError<'_>> for AppError {
-    fn from(e: DynReplyError<'_>) -> Self {
-        let message = match e.parameters {
-            Some(params) => format!("{}: {params:?}", e.error),
-            None => e.error.to_string(),
-        };
+impl From<serde_json::Value> for AppError {
+    fn from(e: serde_json::Value) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message,
+            message: e.to_string(),
         }
     }
 }
@@ -461,7 +430,7 @@ async fn route_call_post(
     Path(method): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
-    axum::Json(call_args): axum::Json<HashMap<String, Value>>,
+    axum::Json(call_args): axum::Json<Value>,
 ) -> Result<Response, AppError> {
     debug!("POST call for method: {method}, params: {params:#?}");
 
@@ -481,16 +450,8 @@ async fn route_call_post(
 
     let mut connection = get_varlink_connection_with_validate_socket(&socket, &state).await?;
 
-    let call = zlink::Call::new(DynMethod {
-        method: &method,
-        parameters: Some(&call_args),
-    });
-    connection
-        .call_method::<_, DynReply<'_>, DynReplyError<'_>>(&call, vec![])
-        .await?
-        .0
-        .map(|r| r.into_parameters().unwrap_or_default().into_response())
-        .map_err(Into::into)
+    let reply = connection.call_dynamic(&method, call_args).await??;
+    Ok(axum::Json(reply.into_parameters()).into_response())
 }
 
 async fn route_ws(
