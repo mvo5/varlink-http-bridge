@@ -1339,27 +1339,62 @@ mod sshauth_tests {
 
         let pub_key_content = std::fs::read_to_string(key_path.with_extension("pub")).unwrap();
         let root = make_test_rootdir_with_keys(&[pub_key_content.trim()]);
-        let result = maybe_create_ssh_authenticator(None, None, root.path());
-        assert!(result.is_err());
+        let result = maybe_create_ssh_authenticator(None, None, root.path()).unwrap();
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("RSA is not supported"),
-            "RSA-only authorized_keys should fail with clear message"
+            result.is_none(),
+            "RSA-only authorized_keys should be skipped, returning None"
+        );
+    }
+
+    #[test]
+    fn test_ssh_auth_rsa_only_credential_falls_through_to_ed25519() {
+        // Generate an RSA key and an ed25519 key
+        let rsa_dir = tempfile::tempdir().unwrap();
+        let rsa_key_path = rsa_dir.path().join("test_rsa");
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-t", "rsa", "-b", "2048", "-f"])
+            .arg(&rsa_key_path)
+            .args(["-N", "", "-q"])
+            .status()
+            .expect("ssh-keygen failed to run");
+        assert!(status.success(), "ssh-keygen rsa failed");
+        let rsa_pubkey = std::fs::read_to_string(rsa_key_path.with_extension("pub")).unwrap();
+
+        let ed_dir = tempfile::tempdir().unwrap();
+        let (ed_pubkey, _) = generate_ed25519_keypair(ed_dir.path());
+
+        // Set up a creds_dir where ssh.authorized_keys.root has only the RSA
+        // key and ssh.ephemeral-authorized_keys-all has the ed25519 key.
+        let creds_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            creds_dir.path().join("ssh.authorized_keys.root"),
+            rsa_pubkey.as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            creds_dir.path().join("ssh.ephemeral-authorized_keys-all"),
+            ed_pubkey.as_bytes(),
+        )
+        .unwrap();
+
+        let empty_root = tempfile::tempdir().unwrap();
+        let auth = maybe_create_ssh_authenticator(None, Some(creds_dir.path()), empty_root.path())
+            .unwrap()
+            .expect("should fall through RSA-only file to ed25519 file");
+        assert_eq!(
+            auth.key_count(),
+            1,
+            "should have the ed25519 key after skipping RSA-only credential"
         );
     }
 
     #[test]
     fn test_ssh_auth_rejects_garbage() {
         let root = make_test_rootdir_with_keys(&["not-a-real-key line", "# comment"]);
-        let result = maybe_create_ssh_authenticator(None, None, root.path());
-        assert!(result.is_err());
+        let result = maybe_create_ssh_authenticator(None, None, root.path()).unwrap();
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("no supported SSH public keys")
+            result.is_none(),
+            "garbage-only authorized_keys should be skipped, returning None"
         );
     }
 
