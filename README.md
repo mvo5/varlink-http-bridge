@@ -270,8 +270,7 @@ locations (first match wins):
 
 1. `--authorized-keys=PATH` — explicit CLI flag
 2. `/etc/varlink-httpd/authorized_keys` — config file
-3. `$CREDENTIALS_DIRECTORY/ssh.authorized_keys.root` — systemd per-service credential (see `systemd.exec(5)`)
-4. `/run/credentials/@system/ssh.authorized_keys.root` — system-wide credential (see `systemd.system-credentials(7)`)
+3. `$CREDENTIALS_DIRECTORY/ssh.authorized_keys.root` — systemd credential (see `systemd.exec(5)`)
 
 The simplest setup is to pass the path explicitly:
 

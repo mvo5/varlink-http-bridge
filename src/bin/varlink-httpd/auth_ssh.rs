@@ -212,8 +212,8 @@ pub(crate) fn maybe_create_ssh_authenticator(
         p.exists().then(|| p.to_string_lossy().to_string())
     }
 
-    // Priority: explicit CLI > /etc config > $CREDENTIALS_DIRECTORY >
-    // system-wide /run/credentials/@system/ (see systemd.system-credentials(7))
+    // Priority: explicit CLI > /etc config > $CREDENTIALS_DIRECTORY
+    // (ImportCredential= in the unit file handles system-wide credentials)
     let authorized_keys_path = cli_authorized_keys
         .or_else(|| exists(&root.join("etc/varlink-httpd/authorized_keys")))
         .or_else(|| {
@@ -222,12 +222,6 @@ pub(crate) fn maybe_create_ssh_authenticator(
                     .iter()
                     .find_map(|name| exists(&d.join(name)))
             })
-        })
-        .or_else(|| {
-            let sys_creds = root.join("run/credentials/@system");
-            SSH_AUTHORIZED_KEYS_CREDENTIALS
-                .iter()
-                .find_map(|name| exists(&sys_creds.join(name)))
         });
 
     let Some(ak_path) = authorized_keys_path else {

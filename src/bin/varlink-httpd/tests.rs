@@ -1669,62 +1669,38 @@ mod sshauth_tests {
             .unwrap();
         assert_eq!(auth.key_count(), 1, "should find key from /etc path");
 
-        // 3. rootdir/run/credentials/@system/ssh.authorized_keys.root exists → found
-        let root_run = tempfile::tempdir().unwrap();
-        let run_dir = root_run.path().join("run/credentials/@system");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        std::fs::write(
-            run_dir.join("ssh.authorized_keys.root"),
-            pubkey_a.as_bytes(),
-        )
-        .unwrap();
-        let auth = maybe_create_ssh_authenticator(None, None, root_run.path())
-            .unwrap()
-            .unwrap();
-        assert_eq!(auth.key_count(), 1, "should find key from /run path");
-
-        // 4. Both /etc and /run exist → /etc takes priority (1 key vs 2 keys)
-        let root_both = tempfile::tempdir().unwrap();
-        let etc_dir = root_both.path().join("etc/varlink-httpd");
-        std::fs::create_dir_all(&etc_dir).unwrap();
-        std::fs::write(etc_dir.join("authorized_keys"), pubkey_a.as_bytes()).unwrap();
-        let run_dir = root_both.path().join("run/credentials/@system");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        let mut run_file = std::fs::File::create(run_dir.join("ssh.authorized_keys.root")).unwrap();
-        writeln!(run_file, "{}", pubkey_b1.trim()).unwrap();
-        writeln!(run_file, "{}", pubkey_b2.trim()).unwrap();
-        drop(run_file);
-        let auth = maybe_create_ssh_authenticator(None, None, root_both.path())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            auth.key_count(),
-            1,
-            "/etc (1 key) should take priority over /run (2 keys)"
-        );
-
-        // 5. $CREDENTIALS_DIRECTORY takes priority over /run
+        // 3. $CREDENTIALS_DIRECTORY/ssh.authorized_keys.root exists → found
         let creds_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             creds_dir.path().join("ssh.authorized_keys.root"),
             pubkey_a.as_bytes(),
         )
         .unwrap();
-        let root_with_run_only = tempfile::tempdir().unwrap();
-        let run_dir = root_with_run_only.path().join("run/credentials/@system");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        let mut run_file = std::fs::File::create(run_dir.join("ssh.authorized_keys.root")).unwrap();
-        writeln!(run_file, "{}", pubkey_b1.trim()).unwrap();
-        writeln!(run_file, "{}", pubkey_b2.trim()).unwrap();
-        drop(run_file);
         let auth =
-            maybe_create_ssh_authenticator(None, Some(creds_dir.path()), root_with_run_only.path())
+            maybe_create_ssh_authenticator(None, Some(creds_dir.path()), empty_root.path())
+                .unwrap()
+                .unwrap();
+        assert_eq!(auth.key_count(), 1, "should find key from creds_dir");
+
+        // 4. Both /etc and $CREDENTIALS_DIRECTORY exist → /etc takes priority
+        let root_both = tempfile::tempdir().unwrap();
+        let etc_dir = root_both.path().join("etc/varlink-httpd");
+        std::fs::create_dir_all(&etc_dir).unwrap();
+        std::fs::write(etc_dir.join("authorized_keys"), pubkey_a.as_bytes()).unwrap();
+        let creds_dir_b = tempfile::tempdir().unwrap();
+        let mut creds_file =
+            std::fs::File::create(creds_dir_b.path().join("ssh.authorized_keys.root")).unwrap();
+        writeln!(creds_file, "{}", pubkey_b1.trim()).unwrap();
+        writeln!(creds_file, "{}", pubkey_b2.trim()).unwrap();
+        drop(creds_file);
+        let auth =
+            maybe_create_ssh_authenticator(None, Some(creds_dir_b.path()), root_both.path())
                 .unwrap()
                 .unwrap();
         assert_eq!(
             auth.key_count(),
             1,
-            "creds_dir (1 key) should take priority over /run (2 keys)"
+            "/etc (1 key) should take priority over creds_dir (2 keys)"
         );
 
         // 5b. ssh.ephemeral-authorized_keys-all is used when .root is absent (creds_dir)
@@ -1766,24 +1742,6 @@ mod sshauth_tests {
             auth.key_count(),
             1,
             ".root (1 key) should take priority over .all (2 keys)"
-        );
-
-        // 5d. ssh.ephemeral-authorized_keys-all in /run/credentials/@system
-        let root_run_all = tempfile::tempdir().unwrap();
-        let run_dir = root_run_all.path().join("run/credentials/@system");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        std::fs::write(
-            run_dir.join("ssh.ephemeral-authorized_keys-all"),
-            pubkey_a.as_bytes(),
-        )
-        .unwrap();
-        let auth = maybe_create_ssh_authenticator(None, None, root_run_all.path())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            auth.key_count(),
-            1,
-            "should find key from .all in /run path"
         );
 
         // 6. CLI path overrides everything
