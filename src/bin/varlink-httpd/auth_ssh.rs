@@ -214,25 +214,49 @@ pub(crate) fn maybe_create_ssh_authenticator(
 
     // Priority: explicit CLI > /etc config > $CREDENTIALS_DIRECTORY
     // (ImportCredential= in the unit file handles system-wide credentials)
-    let authorized_keys_path = cli_authorized_keys
-        .or_else(|| exists(&root.join("etc/varlink-httpd/authorized_keys")))
-        .or_else(|| {
-            creds_dir.and_then(|d| {
-                SSH_AUTHORIZED_KEYS_CREDENTIALS
-                    .iter()
-                    .find_map(|name| exists(&d.join(name)))
-            })
-        });
+    //
+    // Build a list of candidate paths in priority order, then try each
+    // one.  A file that exists but contains only unsupported (RSA) keys
+    // is skipped so that lower-priority sources still get a chance.
+    // An explicit CLI path is a hard requirement — fail immediately if
+    // it contains no usable keys rather than silently falling through.
+    if let Some(p) = cli_authorized_keys {
+        let ssh_auth = SshKeyAuthenticator::new(&p)?;
+        info!(
+            "Authenticator: adding SSH authorized keys ({count} keys from {p})",
+            count = ssh_auth.key_count()
+        );
+        return Ok(Some(ssh_auth));
+    }
 
-    let Some(ak_path) = authorized_keys_path else {
-        return Ok(None);
-    };
-    let ssh_auth = SshKeyAuthenticator::new(&ak_path)?;
-    info!(
-        "Authenticator: adding SSH authorized keys ({count} keys from {ak_path})",
-        count = ssh_auth.key_count()
-    );
-    Ok(Some(ssh_auth))
+    let mut candidates: Vec<String> = Vec::new();
+
+    if let Some(p) = exists(&root.join("etc/varlink-httpd/authorized_keys")) {
+        candidates.push(p);
+    }
+    if let Some(d) = creds_dir {
+        for name in SSH_AUTHORIZED_KEYS_CREDENTIALS {
+            if let Some(p) = exists(&d.join(name)) {
+                candidates.push(p);
+            }
+        }
+    }
+
+    for ak_path in &candidates {
+        match SshKeyAuthenticator::new(ak_path) {
+            Ok(ssh_auth) => {
+                info!(
+                    "Authenticator: adding SSH authorized keys ({count} keys from {ak_path})",
+                    count = ssh_auth.key_count()
+                );
+                return Ok(Some(ssh_auth));
+            }
+            Err(e) => {
+                warn!("skipping {ak_path}: {e:#}");
+            }
+        }
+    }
+    Ok(None)
 }
 
 impl Authenticator for SshKeyAuthenticator {
