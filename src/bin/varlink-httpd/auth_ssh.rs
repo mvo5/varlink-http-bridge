@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
-use crate::Authenticator;
+use crate::{AuthResult, Authenticator};
 use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, SSHAUTH_NONCE_HEADER};
 
 struct KeyCache {
@@ -240,20 +240,25 @@ impl Authenticator for SshKeyAuthenticator {
         &self,
         method: &str,
         path: &str,
-        auth_header: &str,
+        auth_header: Option<&str>,
         nonce: Option<&str>,
         tls_channel_binding: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> AuthResult {
+        // No Bearer token → not our credential type, let someone else decide.
+        let Some(token_str) = auth_header.and_then(|h| h.strip_prefix("Bearer ")) else {
+            return AuthResult::Abstain;
+        };
+
+        let Some(nonce) = nonce else {
+            return AuthResult::Deny("missing nonce header (x-auth-nonce)".into());
+        };
+
         self.maybe_reload();
 
-        let nonce = nonce.context("missing nonce header (x-auth-nonce)")?;
-
-        let token_str = auth_header
-            .strip_prefix("Bearer ")
-            .context("Authorization header must start with 'Bearer '")?;
-
-        let unverified_token =
-            sshauth::UnverifiedToken::try_from(token_str).context("invalid token")?;
+        let unverified_token = match sshauth::UnverifiedToken::try_from(token_str) {
+            Ok(t) => t,
+            Err(e) => return AuthResult::Deny(format!("invalid token: {e}")),
+        };
 
         // clone the keys to drop the authorized_keys.lock() ASAP and avoid it being
         // held during the (slow) verify_for()
@@ -262,7 +267,7 @@ impl Authenticator for SshKeyAuthenticator {
             ak.keys.values().cloned().collect()
         };
 
-        let verified = unverified_token
+        let verified = match unverified_token
             .verify_for()
             .magic_prefix(SSHAUTH_MAGIC_PREFIX)
             .max_skew_seconds(self.max_skew)
@@ -278,18 +283,25 @@ impl Authenticator for SshKeyAuthenticator {
                 tls_channel_binding.unwrap_or_default(),
             )
             .with_keys(&authorized_keys)
-            .context("token verification failed")?;
+        {
+            Ok(v) => v,
+            Err(e) => return AuthResult::Deny(format!("token verification failed: {e}")),
+        };
 
         // good signature, check that nonce is unique
-        self.nonces
+        if let Err(e) = self
+            .nonces
             .lock()
             .unwrap()
-            .check_and_insert_and_prune_old(nonce)?;
+            .check_and_insert_and_prune_old(nonce)
+        {
+            return AuthResult::Deny(format!("{e}"));
+        }
 
         log::info!(
             "SSH auth OK: {method} {path} key={fp}",
             fp = verified.fingerprint()
         );
-        Ok(())
+        AuthResult::Allow
     }
 }

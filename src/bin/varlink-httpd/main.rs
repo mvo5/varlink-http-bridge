@@ -459,15 +459,65 @@ fn resolve_tls_acceptor(
     }
 }
 
+#[derive(Debug)]
+enum AuthResult {
+    /// Credentials are valid — allow the request.
+    Allow,
+    /// Not my credential type — let the next authenticator decide.
+    Abstain,
+    /// Credentials recognized but invalid — reject the request.
+    Deny(String),
+}
+
 trait Authenticator: Send + Sync {
     fn check_request(
         &self,
         method: &str,
         path: &str,
-        auth_header: &str,
+        auth_header: Option<&str>,
         nonce: Option<&str>,
         channel_binding: Option<&str>,
-    ) -> anyhow::Result<()>;
+    ) -> AuthResult;
+}
+
+/// Server-wide authentication policy.
+enum AuthPolicy {
+    /// No HTTP-level auth checks. Used for `--insecure` (no auth at all)
+    /// or mTLS-only (the TLS layer already verified the client certificate;
+    /// see `log_tls_connection()` for per-connection logging).
+    Open,
+    /// Each request must be approved by at least one authenticator.
+    Required(Vec<Box<dyn Authenticator>>),
+}
+
+impl AuthPolicy {
+    fn check_request(
+        &self,
+        method: &str,
+        path: &str,
+        auth_header: Option<&str>,
+        nonce: Option<&str>,
+        channel_binding: Option<&str>,
+    ) -> Result<(), String> {
+        let authenticators = match self {
+            AuthPolicy::Open => return Ok(()),
+            AuthPolicy::Required(a) => a,
+        };
+
+        let mut allowed = false;
+        for authenticator in authenticators {
+            match authenticator.check_request(method, path, auth_header, nonce, channel_binding) {
+                AuthResult::Allow => allowed = true,
+                AuthResult::Deny(reason) => return Err(reason),
+                AuthResult::Abstain => {}
+            }
+        }
+        if allowed {
+            Ok(())
+        } else {
+            Err("no authenticator accepted the request".to_string())
+        }
+    }
 }
 
 async fn auth_middleware(
@@ -475,27 +525,19 @@ async fn auth_middleware(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if state.authenticators.is_empty() {
-        return next.run(request).await;
-    }
-
-    let auth_header = match request.headers().get("authorization") {
-        Some(val) => match val.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(json!({"error": "invalid Authorization header encoding"})),
-                )
-                    .into_response();
-            }
-        },
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                axum::Json(json!({"error": "missing Authorization header"})),
-            )
-                .into_response();
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .map(|val| {
+            val.to_str()
+                .map(|s| s.to_string())
+                .map_err(|_| "invalid Authorization header encoding")
+        })
+        .transpose();
+    let auth_header = match auth_header {
+        Ok(h) => h,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": e}))).into_response()
         }
     };
 
@@ -513,31 +555,26 @@ async fn auth_middleware(
         .map_or(request.uri().path(), axum::http::uri::PathAndQuery::as_str)
         .to_string();
 
-    let mut errors = Vec::new();
-    for authenticator in state.authenticators.iter() {
-        match authenticator.check_request(
-            &method,
-            &path,
-            &auth_header,
-            nonce.as_deref(),
-            tls_channel_binding.as_deref(),
-        ) {
-            Ok(()) => return next.run(request).await,
-            Err(e) => errors.push(e.to_string()),
-        }
+    match state.auth_policy.check_request(
+        &method,
+        &path,
+        auth_header.as_deref(),
+        nonce.as_deref(),
+        tls_channel_binding.as_deref(),
+    ) {
+        Ok(()) => next.run(request).await,
+        Err(e) => (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"error": e})),
+        )
+            .into_response(),
     }
-
-    (
-        StatusCode::UNAUTHORIZED,
-        axum::Json(json!({"error": errors.join("; ")})),
-    )
-        .into_response()
 }
 
 #[derive(Clone)]
 struct AppState {
     varlink_sockets: Arc<VarlinkSockets>,
-    authenticators: Arc<Vec<Box<dyn Authenticator>>>,
+    auth_policy: Arc<AuthPolicy>,
 }
 
 async fn route_sockets_get(State(state): State<AppState>) -> Result<axum::Json<Value>, AppError> {
@@ -806,7 +843,7 @@ async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
 
 fn create_router(
     varlink_sockets_path: &str,
-    authenticators: Vec<Box<dyn Authenticator>>,
+    auth_policy: AuthPolicy,
 ) -> anyhow::Result<Router> {
     let metadata = std::fs::metadata(varlink_sockets_path)
         .with_context(|| format!("failed to stat {varlink_sockets_path}"))?;
@@ -819,7 +856,7 @@ fn create_router(
         } else {
             bail!("path {varlink_sockets_path} is neither a directory nor a socket");
         }),
-        authenticators: Arc::new(authenticators),
+        auth_policy: Arc::new(auth_policy),
     };
 
     // API routes behind auth middleware
@@ -862,9 +899,9 @@ async fn run_server(
     varlink_sockets_path: &str,
     listener: TcpListener,
     tls_acceptor: Option<openssl::ssl::SslAcceptor>,
-    authenticators: Vec<Box<dyn Authenticator>>,
+    auth_policy: AuthPolicy,
 ) -> anyhow::Result<()> {
-    let app = create_router(varlink_sockets_path, authenticators)?;
+    let app = create_router(varlink_sockets_path, auth_policy)?;
     let make_svc = app.into_make_service_with_connect_info::<VarlinkConnCache>();
 
     if let Some(acceptor) = tls_acceptor {
@@ -1066,12 +1103,16 @@ async fn main() -> anyhow::Result<()> {
         authenticators.push(Box::new(ssh_auth));
     }
 
-    if authenticators.is_empty() && !has_mtls && !cli.insecure {
-        bail!("no authentication configured: use --authorized-keys=, --trust=, or --insecure");
-    }
-    if cli.insecure && authenticators.is_empty() && !has_mtls {
+    let auth_policy = if cli.insecure {
         eprintln!("WARNING: running without authentication - all routes are open");
-    }
+        AuthPolicy::Open
+    } else if !authenticators.is_empty() {
+        AuthPolicy::Required(authenticators)
+    } else if has_mtls {
+        AuthPolicy::Open
+    } else {
+        bail!("no authentication configured: use --authorized-keys=, --trust=, or --insecure");
+    };
 
     let local_addr = listener.local_addr()?;
     let scheme = if tls_acceptor.is_some() {
@@ -1089,7 +1130,7 @@ async fn main() -> anyhow::Result<()> {
         &cli.varlink_sockets_path,
         listener,
         tls_acceptor,
-        authenticators,
+        auth_policy,
     )
     .await
 }

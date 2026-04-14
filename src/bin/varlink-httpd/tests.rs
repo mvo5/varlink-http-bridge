@@ -65,12 +65,12 @@ fn helper_binary() -> std::path::PathBuf {
 async fn run_test_server(
     varlink_sockets_path: &str,
 ) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
-    run_test_server_with_auth(varlink_sockets_path, Vec::new()).await
+    run_test_server_with_policy(varlink_sockets_path, AuthPolicy::Open).await
 }
 
-async fn run_test_server_with_auth(
+async fn run_test_server_with_policy(
     varlink_sockets_path: &str,
-    authenticators: Vec<Box<dyn Authenticator>>,
+    auth_policy: AuthPolicy,
 ) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -81,7 +81,7 @@ async fn run_test_server_with_auth(
 
     let varlink_sockets_path = varlink_sockets_path.to_string();
     let task_handle = tokio::spawn(async move {
-        run_server(&varlink_sockets_path, listener, None, authenticators)
+        run_server(&varlink_sockets_path, listener, None, auth_policy)
             .await
             .expect("server failed")
     });
@@ -423,7 +423,7 @@ async fn test_varlink_sockets_dir_or_file_missing() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind to random port failed");
-    let res = run_server(&varlink_sockets_dir_or_file, listener, None, Vec::new()).await;
+    let res = run_server(&varlink_sockets_dir_or_file, listener, None, AuthPolicy::Open).await;
 
     assert!(res.is_err());
     assert!(
@@ -620,7 +620,7 @@ async fn test_varlink_conn_cache_reuses_connection() {
     let sockets = Arc::new(VarlinkSockets::from_socket_dir("/run/systemd").unwrap());
     let state = AppState {
         varlink_sockets: sockets,
-        authenticators: Arc::new(Vec::new()),
+        auth_policy: Arc::new(AuthPolicy::Open),
     };
     let cache = VarlinkConnCache::new(None);
 
@@ -921,13 +921,26 @@ async fn run_test_tls_server(
     varlink_sockets_path: &str,
     tls_acceptor: openssl::ssl::SslAcceptor,
 ) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
-    run_test_tls_server_with_auth(varlink_sockets_path, tls_acceptor, Vec::new()).await
+    run_test_tls_server_with_policy(varlink_sockets_path, tls_acceptor, AuthPolicy::Open).await
 }
 
 async fn run_test_tls_server_with_auth(
     varlink_sockets_path: &str,
     tls_acceptor: openssl::ssl::SslAcceptor,
     authenticators: Vec<Box<dyn Authenticator>>,
+) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
+    run_test_tls_server_with_policy(
+        varlink_sockets_path,
+        tls_acceptor,
+        AuthPolicy::Required(authenticators),
+    )
+    .await
+}
+
+async fn run_test_tls_server_with_policy(
+    varlink_sockets_path: &str,
+    tls_acceptor: openssl::ssl::SslAcceptor,
+    auth_policy: AuthPolicy,
 ) -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -942,7 +955,7 @@ async fn run_test_tls_server_with_auth(
             &varlink_sockets_path,
             listener,
             Some(tls_acceptor),
-            authenticators,
+            auth_policy,
         )
         .await
         .expect("server failed")
@@ -1315,7 +1328,7 @@ mod sshauth_tests {
         let tmpdir = tempfile::tempdir().unwrap();
         // Keep tmpdir so it lives for the test duration (but gets cleaned up eventually)
         let path = tmpdir.keep();
-        create_router(path.to_str().unwrap(), authenticators).unwrap()
+        create_router(path.to_str().unwrap(), AuthPolicy::Required(authenticators)).unwrap()
     }
 
     #[test]
@@ -1380,8 +1393,8 @@ mod sshauth_tests {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let header = format!("Bearer {}", token.encode());
-        let result = auth.check_request("GET", "/sockets", &header, Some(nonce), None);
-        assert!(result.is_err(), "expired token should be rejected");
+        let result = auth.check_request("GET", "/sockets", Some(header.as_str()), Some(nonce), None);
+        assert!(matches!(result, AuthResult::Deny(_)), "expired token should be rejected");
     }
 
     #[tokio::test]
@@ -1402,13 +1415,10 @@ mod sshauth_tests {
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        let result = auth.check_request("GET", "/sockets", &header, Some(nonce), None);
-        assert!(result.is_err());
+        let result = auth.check_request("GET", "/sockets", Some(header.as_str()), Some(nonce), None);
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("token verification failed")
+            matches!(&result, AuthResult::Deny(reason) if reason.contains("token verification failed")),
+            "expected 'token verification failed' denial, got: {result:?}"
         );
     }
 
@@ -1428,8 +1438,8 @@ mod sshauth_tests {
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb))
-            .expect("valid ed25519 token should pass");
+        let result = auth.check_request("GET", "/sockets", Some(header.as_str()), Some(nonce), Some(cb));
+        assert!(matches!(result, AuthResult::Allow), "valid ed25519 token should pass");
     }
 
     #[tokio::test]
@@ -1486,16 +1496,16 @@ mod sshauth_tests {
             &self,
             _method: &str,
             _path: &str,
-            _auth_header: &str,
+            _auth_header: Option<&str>,
             _nonce: Option<&str>,
             _channel_binding: Option<&str>,
-        ) -> anyhow::Result<()> {
-            anyhow::bail!("{}", self.0)
+        ) -> AuthResult {
+            AuthResult::Deny(self.0.to_string())
         }
     }
 
     #[tokio::test]
-    async fn test_all_auth_rejected_errors_and_errors_are_joined() {
+    async fn test_first_deny_stops_chain() {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
@@ -1519,7 +1529,7 @@ mod sshauth_tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let error = json["error"].as_str().unwrap();
-        assert_eq!(error, "error1; error2");
+        assert_eq!(error, "error1");
     }
 
     #[tokio::test]
@@ -1538,7 +1548,23 @@ mod sshauth_tests {
     }
 
     #[tokio::test]
-    async fn test_ssh_auth_no_authenticators_allows_all() {
+    async fn test_auth_policy_open_allows_all() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.keep();
+        let app = create_router(path.to_str().unwrap(), AuthPolicy::Open).unwrap();
+        let response = app
+            .oneshot(Request::get("/sockets").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_policy_required_with_no_authenticators_rejects() {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
@@ -1548,8 +1574,7 @@ mod sshauth_tests {
             .oneshot(Request::get("/sockets").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        // No authenticators = open access
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1569,18 +1594,14 @@ mod sshauth_tests {
         let header = format!("Bearer {}", token.encode());
 
         // First use should succeed
-        auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb))
-            .expect("first use of nonce should pass");
+        let result = auth.check_request("GET", "/sockets", Some(header.as_str()), Some(nonce), Some(cb));
+        assert!(matches!(result, AuthResult::Allow), "first use of nonce should pass");
 
         // Replay with the same nonce should fail
-        let result = auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb));
-        assert!(result.is_err(), "replayed nonce should be rejected");
+        let result = auth.check_request("GET", "/sockets", Some(header.as_str()), Some(nonce), Some(cb));
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("nonce already used"),
-            "error should mention nonce replay"
+            matches!(&result, AuthResult::Deny(reason) if reason.contains("nonce already used")),
+            "expected nonce replay denial, got: {result:?}"
         );
     }
 
@@ -1595,9 +1616,11 @@ mod sshauth_tests {
         let header = format!("Bearer {}", token.encode());
 
         // Without a nonce, the request should be rejected
-        let result = auth.check_request("GET", "/sockets", &header, None, None);
-        assert!(result.is_err(), "request without nonce should be rejected");
-        assert!(result.unwrap_err().to_string().contains("missing nonce"));
+        let result = auth.check_request("GET", "/sockets", Some(header.as_str()), None, None);
+        assert!(
+            matches!(&result, AuthResult::Deny(reason) if reason.contains("missing nonce")),
+            "expected missing nonce denial, got: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1617,9 +1640,9 @@ mod sshauth_tests {
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        let result = auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb_verifier));
+        let result = auth.check_request("GET", "/sockets", Some(header.as_str()), Some(nonce), Some(cb_verifier));
         assert!(
-            result.is_err(),
+            matches!(result, AuthResult::Deny(_)),
             "mismatched channel binding should be rejected (relay attack)"
         );
     }
@@ -1640,8 +1663,8 @@ mod sshauth_tests {
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        auth.check_request("GET", "/sockets", &header, Some(nonce), Some(cb))
-            .expect("matching channel binding should pass");
+        let result = auth.check_request("GET", "/sockets", Some(header.as_str()), Some(nonce), Some(cb));
+        assert!(matches!(result, AuthResult::Allow), "matching channel binding should pass");
     }
 
     #[test]
