@@ -7,7 +7,7 @@ Release:        %autorelease
 Summary:        HTTP bridge for local varlink services
 
 License:        LGPL-2.1-or-later
-URL:            https://github.com/mvo5/varlink-proxy-rs
+URL:            https://github.com/systemd/varlink-http-bridge
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo
