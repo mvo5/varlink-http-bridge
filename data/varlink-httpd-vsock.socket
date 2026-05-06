@@ -5,6 +5,11 @@
 [Unit]
 Description=Varlink HTTP Bridge (vsock)
 ConditionVirtualization=vm
+# Start early so the bridge is reachable for remote management while
+# systemd-firstboot.service may still be blocking.
+DefaultDependencies=no
+Before=sockets.target
+Conflicts=shutdown.target
 
 [Socket]
 ListenStream=vsock::1031

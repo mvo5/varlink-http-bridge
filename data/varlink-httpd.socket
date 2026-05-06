@@ -4,6 +4,11 @@
 
 [Unit]
 Description=Varlink HTTP Bridge (TCP)
+# Start early so the bridge is reachable for remote management while
+# systemd-firstboot.service may still be blocking.
+DefaultDependencies=no
+Before=sockets.target
+Conflicts=shutdown.target
 
 [Socket]
 ListenStream=0.0.0.0:1031

@@ -19,6 +19,12 @@ ExecStart=@bindir@/varlink-httpd
 Restart=on-failure
 RestartSec=5
 
+# Pass the FDs from both socket units in a single service start. Without
+# this, whichever socket triggers activation first wins the race; the
+# other socket's FD stays held by systemd and connections on that
+# transport never reach varlink-httpd.
+Sockets=varlink-httpd.socket varlink-httpd-vsock.socket
+
 # Hardening
 ProtectSystem=strict
 ProtectHome=yes
