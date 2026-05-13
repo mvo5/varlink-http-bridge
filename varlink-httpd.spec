@@ -1,6 +1,10 @@
 # we have "strip = true in Cargo.toml" so we need to undefine this
 %undefine _debugsource_packages
 
+# linkdupes BRP (Fedora 44) calls libselinux selabel_open() which fails in
+# build sandboxes without /etc/selinux populated (e.g. mkosi). Skip it.
+%undefine __brp_linkdupes
+
 Name:           varlink-httpd
 Version:        0.1.0
 Release:        %autorelease
