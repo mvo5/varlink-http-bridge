@@ -196,7 +196,55 @@ fn connect_vsock(url: &str, use_tls: bool) -> Result<(Stream, String, Option<Str
     }
 }
 
-fn connect_tcp(url: &str) -> Result<(Stream, String, Option<String>)> {
+/// Open a TCP connection to `target_host:target_port` through an HTTP
+/// `CONNECT` proxy (the varlink tunnel relay), à la `curl --proxytunnel`.
+/// The returned stream is a transparent pipe to the target, so the caller's
+/// TLS handshake terminates end-to-end at the target (the node's bridge) and
+/// the RFC 9266 channel binding stays valid.
+fn connect_via_proxy(proxy: &str, target_host: &str, target_port: u16) -> Result<TcpStream> {
+    let authority = proxy
+        .strip_prefix("http://")
+        .unwrap_or(proxy)
+        .trim_end_matches('/');
+    let mut tcp = TcpStream::connect(authority)
+        .with_context(|| format!("connecting to proxy {authority}"))?;
+    let req = format!(
+        "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n\r\n"
+    );
+    tcp.write_all(req.as_bytes())
+        .context("sending CONNECT to proxy")?;
+
+    // Read the response head (up to the blank line) byte by byte so we never
+    // consume bytes belonging to the tunnelled stream that follows.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = tcp.read(&mut byte).context("reading CONNECT response")?;
+        if n == 0 {
+            bail!("proxy closed before completing CONNECT response");
+        }
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if head.len() > 8192 {
+            bail!("CONNECT response head too large");
+        }
+    }
+    let status = String::from_utf8_lossy(&head);
+    let status_line = status.lines().next().unwrap_or_default();
+    // Accept any 2xx (e.g. "HTTP/1.1 200 Connection established").
+    let ok = status_line
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|code| code.starts_with('2'));
+    if !ok {
+        bail!("proxy CONNECT to {target_host}:{target_port} rejected: {status_line:?}");
+    }
+    Ok(tcp)
+}
+
+fn connect_tcp(url: &str, proxy: Option<&str>) -> Result<(Stream, String, Option<String>)> {
     let ws_url = if let Some(rest) = url.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = url.strip_prefix("http://") {
@@ -209,8 +257,11 @@ fn connect_tcp(url: &str) -> Result<(Stream, String, Option<String>)> {
     let host = uri.host().context("URL has no host")?;
     let port = uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
 
-    let tcp = TcpStream::connect((host, port))
-        .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
+    let tcp = match proxy {
+        Some(proxy) => connect_via_proxy(proxy, host, port)?,
+        None => TcpStream::connect((host, port))
+            .with_context(|| format!("TCP connect to {host}:{port} failed"))?,
+    };
     varlink_http_bridge::set_tcp_keepalive_and_nodelay(&tcp).context("configure client socket")?;
 
     let stream =
@@ -233,16 +284,22 @@ fn connect_tcp(url: &str) -> Result<(Stream, String, Option<String>)> {
     Ok((stream, ws_url, tls_channel_binding))
 }
 
-fn connect_ws(url: &str) -> Result<Ws> {
+fn connect_ws(url: &str, proxy: Option<&str>) -> Result<Ws> {
     use tungstenite::client::IntoClientRequest;
 
     let (stream, ws_url, tls_channel_binding) = if let Some(rest) = url.strip_prefix("vsock+tls://")
     {
+        if proxy.is_some() {
+            bail!("--proxy / VARLINK_BRIDGE_PROXY is not supported with vsock URLs");
+        }
         connect_vsock(&format!("vsock://{rest}"), true)?
     } else if url.starts_with("vsock://") {
+        if proxy.is_some() {
+            bail!("--proxy / VARLINK_BRIDGE_PROXY is not supported with vsock URLs");
+        }
         connect_vsock(url, false)?
     } else {
-        connect_tcp(url)?
+        connect_tcp(url, proxy)?
     };
 
     // Use into_client_request() here as it auto-generates standard WS upgrade headers,
@@ -298,6 +355,28 @@ fn graceful_close(ws: &mut Ws) -> Result<()> {
     Ok(())
 }
 
+/// Split CLI args (everything after argv[0]) into the optional bridge URL
+/// (the first positional) and an optional `--proxy <url>` / `--proxy=<url>`.
+fn parse_cli_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<(Option<String>, Option<String>)> {
+    let mut url = None;
+    let mut proxy = None;
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        if let Some(value) = arg.strip_prefix("--proxy=") {
+            proxy = Some(value.to_string());
+        } else if arg == "--proxy" {
+            proxy = Some(it.next().context("--proxy requires a value")?);
+        } else if url.is_none() {
+            url = Some(arg);
+        } else {
+            bail!("unexpected extra argument: {arg}");
+        }
+    }
+    Ok((url, proxy))
+}
+
 fn main() -> Result<()> {
     env_logger::init();
 
@@ -312,19 +391,24 @@ fn main() -> Result<()> {
     // XXX: once https://github.com/systemd/systemd/issues/40640 is implemented
     // we can remove the env_url and this confusing match
     let env_url = std::env::var("VARLINK_BRIDGE_URL").ok();
-    let arg_url = std::env::args().nth(1);
+    let (arg_url, arg_proxy) = parse_cli_args(std::env::args().skip(1))?;
     let bridge_url = match (env_url, arg_url) {
         (Some(_), Some(_)) => bail!("cannot set both VARLINK_BRIDGE_URL and argv[1]"),
         (None, None) => bail!("bridge URL required via VARLINK_BRIDGE_URL or argv[1]"),
         (Some(url), None) | (None, Some(url)) => url,
     };
 
+    // Optional HTTP CONNECT proxy (the varlink tunnel relay): reach a node's
+    // bridge through `wss://<machine-id>/...` tunnelled via the relay. The
+    // flag wins over the env var.
+    let proxy = arg_proxy.or_else(|| std::env::var("VARLINK_BRIDGE_PROXY").ok());
+
     // Safety: fd 3 is passed to us via the sd_listen_fds() protocol.
     let fd3 = unsafe { OwnedFd::from_raw_fd(3) };
     rustix::io::fcntl_getfd(&fd3).context("fd 3 is not valid (LISTEN_FDS protocol error?)")?;
     let mut fd3 = UnixStream::from(fd3);
 
-    let mut ws = connect_ws(&bridge_url)?;
+    let mut ws = connect_ws(&bridge_url, proxy.as_deref())?;
 
     // Set non-blocking so that we deal with incomplete websocket
     // frames in ws.read() - they return WouldBlock now and we can
@@ -413,5 +497,85 @@ mod tests {
         assert!(parse_vsock_url("http://localhost").is_err());
         assert!(parse_vsock_url("vsock://notanumber:1031/path").is_err());
         assert!(parse_vsock_url("vsock://2:notaport/path").is_err());
+    }
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_cli_url_only() {
+        let (url, proxy) = parse_cli_args(args(&["wss://node/ws/sockets/x"])).unwrap();
+        assert_eq!(url.as_deref(), Some("wss://node/ws/sockets/x"));
+        assert_eq!(proxy, None);
+    }
+
+    #[test]
+    fn parse_cli_proxy_separate_and_joined() {
+        let (url, proxy) =
+            parse_cli_args(args(&["--proxy", "http://relay:8444", "wss://node/x"])).unwrap();
+        assert_eq!(url.as_deref(), Some("wss://node/x"));
+        assert_eq!(proxy.as_deref(), Some("http://relay:8444"));
+
+        let (url, proxy) =
+            parse_cli_args(args(&["wss://node/x", "--proxy=http://relay:8444"])).unwrap();
+        assert_eq!(url.as_deref(), Some("wss://node/x"));
+        assert_eq!(proxy.as_deref(), Some("http://relay:8444"));
+    }
+
+    #[test]
+    fn parse_cli_errors() {
+        assert!(parse_cli_args(args(&["--proxy"])).is_err());
+        assert!(parse_cli_args(args(&["url-a", "url-b"])).is_err());
+    }
+
+    /// A fake CONNECT proxy: assert the request line, reply `reply`, then
+    /// echo so the caller can confirm the tunnel is live.
+    fn fake_proxy(reply: &'static str) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while s.read(&mut byte).unwrap() == 1 {
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&head);
+            assert!(
+                head.starts_with("CONNECT node-1:443 HTTP/1.1\r\n"),
+                "unexpected CONNECT head: {head:?}"
+            );
+            s.write_all(reply.as_bytes()).unwrap();
+            // Echo the tunnelled bytes back.
+            let mut buf = [0u8; 64];
+            while let Ok(n) = s.read(&mut buf) {
+                if n == 0 || s.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn connect_via_proxy_tunnels_on_200() {
+        let addr = fake_proxy("HTTP/1.1 200 Connection established\r\n\r\n");
+        let mut tcp = connect_via_proxy(&addr.to_string(), "node-1", 443).unwrap();
+        // The socket is now a transparent pipe; the fake proxy echoes.
+        tcp.write_all(b"hello").unwrap();
+        let mut got = [0u8; 5];
+        tcp.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello");
+    }
+
+    #[test]
+    fn connect_via_proxy_errors_on_502() {
+        let addr = fake_proxy("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        let err = connect_via_proxy(&addr.to_string(), "node-1", 443).unwrap_err();
+        assert!(format!("{err:#}").contains("502"), "got: {err:#}");
     }
 }

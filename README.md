@@ -136,6 +136,19 @@ $ varlinkctl call http://localhost:1031/ws/sockets/io.systemd.Hostname io.system
 ...
 ```
 
+## Connecting through a proxy
+
+`varlinkctl-http` can reach a bridge through an HTTP `CONNECT` proxy,
+like `curl --proxytunnel -x`. Set `VARLINK_BRIDGE_PROXY` (or pass
+`--proxy <url>`); the proxy `CONNECT`s to the bridge host and the
+TLS session stays end-to-end, so channel-bound auth keeps working.
+
+```console
+$ VARLINK_BRIDGE_PROXY=http://proxy:8444 \
+    varlinkctl call wss://host/ws/sockets/io.systemd.Hostname \
+    io.systemd.Hostname.Describe '{}'
+```
+
 ## Examples (websocket)
 
 The examples use websocat because curl for websockets support is relatively new and
