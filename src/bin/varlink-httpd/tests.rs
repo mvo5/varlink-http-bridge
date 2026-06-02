@@ -872,7 +872,14 @@ async fn run_test_tls_server(
     varlink_sockets_path: &str,
     tls_acceptor: openssl::ssl::SslAcceptor,
 ) -> TestServer<std::net::SocketAddr> {
-    run_test_tls_server_with_auth(varlink_sockets_path, tls_acceptor, Vec::new()).await
+    // mirror the production mTLS-only path: the client is verified during
+    // the TLS handshake, no per-request HTTP authentication
+    run_test_tls_server_with_auth(
+        varlink_sockets_path,
+        tls_acceptor,
+        vec![Box::new(crate::AllowAllAuthenticator { reason: "test" })],
+    )
+    .await
 }
 
 async fn run_test_tls_server_with_auth(
