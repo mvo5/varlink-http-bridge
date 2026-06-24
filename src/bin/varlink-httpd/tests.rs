@@ -75,6 +75,49 @@ fn helper_binary() -> std::path::PathBuf {
     helper
 }
 
+/// Run `varlinkctl call <method> <params>` against `bridge_url`,
+/// returning the process output. `extra_env` adds environment
+/// variables (e.g. `XDG_CONFIG_HOME`, `VARLINK_SSH_KEY`).
+async fn run_varlinkctl_call(
+    bridge_url: &str,
+    method: &str,
+    params: &str,
+    more: bool,
+    extra_env: &[(&str, &std::path::Path)],
+) -> std::process::Output {
+    let exec = format!("exec:{}", helper_binary().display());
+    let mut args = vec!["call"];
+    if more {
+        args.push("--more");
+    }
+    args.extend(["--json=short", exec.as_str(), method, params]);
+
+    let mut cmd = tokio::process::Command::new("varlinkctl");
+    cmd.args(&args)
+        .env("VARLINK_BRIDGE_URL", bridge_url)
+        // remove to avoid external env contamination
+        .env_remove("SSH_AUTH_SOCK");
+    for (key, val) in extra_env {
+        cmd.env(key, val);
+    }
+    cmd.output().await.expect("failed to run varlinkctl")
+}
+
+/// Assert a `varlinkctl` call succeeded and returned this hosts hostname.
+fn assert_hostname_reply(output: &std::process::Output) {
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "varlinkctl failed (stderr: {stderr})"
+    );
+
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let line = stdout.trim().trim_start_matches('\x1e');
+    let body: Value = serde_json::from_str(line).expect("varlinkctl output not valid JSON");
+    let expected_hostname = gethostname().into_string().expect("failed to get hostname");
+    assert_eq!(body["Hostname"], expected_hostname);
+}
+
 async fn run_test_server(varlink_sockets_path: &str) -> TestServer<std::net::SocketAddr> {
     run_test_server_with_auth(
         varlink_sockets_path,
@@ -705,32 +748,15 @@ async fn test_jsonseq_userdb_get_user_record_more() {
 async fn test_varlinkctl_helper_hostname_describe() {
     let server = run_test_server("/run/systemd").await;
     let bridge_url = format!("http://{}/ws/sockets/io.systemd.Hostname", server.addr);
-    let output = tokio::process::Command::new("varlinkctl")
-        .args([
-            "call",
-            "--json=short",
-            &format!("exec:{}", helper_binary().display()),
-            "io.systemd.Hostname.Describe",
-            "{}",
-        ])
-        .env("VARLINK_BRIDGE_URL", &bridge_url)
-        .output()
-        .await
-        .expect("failed to run varlinkctl");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "varlinkctl failed (stderr: {stderr})"
-    );
-
-    let stdout = String::from_utf8(output.stdout).expect("invalid UTF-8 in varlinkctl output");
-    let line = stdout.trim().trim_start_matches('\x1e');
-    let body: Value =
-        serde_json::from_str(line).expect("varlinkctl output not valid JSON: {e}: {line:?}");
-
-    let expected_hostname = gethostname().into_string().expect("failed to get hostname");
-    assert_eq!(body["Hostname"], expected_hostname);
+    let output = run_varlinkctl_call(
+        &bridge_url,
+        "io.systemd.Hostname.Describe",
+        "{}",
+        false,
+        &[],
+    )
+    .await;
+    assert_hostname_reply(&output);
 }
 
 #[test_with::path(/usr/bin/varlinkctl)]
@@ -739,21 +765,16 @@ async fn test_varlinkctl_helper_hostname_describe() {
 async fn test_varlinkctl_helper_userdb_get_user_record() {
     let server = run_test_server("/run/systemd/userdb").await;
     let bridge_url = format!("http://{}/ws/sockets/io.systemd.Multiplexer", server.addr);
-    let output = tokio::process::Command::new("varlinkctl")
-        .args([
-            "call",
-            "--more",
-            "--json=short",
-            &format!("exec:{}", helper_binary().display()),
-            "io.systemd.UserDatabase.GetUserRecord",
-            r#"{"service":"io.systemd.Multiplexer"}"#,
-        ])
-        .env("VARLINK_BRIDGE_URL", &bridge_url)
-        .output()
-        .await
-        .expect("failed to run varlinkctl");
+    let output = run_varlinkctl_call(
+        &bridge_url,
+        "io.systemd.UserDatabase.GetUserRecord",
+        r#"{"service":"io.systemd.Multiplexer"}"#,
+        true,
+        &[],
+    )
+    .await;
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
     assert!(
         output.status.success(),
         "varlinkctl failed (stderr: {stderr})"
@@ -1058,33 +1079,15 @@ async fn test_varlinkctl_helper_mtls_hostname_describe() {
         server.addr.port()
     );
 
-    let output = tokio::process::Command::new("varlinkctl")
-        .args([
-            "call",
-            "--json=short",
-            &format!("exec:{}", helper_binary().display()),
-            "io.systemd.Hostname.Describe",
-            "{}",
-        ])
-        .env("VARLINK_BRIDGE_URL", &bridge_url)
-        .env("XDG_CONFIG_HOME", fake_xdg_home.path())
-        .output()
-        .await
-        .expect("failed to run varlinkctl");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "varlinkctl failed (stderr: {stderr})"
-    );
-
-    let stdout = String::from_utf8(output.stdout).expect("invalid UTF-8 in varlinkctl output");
-    let line = stdout.trim().trim_start_matches('\x1e');
-    let body: Value =
-        serde_json::from_str(line).expect("varlinkctl output not valid JSON: {e}: {line:?}");
-
-    let expected_hostname = gethostname().into_string().expect("failed to get hostname");
-    assert_eq!(body["Hostname"], expected_hostname);
+    let output = run_varlinkctl_call(
+        &bridge_url,
+        "io.systemd.Hostname.Describe",
+        "{}",
+        false,
+        &[("XDG_CONFIG_HOME", fake_xdg_home.path())],
+    )
+    .await;
+    assert_hostname_reply(&output);
 }
 
 #[test_with::path(/usr/bin/openssl)]
@@ -1113,21 +1116,16 @@ async fn test_varlinkctl_helper_mtls_no_client_cert() {
         server.addr.port()
     );
 
-    let output = tokio::process::Command::new("varlinkctl")
-        .args([
-            "call",
-            "--json=short",
-            &format!("exec:{}", helper_binary().display()),
-            "io.systemd.Hostname.Describe",
-            "{}",
-        ])
-        .env("VARLINK_BRIDGE_URL", &bridge_url)
-        .env("XDG_CONFIG_HOME", fake_xdg_home.path())
-        .output()
-        .await
-        .expect("failed to run varlinkctl");
+    let output = run_varlinkctl_call(
+        &bridge_url,
+        "io.systemd.Hostname.Describe",
+        "{}",
+        false,
+        &[("XDG_CONFIG_HOME", fake_xdg_home.path())],
+    )
+    .await;
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
     assert!(
         !output.status.success(),
         "expected failure without client cert, but helper succeeded"
@@ -1339,30 +1337,15 @@ async fn test_varlinkctl_helper_vsock_hostname_describe() {
 
     let server = run_test_vsock_server("/run/systemd").await;
     let bridge_url = format!("vsock://1:{}/ws/sockets/io.systemd.Hostname", server.addr);
-    let output = tokio::process::Command::new("varlinkctl")
-        .args([
-            "call",
-            "--json=short",
-            &format!("exec:{}", helper_binary().display()),
-            "io.systemd.Hostname.Describe",
-            "{}",
-        ])
-        .env("VARLINK_BRIDGE_URL", &bridge_url)
-        .output()
-        .await
-        .expect("failed to run varlinkctl");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "varlinkctl over vsock failed (stderr: {stderr})"
-    );
-
-    let stdout = String::from_utf8(output.stdout).expect("invalid UTF-8");
-    let line = stdout.trim().trim_start_matches('\x1e');
-    let body: Value = serde_json::from_str(line).expect("invalid JSON from varlinkctl");
-    let expected_hostname = gethostname().into_string().expect("failed to get hostname");
-    assert_eq!(body["Hostname"], expected_hostname);
+    let output = run_varlinkctl_call(
+        &bridge_url,
+        "io.systemd.Hostname.Describe",
+        "{}",
+        false,
+        &[],
+    )
+    .await;
+    assert_hostname_reply(&output);
 }
 
 // --- SSH key auth tests ---
@@ -1947,31 +1930,17 @@ mod sshauth_tests {
             server.addr.port()
         );
 
-        let output = tokio::process::Command::new("varlinkctl")
-            .args([
-                "call",
-                "--json=short",
-                &format!("exec:{}", helper_binary().display()),
-                "io.systemd.Hostname.Describe",
-                "{}",
-            ])
-            .env("VARLINK_BRIDGE_URL", &bridge_url)
-            .env("XDG_CONFIG_HOME", fake_xdg_home.path())
-            .env("VARLINK_SSH_KEY", &key_path)
-            .output()
-            .await
-            .expect("failed to run varlinkctl");
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "varlinkctl with TLS + SSH auth failed (stderr: {stderr})"
-        );
-
-        let stdout = String::from_utf8(output.stdout).expect("invalid UTF-8");
-        let line = stdout.trim().trim_start_matches('\x1e');
-        let body: serde_json::Value = serde_json::from_str(line).expect("invalid JSON");
-        let expected_hostname = gethostname().into_string().expect("failed to get hostname");
-        assert_eq!(body["Hostname"], expected_hostname);
+        let output = run_varlinkctl_call(
+            &bridge_url,
+            "io.systemd.Hostname.Describe",
+            "{}",
+            false,
+            &[
+                ("XDG_CONFIG_HOME", fake_xdg_home.path()),
+                ("VARLINK_SSH_KEY", key_path.as_path()),
+            ],
+        )
+        .await;
+        assert_hostname_reply(&output);
     }
 } // mod sshauth_tests
