@@ -262,7 +262,7 @@ fn connect_ws(url: &str) -> Result<Ws> {
     // it may add more
     maybe_add_auth_headers(&mut request, &uri, tls_channel_binding.as_deref())?;
 
-    let is_tls = matches!(&stream, Stream::Tls(_));
+    let is_tls = matches!(&stream, Stream::Tls(_) | Stream::TlsVsock(_));
     let (ws, _) = tungstenite::client(request, stream).map_err(|e| {
         let http_detail = match &e {
             tungstenite::HandshakeError::Failure(tungstenite::Error::Http(resp)) => {
