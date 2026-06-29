@@ -233,6 +233,13 @@ fn connect_tcp(url: &str) -> Result<(Stream, String, Option<String>)> {
     Ok((stream, ws_url, tls_channel_binding))
 }
 
+fn resp_body_text(resp: &tungstenite::http::Response<Option<Vec<u8>>>) -> Option<String> {
+    resp.body()
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+}
+
 fn connect_ws(url: &str) -> Result<Ws> {
     use tungstenite::client::IntoClientRequest;
 
@@ -255,11 +262,24 @@ fn connect_ws(url: &str) -> Result<Ws> {
     // it may add more
     maybe_add_auth_headers(&mut request, &uri, tls_channel_binding.as_deref())?;
 
-    let ws_context = match &stream {
-        Stream::Tls(_) => "WebSocket handshake failed: check client cert if server requires mTLS",
-        _ => "WebSocket handshake failed",
-    };
-    let (ws, _) = tungstenite::client(request, stream).context(ws_context)?;
+    let is_tls = matches!(&stream, Stream::Tls(_));
+    let (ws, _) = tungstenite::client(request, stream).map_err(|e| {
+        let http_detail = match &e {
+            tungstenite::HandshakeError::Failure(tungstenite::Error::Http(resp)) => {
+                match resp_body_text(resp) {
+                    Some(body) => format!(": HTTP {}: {body}", resp.status()),
+                    None => format!(": HTTP {}", resp.status()),
+                }
+            }
+            _ => String::new(),
+        };
+        let tls_hint = if is_tls {
+            " (check client cert if server requires mTLS)"
+        } else {
+            ""
+        };
+        anyhow::Error::new(e).context(format!("WebSocket handshake failed{http_detail}{tls_hint}"))
+    })?;
     Ok(ws)
 }
 
