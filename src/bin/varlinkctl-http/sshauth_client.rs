@@ -35,10 +35,7 @@ pub(crate) fn maybe_add_auth_headers(
     let (bearer, nonce) = match build_auth_token("GET", path_and_query, tls_channel_binding) {
         Ok(Some((bearer, nonce))) => (bearer, nonce),
         Ok(None) => return Ok(()),
-        Err(e) => {
-            warn!("SSH auth token generation failed, proceeding without: {e:#}");
-            return Ok(());
-        }
+        Err(e) => return Err(e).context("auth token generation failed"),
     };
     request.headers_mut().insert(
         "Authorization",
