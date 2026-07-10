@@ -1,0 +1,12 @@
+[package]
+name = "ssh-key-import"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+
+[dependencies]
+anyhow = "1.0.100"
+ssh-key = "0.6"
+sshauth = "0.1"
+tempfile = "3.27"
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
