@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use log::{debug, warn};
+use tokio_tungstenite::tungstenite;
 use varlink_http_bridge::SSHAUTH_MAGIC_PREFIX;
 
 struct Signer {
@@ -12,27 +13,19 @@ struct Signer {
     source: String,
 }
 
-// Slightly ugly to build it here dynamically, but when this code is
-// built without the sshauth feature this file is not built at all so
-// making everything async seems overkill (only this helper needs
-// async so far)
-static TOKIO_RT: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .build()
-        .expect("creating tokio runtime")
-});
-
-pub(crate) fn maybe_add_auth_headers(
+pub(crate) async fn maybe_add_auth_headers(
     request: &mut tungstenite::http::Request<()>,
-    uri: &tungstenite::http::Uri,
     tls_channel_binding: Option<&str>,
 ) -> Result<()> {
-    let path_and_query = uri
+    // to_string: ends the borrow of `request` before headers_mut() below
+    let path_and_query = request
+        .uri()
         .path_and_query()
-        .map_or(uri.path(), tungstenite::http::uri::PathAndQuery::as_str);
+        .map_or(request.uri().path(), |pq| pq.as_str())
+        .to_string();
 
-    let (bearer, nonce) = match build_auth_token("GET", path_and_query, tls_channel_binding) {
+    let (bearer, nonce) = match build_auth_token("GET", &path_and_query, tls_channel_binding).await
+    {
         Ok(Some((bearer, nonce))) => (bearer, nonce),
         Ok(None) => return Ok(()),
         Err(e) => return Err(e).context("auth token generation failed"),
@@ -51,41 +44,38 @@ pub(crate) fn maybe_add_auth_headers(
 /// Build an SSH auth token for the given HTTP method and path.
 ///
 /// Returns `Ok(None)` when no SSH credentials are available.
-fn build_auth_token(
+async fn build_auth_token(
     method: &str,
     path_and_query: &str,
     tls_channel_binding: Option<&str>,
 ) -> Result<Option<(String, String)>> {
-    // The sshauth crate is async so we need to run this inside an async context
-    TOKIO_RT.block_on(async {
-        let Some(mut signer) = build_signer().await? else {
-            return Ok(None);
-        };
-        debug!(
-            "SSH auth: using {} key {} ({}) from {}",
-            signer.algo, signer.fingerprint, signer.comment, signer.source,
+    let Some(mut signer) = build_signer().await? else {
+        return Ok(None);
+    };
+    debug!(
+        "SSH auth: using {} key {} ({}) from {}",
+        signer.algo, signer.fingerprint, signer.comment, signer.source,
+    );
+
+    let nonce = generate_nonce();
+
+    signer
+        .builder
+        .include_fingerprint(true)
+        .magic_prefix(SSHAUTH_MAGIC_PREFIX);
+    let token_signer = signer.builder.build()?;
+
+    let mut tb = token_signer.sign_for();
+    tb.action("method", method)
+        .action("path", path_and_query)
+        .action("nonce", &nonce)
+        .action(
+            "tls-channel-binding",
+            tls_channel_binding.unwrap_or_default(),
         );
 
-        let nonce = generate_nonce();
-
-        signer
-            .builder
-            .include_fingerprint(true)
-            .magic_prefix(SSHAUTH_MAGIC_PREFIX);
-        let token_signer = signer.builder.build()?;
-
-        let mut tb = token_signer.sign_for();
-        tb.action("method", method)
-            .action("path", path_and_query)
-            .action("nonce", &nonce)
-            .action(
-                "tls-channel-binding",
-                tls_channel_binding.unwrap_or_default(),
-            );
-
-        let token: sshauth::token::Token = tb.sign().await?;
-        Ok(Some((format!("Bearer {}", token.encode()), nonce)))
-    })
+    let token: sshauth::token::Token = tb.sign().await?;
+    Ok(Some((format!("Bearer {}", token.encode()), nonce)))
 }
 
 /// Build a [`Signer`] from the available SSH credentials.

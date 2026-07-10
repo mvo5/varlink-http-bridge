@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use log::warn;
+use futures_util::{SinkExt, StreamExt};
+use log::{debug, warn};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVersion};
-use rustix::event::{PollFd, PollFlags, poll};
-use tungstenite::{Message, WebSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::{self, Message};
 
 #[cfg(feature = "sshauth")]
 mod sshauth_client;
@@ -21,93 +21,27 @@ mod sshauth_client;
 #[cfg(feature = "sshauth")]
 use sshauth_client::maybe_add_auth_headers;
 #[cfg(not(feature = "sshauth"))]
-fn maybe_add_auth_headers(
+async fn maybe_add_auth_headers(
     _request: &mut tungstenite::http::Request<()>,
-    _uri: &tungstenite::http::Uri,
     _tls_channel_binding: Option<&str>,
 ) -> Result<()> {
     Ok(())
 }
 
-enum Stream {
-    Plain(TcpStream),
-    Tls(openssl::ssl::SslStream<TcpStream>),
-    Vsock(vsock::VsockStream),
-    TlsVsock(openssl::ssl::SslStream<vsock::VsockStream>),
-}
+/// One object-safe type for all transport combinations
+/// (TCP/vsock, with/without TLS).
+trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+type BoxedStream = Box<dyn AsyncStream>;
 
-impl Read for Stream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Stream::Plain(s) => s.read(buf),
-            Stream::Tls(s) => s.read(buf),
-            Stream::Vsock(s) => s.read(buf),
-            Stream::TlsVsock(s) => s.read(buf),
-        }
-    }
-}
+type Ws = WebSocketStream<BoxedStream>;
 
-impl Write for Stream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Stream::Plain(s) => s.write(buf),
-            Stream::Tls(s) => s.write(buf),
-            Stream::Vsock(s) => s.write(buf),
-            Stream::TlsVsock(s) => s.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Stream::Plain(s) => s.flush(),
-            Stream::Tls(s) => s.flush(),
-            Stream::Vsock(s) => s.flush(),
-            Stream::TlsVsock(s) => s.flush(),
-        }
-    }
-}
-
-impl Stream {
-    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
-        match self {
-            Stream::Plain(s) => s.set_nonblocking(nonblocking),
-            Stream::Tls(s) => s.get_ref().set_nonblocking(nonblocking),
-            Stream::Vsock(s) => s.set_nonblocking(nonblocking),
-            Stream::TlsVsock(s) => s.get_ref().set_nonblocking(nonblocking),
-        }
-    }
-
-    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        match self {
-            Stream::Plain(s) => s.set_read_timeout(dur),
-            Stream::Tls(s) => s.get_ref().set_read_timeout(dur),
-            Stream::Vsock(s) => s.set_read_timeout(dur),
-            Stream::TlsVsock(s) => s.get_ref().set_read_timeout(dur),
-        }
-    }
-
-    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        match self {
-            Stream::Plain(s) => s.set_write_timeout(dur),
-            Stream::Tls(s) => s.get_ref().set_write_timeout(dur),
-            Stream::Vsock(s) => s.set_write_timeout(dur),
-            Stream::TlsVsock(s) => s.get_ref().set_write_timeout(dur),
-        }
-    }
-}
-
-impl std::os::fd::AsFd for Stream {
-    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        match self {
-            Stream::Plain(s) => s.as_fd(),
-            Stream::Tls(s) => s.get_ref().as_fd(),
-            Stream::Vsock(s) => s.as_fd(),
-            Stream::TlsVsock(s) => s.get_ref().as_fd(),
-        }
-    }
-}
-
-type Ws = WebSocket<Stream>;
+// Time to wait until a close needs to be complete before giving up.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+// Time to wait for the whole connection setup: TCP/vsock connect, TLS
+// handshake, auth token generation (a hung ssh-agent) and the
+// WebSocket upgrade.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Build an `SslConnector` with client certs and a custom CA loaded from the
 /// first existing directory:
@@ -153,6 +87,29 @@ fn build_ssl_connector() -> Result<SslConnector> {
     Ok(builder.build())
 }
 
+/// TLS-handshake `stream`, returning it with the RFC 9266 channel binding.
+///
+/// `verify_hostname=false` is for vsock where there is no hostname; the
+/// peer certificate is still verified against the CA chain.
+async fn connect_tls<S: AsyncStream + 'static>(
+    domain: &str,
+    verify_hostname: bool,
+    stream: S,
+    error_context: &'static str,
+) -> Result<(BoxedStream, Option<String>)> {
+    let connector = build_ssl_connector()?;
+    let mut config = connector.configure().context("SSL configure")?;
+    config.set_verify_hostname(verify_hostname);
+    let ssl = config.into_ssl(domain).context("SSL setup")?;
+    let mut tls_stream = tokio_openssl::SslStream::new(ssl, stream)?;
+    Pin::new(&mut tls_stream)
+        .connect()
+        .await
+        .context(error_context)?;
+    let tls_channel_binding = varlink_http_bridge::export_tls_channel_binding(tls_stream.ssl());
+    Ok((Box::new(tls_stream), Some(tls_channel_binding)))
+}
+
 /// Parse a `vsock://CID:PORT/path` URL.
 ///
 /// The port defaults to [`varlink_http_bridge::DEFAULT_PORT`] if omitted (`vsock://CID/path`).
@@ -171,32 +128,28 @@ fn parse_vsock_url(url: &str) -> Result<(u32, u32, String)> {
     Ok((cid, port, path.to_string()))
 }
 
-fn connect_vsock(url: &str, use_tls: bool) -> Result<(Stream, String, Option<String>)> {
+async fn connect_vsock(url: &str, use_tls: bool) -> Result<(BoxedStream, String, Option<String>)> {
     let (cid, port, path) = parse_vsock_url(url)?;
-    let raw_stream = vsock::VsockStream::connect_with_cid_port(cid, port)
+    debug!("connecting to vsock CID {cid}:{port} (tls: {use_tls})");
+    let raw_stream = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, port))
+        .await
         .with_context(|| format!("vsock connect to CID {cid}:{port} failed"))?;
 
     if use_tls {
-        let connector = build_ssl_connector()?;
-        // vsock has no hostnames - skip hostname verification but still
-        // verify the peer certificate against the CA chain
-        let mut config = connector.configure().context("SSL configure for vsock")?;
-        config.set_verify_hostname(false);
-        let tls_stream = config.connect("vsock", raw_stream).context(
+        let (stream, tls_channel_binding) = connect_tls(
+            "vsock",
+            false,
+            raw_stream,
             "TLS handshake over vsock failed: check client cert if server requires mTLS",
-        )?;
-        let tls_channel_binding = Some(varlink_http_bridge::export_tls_channel_binding(
-            tls_stream.ssl(),
-        ));
-        let ws_url = format!("wss://vsock{path}");
-        Ok((Stream::TlsVsock(tls_stream), ws_url, tls_channel_binding))
+        )
+        .await?;
+        Ok((stream, format!("wss://vsock{path}"), tls_channel_binding))
     } else {
-        let ws_url = format!("ws://vsock{path}");
-        Ok((Stream::Vsock(raw_stream), ws_url, None))
+        Ok((Box::new(raw_stream), format!("ws://vsock{path}"), None))
     }
 }
 
-fn connect_tcp(url: &str) -> Result<(Stream, String, Option<String>)> {
+async fn connect_tcp(url: &str) -> Result<(BoxedStream, String, Option<String>)> {
     let ws_url = if let Some(rest) = url.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = url.strip_prefix("http://") {
@@ -207,30 +160,33 @@ fn connect_tcp(url: &str) -> Result<(Stream, String, Option<String>)> {
     let uri: tungstenite::http::Uri = ws_url.parse().context("invalid WebSocket URL")?;
     let use_tls = uri.scheme_str() == Some("wss");
     let host = uri.host().context("URL has no host")?;
+    // Uri::host() keeps the brackets on IPv6 literals ("[::1]") but
+    // TcpStream::connect and TLS verification need the bare address
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_string();
     let port = uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
 
-    let tcp = TcpStream::connect((host, port))
+    debug!("connecting to {host}:{port} (tls: {use_tls})");
+    let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+        .await
         .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
     varlink_http_bridge::set_tcp_keepalive_and_nodelay(&tcp).context("configure client socket")?;
 
-    let stream =
-        if use_tls {
-            let connector = build_ssl_connector()?;
-            Stream::Tls(connector.connect(host, tcp).context(
-                "TLS handshake failed: check client certificate if server requires mTLS",
-            )?)
-        } else {
-            Stream::Plain(tcp)
-        };
-
-    let tls_channel_binding = match &stream {
-        Stream::Tls(ssl_stream) => Some(varlink_http_bridge::export_tls_channel_binding(
-            ssl_stream.ssl(),
-        )),
-        _ => None,
-    };
-
-    Ok((stream, ws_url, tls_channel_binding))
+    if use_tls {
+        let (stream, tls_channel_binding) = connect_tls(
+            &host,
+            true,
+            tcp,
+            "TLS handshake failed: check client certificate if server requires mTLS",
+        )
+        .await?;
+        Ok((stream, ws_url, tls_channel_binding))
+    } else {
+        Ok((Box::new(tcp), ws_url, None))
+    }
 }
 
 fn resp_body_text(resp: &tungstenite::http::Response<Option<Vec<u8>>>) -> Option<String> {
@@ -240,85 +196,145 @@ fn resp_body_text(resp: &tungstenite::http::Response<Option<Vec<u8>>>) -> Option
         .map(|b| String::from_utf8_lossy(b).into_owned())
 }
 
-fn connect_ws(url: &str) -> Result<Ws> {
+async fn connect_ws(url: &str) -> Result<Ws> {
     use tungstenite::client::IntoClientRequest;
 
     let (stream, ws_url, tls_channel_binding) = if let Some(rest) = url.strip_prefix("vsock+tls://")
     {
-        connect_vsock(&format!("vsock://{rest}"), true)?
+        connect_vsock(&format!("vsock://{rest}"), true).await?
     } else if url.starts_with("vsock://") {
-        connect_vsock(url, false)?
+        connect_vsock(url, false).await?
     } else {
-        connect_tcp(url)?
+        connect_tcp(url).await?
     };
+    let is_tls = tls_channel_binding.is_some();
 
     // Use into_client_request() here as it auto-generates standard WS upgrade headers,
     // then we add our auth headers too
-    let uri: tungstenite::http::Uri = ws_url.parse().context("invalid WebSocket URL")?;
     let mut request = ws_url
         .into_client_request()
         .context("building WS request")?;
-    // this adds ssh auth headers if ssh-agent is available, once we have more auth methods
-    // it may add more
-    maybe_add_auth_headers(&mut request, &uri, tls_channel_binding.as_deref())?;
+    maybe_add_auth_headers(&mut request, tls_channel_binding.as_deref()).await?;
 
-    let is_tls = matches!(&stream, Stream::Tls(_) | Stream::TlsVsock(_));
-    let (ws, _) = tungstenite::client(request, stream).map_err(|e| {
-        let http_detail = match &e {
-            tungstenite::HandshakeError::Failure(tungstenite::Error::Http(resp)) => {
-                match resp_body_text(resp) {
+    let (ws, _) = tokio_tungstenite::client_async(request, stream)
+        .await
+        .map_err(|e| {
+            let http_detail = match &e {
+                tungstenite::Error::Http(resp) => match resp_body_text(resp) {
                     Some(body) => format!(": HTTP {}: {body}", resp.status()),
                     None => format!(": HTTP {}", resp.status()),
-                }
-            }
-            _ => String::new(),
-        };
-        let tls_hint = if is_tls {
-            " (check client cert if server requires mTLS)"
-        } else {
-            ""
-        };
-        anyhow::Error::new(e).context(format!("WebSocket handshake failed{http_detail}{tls_hint}"))
-    })?;
+                },
+                _ => String::new(),
+            };
+            let tls_hint = if is_tls {
+                " (check client cert if server requires mTLS)"
+            } else {
+                ""
+            };
+            anyhow::Error::new(e)
+                .context(format!("WebSocket handshake failed{http_detail}{tls_hint}"))
+        })?;
+    debug!("WebSocket established");
     Ok(ws)
 }
 
-/// Forward all data from the WebSocket to fd3 until it would block or the peer closes.
-/// Returns Ok(true) if a Close frame was received.
-fn forward_ws_until_would_block(ws: &mut Ws, fd3: &mut UnixStream) -> Result<bool> {
-    loop {
-        match ws.read() {
-            Ok(Message::Binary(data)) => fd3.write_all(&data).context("fd3 write")?,
-            Ok(Message::Text(_)) => bail!("unexpected text WebSocket frame"),
-            Ok(Message::Close(_)) => return Ok(true),
-            Ok(_) => {}
-            Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                return Ok(false);
-            }
-            Err(e) => return Err(e).context("ws read"),
-        }
+/// Our half of the close handshake, bounded so a stuck peer cannot
+/// hang the exit.
+async fn close_ws(sink: &mut futures_util::stream::SplitSink<Ws, Message>) {
+    match tokio::time::timeout(CLOSE_TIMEOUT, sink.close()).await {
+        Ok(
+            Ok(()) | Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed),
+        ) => {}
+        Ok(Err(e)) => warn!("WebSocket close failed: {e:#}"),
+        Err(_) => warn!("timed out closing WebSocket"),
     }
 }
 
-fn graceful_close(ws: &mut Ws) -> Result<()> {
-    let stream = ws.get_ref();
-    stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+/// Forward data between fd3 and the WebSocket in both directions until
+/// fd3 hits EOF, the peer closes, or we get SIGINT/SIGTERM.
+async fn run_proxy(ws: Ws, fd3: UnixStream) -> Result<()> {
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let (mut sink, mut stream) = ws.split();
+    let (mut fd3_read, mut fd3_write) = fd3.into_split();
 
-    // close and wait up to aboves timeout
-    ws.close(None)?;
-    while ws.can_read() {
-        match ws.read() {
-            Ok(Message::Close(_)) => break,
-            Err(e) => return Err(e).context("waiting for close response"),
-            Ok(_) => {}
+    // fd3 -> websocket. send() completes only once the data is written
+    // out, so a slow peer naturally stops us from reading more of fd3.
+    // Borrows `sink` (no move) so the peer-close branch below can still
+    // send the close reply after this future is dropped.
+    let mut up = Box::pin(async {
+        let mut buf = bytes::BytesMut::new();
+        let mut total: u64 = 0;
+        loop {
+            // split().freeze() avoids copying each chunk into the message
+            buf.reserve(65536);
+            let n = fd3_read.read_buf(&mut buf).await.context("fd3 read")?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            // when this finishes the buf part that got split is dropped
+            // and the next buf.reserve can just reclaim/reuse it
+            sink.send(Message::Binary(buf.split().freeze()))
+                .await
+                .context("ws send")?;
+        }
+        debug!("fd3 EOF after {total} bytes, closing WebSocket");
+        sink.close().await.context("ws close")
+    });
+
+    // websocket -> fd3
+    let mut down = Box::pin(async move {
+        let mut total: u64 = 0;
+        while let Some(msg) = stream.next().await {
+            match msg.context("ws read")? {
+                Message::Binary(data) => {
+                    total += data.len() as u64;
+                    fd3_write.write_all(&data).await.context("fd3 write")?;
+                }
+                Message::Text(_) => bail!("unexpected text WebSocket frame"),
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        debug!("WebSocket -> fd3 finished after {total} bytes");
+        Ok(())
+    });
+
+    // select is parallel, whatever is first wins
+    tokio::select! {
+        r = &mut up => {
+            r?;
+            // all data is delivered at this point; warn if the close
+            // handshake fails though
+            match tokio::time::timeout(CLOSE_TIMEOUT, &mut down).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("error waiting for close response: {e:#}"),
+                Err(_) => warn!("timed out waiting for close response"),
+            }
+        }
+        r = &mut down => {
+            r?;
+            // peer closed first: answer the close handshake before exiting
+            drop(up);
+            close_ws(&mut sink).await;
+        }
+        _ = sigint.recv() => {
+            debug!("SIGINT, closing WebSocket");
+            drop(up);
+            close_ws(&mut sink).await;
+        }
+        _ = sigterm.recv() => {
+            debug!("SIGTERM, closing WebSocket");
+            drop(up);
+            close_ws(&mut sink).await;
         }
     }
     Ok(())
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     env_logger::init();
 
     let listen_fds: i32 = std::env::var("LISTEN_FDS")
@@ -342,66 +358,152 @@ fn main() -> Result<()> {
     // Safety: fd 3 is passed to us via the sd_listen_fds() protocol.
     let fd3 = unsafe { OwnedFd::from_raw_fd(3) };
     rustix::io::fcntl_getfd(&fd3).context("fd 3 is not valid (LISTEN_FDS protocol error?)")?;
-    let mut fd3 = UnixStream::from(fd3);
+    let fd3 = std::os::unix::net::UnixStream::from(fd3);
+    fd3.set_nonblocking(true)?;
+    let fd3 = UnixStream::from_std(fd3)?;
 
-    let mut ws = connect_ws(&bridge_url)?;
+    let ws = tokio::time::timeout(CONNECT_TIMEOUT, connect_ws(&bridge_url))
+        .await
+        .with_context(|| format!("timed out connecting to '{bridge_url}'"))??;
 
-    // Set non-blocking so that we deal with incomplete websocket
-    // frames in ws.read() - they return WouldBlock now and we can
-    // continue when waking up from PollFd next time.
-    ws.get_ref().set_nonblocking(true)?;
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
-
-    let mut buf = vec![0u8; 8192];
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-
-        let mut pollfds = [
-            PollFd::new(&fd3, PollFlags::IN),
-            PollFd::new(ws.get_ref(), PollFlags::IN),
-        ];
-        match poll(&mut pollfds, None) {
-            // signal interrupted poll: continue to re-check shutdown flag
-            Err(rustix::io::Errno::INTR) => continue,
-            result => {
-                result?;
-            }
-        }
-        let fd3_revents = pollfds[0].revents();
-        let ws_revents = pollfds[1].revents();
-
-        if fd3_revents.contains(PollFlags::IN) {
-            let n = fd3.read(&mut buf).context("fd3 read")?;
-            if n == 0 {
-                break;
-            }
-            ws.send(Message::Binary(buf[..n].to_vec().into()))
-                .context("ws send")?;
-        }
-
-        if ws_revents.contains(PollFlags::IN) && forward_ws_until_would_block(&mut ws, &mut fd3)? {
-            break; // peer sent Close
-        }
-
-        if fd3_revents.contains(PollFlags::HUP) {
-            break;
-        }
-    }
-
-    if let Err(e) = graceful_close(&mut ws) {
-        warn!("WebSocket close failed: {e:#}");
-    }
-    Ok(())
+    run_proxy(ws, fd3).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type ServerWs = WebSocketStream<tokio::net::TcpStream>;
+
+    /// Wire `run_proxy` up against an in-process WebSocket server.
+    ///
+    /// Returns the server end of the WebSocket, our end of the fd3
+    /// socketpair and the running proxy task.
+    async fn proxy_fixture() -> (ServerWs, UnixStream, tokio::task::JoinHandle<Result<()>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(tcp).await.unwrap()
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (ws, _) =
+            tokio_tungstenite::client_async(format!("ws://{addr}/"), Box::new(tcp) as BoxedStream)
+                .await
+                .unwrap();
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let proxy = tokio::spawn(run_proxy(ws, theirs));
+        (accept.await.unwrap(), ours, proxy)
+    }
+
+    /// Bulk uploads must survive a peer that reads slower than fd3
+    /// delivers (this killed the poll()-based implementation with
+    /// an unhandled `WouldBlock`).
+    #[tokio::test]
+    async fn test_run_proxy_bulk_upload_backpressure() {
+        let (mut ws, ours, proxy) = proxy_fixture().await;
+        let server = tokio::spawn(async move {
+            // stall so the client's kernel send buffer fills up
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let mut received = Vec::new();
+            while let Some(msg) = ws.next().await {
+                match msg.unwrap() {
+                    Message::Binary(data) => received.extend_from_slice(&data),
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+            received
+        });
+
+        // patterned so lost/duplicated/reordered frames are detected
+        let payload: Vec<u8> = (0..16 * 1024 * 1024)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let (_ours_read, mut ours_write) = ours.into_split();
+        ours_write.write_all(&payload).await.unwrap();
+        // EOF makes run_proxy close the WebSocket and return
+        drop(ours_write);
+
+        proxy.await.unwrap().expect("run_proxy failed");
+        assert!(server.await.unwrap() == payload, "payload mismatch");
+    }
+
+    /// Bulk downloads must survive fd3 backpressure: frames the WebSocket
+    /// library has already buffered internally must still be delivered
+    /// once fd3 drains (this stalled a poll()-based implementation,
+    /// where userspace-buffered frames are invisible to `poll()`).
+    #[tokio::test]
+    async fn test_run_proxy_bulk_download_backpressure() {
+        const PAYLOAD_LEN: usize = 16 * 1024 * 1024;
+        const CHUNK: usize = 64 * 1024;
+
+        // patterned so lost/duplicated/reordered frames are detected
+        let payload: Vec<u8> = (0..PAYLOAD_LEN)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let expected = payload.clone();
+
+        let (mut ws, ours, proxy) = proxy_fixture().await;
+        let server = tokio::spawn(async move {
+            for chunk in payload.chunks(CHUNK) {
+                ws.send(Message::Binary(chunk.to_vec().into()))
+                    .await
+                    .unwrap();
+            }
+            // idle until the peer closes
+            while let Some(msg) = ws.next().await {
+                if matches!(msg, Ok(Message::Close(_))) {
+                    break;
+                }
+            }
+        });
+
+        // let the proxy run into fd3 backpressure while the server floods
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let (mut ours_read, ours_write) = ours.into_split();
+        let mut received = vec![0u8; PAYLOAD_LEN];
+        tokio::time::timeout(Duration::from_secs(30), ours_read.read_exact(&mut received))
+            .await
+            .expect("timed out reading download (frames stranded?)")
+            .expect("read download");
+        assert!(received == expected, "downloaded payload differs");
+
+        // EOF makes run_proxy close the WebSocket and return
+        drop(ours_write);
+        proxy.await.unwrap().expect("run_proxy failed");
+        server.await.unwrap();
+    }
+
+    /// When the peer closes first the proxy must answer the close
+    /// handshake (instead of just dropping the connection) and exit 0.
+    #[tokio::test]
+    async fn test_run_proxy_peer_close_first() {
+        let (mut ws, mut ours, proxy) = proxy_fixture().await;
+        let server = tokio::spawn(async move {
+            ws.send(Message::Binary(b"hello".to_vec().into()))
+                .await
+                .unwrap();
+            ws.close(None).await.unwrap();
+            // drain until the client's close reply (or connection loss)
+            let mut got_close_reply = false;
+            while let Some(msg) = ws.next().await {
+                if matches!(msg, Ok(Message::Close(_))) {
+                    got_close_reply = true;
+                }
+            }
+            got_close_reply
+        });
+
+        let mut hello = [0u8; 5];
+        ours.read_exact(&mut hello).await.unwrap();
+        assert_eq!(&hello, b"hello");
+
+        proxy.await.unwrap().expect("run_proxy failed");
+        assert!(server.await.unwrap(), "server never got a close reply");
+    }
 
     #[test]
     fn test_parse_vsock_url_cid_and_port() {
