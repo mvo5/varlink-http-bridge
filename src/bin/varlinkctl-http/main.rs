@@ -28,6 +28,22 @@ async fn maybe_add_auth_headers(
     Ok(())
 }
 
+/// Add `Authorization: Bearer` from `VARLINK_TOKEN`, returning whether it
+/// was set. A token takes priority over SSH signing: it is always explicit
+/// configuration, while an ssh-agent is ambient environment.
+fn maybe_add_token_auth_header(request: &mut tungstenite::http::Request<()>) -> Result<bool> {
+    let Ok(token) = std::env::var("VARLINK_TOKEN") else {
+        return Ok(false);
+    };
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {token}")
+            .parse()
+            .context("invalid VARLINK_TOKEN value")?,
+    );
+    Ok(true)
+}
+
 /// One object-safe type for all transport combinations
 /// (TCP/vsock, with/without TLS).
 trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -214,7 +230,9 @@ async fn connect_ws(url: &str) -> Result<Ws> {
     let mut request = ws_url
         .into_client_request()
         .context("building WS request")?;
-    maybe_add_auth_headers(&mut request, tls_channel_binding.as_deref()).await?;
+    if !maybe_add_token_auth_header(&mut request)? {
+        maybe_add_auth_headers(&mut request, tls_channel_binding.as_deref()).await?;
+    }
 
     let (ws, _) = tokio_tungstenite::client_async(request, stream)
         .await

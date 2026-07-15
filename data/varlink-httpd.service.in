@@ -52,5 +52,8 @@ ImportCredential=varlink-httpd.tls.trust:trust
 ImportCredential=ssh.authorized_keys.root
 ImportCredential=ssh.ephemeral-authorized_keys-all
 
+# Bearer token hashes, renamed to the short name matching the --tokens flag
+ImportCredential=varlink-httpd.tokens:tokens
+
 [Install]
 WantedBy=network.target

@@ -1942,3 +1942,180 @@ mod sshauth_tests {
         assert_hostname_reply(&output);
     }
 } // mod sshauth_tests
+
+// --- Bearer token auth tests ---
+
+mod tokenauth_tests {
+    use super::*;
+    use crate::auth_token::{TokenAuthenticator, append_token, create_token_authenticator};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// Create a fake rootdir with an `etc/varlink-httpd/tokens` file.
+    fn make_test_rootdir_with_token_lines(lines: &[&str]) -> tempfile::TempDir {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("etc/varlink-httpd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = std::fs::File::create(dir.join("tokens")).unwrap();
+        for line in lines {
+            writeln!(f, "{line}").unwrap();
+        }
+        root
+    }
+
+    /// Set up a token authenticator that accepts one freshly generated token.
+    ///
+    /// Returns the authenticator, the token, and the tokens file path.
+    fn make_test_token_auth() -> (TokenAuthenticator, String, std::path::PathBuf) {
+        let root = make_test_rootdir_with_token_lines(&[]);
+        let tokens_path = root.path().join("etc/varlink-httpd/tokens");
+        let token = crate::auth_token::generate_token();
+        append_token(&tokens_path, &token, Some("testtoken")).unwrap();
+        let auth = create_token_authenticator(None, None, root.path())
+            .unwrap()
+            .expect("tokens file exists, authenticator must be created");
+        std::mem::forget(root);
+        (auth, token, tokens_path)
+    }
+
+    fn make_token_test_router(authenticators: Vec<Box<dyn Authenticator>>) -> Router {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.keep();
+        create_router(path.to_str().unwrap(), authenticators).unwrap()
+    }
+
+    #[test]
+    fn test_token_auth_accepts_valid_token() {
+        let (auth, token, _) = make_test_token_auth();
+        let header = format!("Bearer {token}");
+        auth.check_request("GET", "/sockets", Some(&header), None, None)
+            .expect("valid token must be accepted");
+    }
+
+    #[test]
+    fn test_token_auth_rejects_unknown_token() {
+        let (auth, _, _) = make_test_token_auth();
+        let result = auth.check_request("GET", "/sockets", Some("Bearer vhb_bogus"), None, None);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown bearer token")
+        );
+    }
+
+    #[test]
+    fn test_token_auth_rejects_missing_header() {
+        let (auth, _, _) = make_test_token_auth();
+        let result = auth.check_request("GET", "/sockets", None, None, None);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("missing Authorization header")
+        );
+    }
+
+    #[test]
+    fn test_token_auth_rejects_non_bearer_scheme() {
+        let (auth, _, _) = make_test_token_auth();
+        let result = auth.check_request("GET", "/sockets", Some("Basic dXNlcjpwdw=="), None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_token_auth_skips_garbage_lines() {
+        let root = make_test_rootdir_with_token_lines(&[
+            "# a comment",
+            "",
+            "not-a-token-line",
+            "sha256:tooshort",
+            &format!("sha256:{} named", "a".repeat(64)),
+            &"b".repeat(64), // missing sha256: prefix
+        ]);
+        let auth = create_token_authenticator(None, None, root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(auth.token_count(), 1);
+    }
+
+    #[test]
+    fn test_token_auth_not_configured_returns_none() {
+        let root = tempfile::tempdir().unwrap();
+        let auth = create_token_authenticator(None, None, root.path()).unwrap();
+        assert!(auth.is_none(), "no tokens file anywhere: no authenticator");
+    }
+
+    #[test]
+    fn test_token_auth_explicit_flag_allows_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokens_path = dir.path().join("tokens");
+        let auth = create_token_authenticator(
+            Some(tokens_path.to_string_lossy().into_owned()),
+            None,
+            std::path::Path::new("/nonexistent"),
+        )
+        .unwrap()
+        .expect("explicit --tokens must always enable the authenticator");
+        assert_eq!(auth.token_count(), 0);
+
+        // The file appearing later is picked up without a restart.
+        let token = crate::auth_token::generate_token();
+        append_token(&tokens_path, &token, None).unwrap();
+        let header = format!("Bearer {token}");
+        auth.check_request("GET", "/sockets", Some(&header), None, None)
+            .expect("token from newly appeared file must be accepted");
+    }
+
+    #[test]
+    fn test_token_auth_drops_tokens_when_file_removed() {
+        let (auth, token, tokens_path) = make_test_token_auth();
+        std::fs::remove_file(&tokens_path).unwrap();
+        let header = format!("Bearer {token}");
+        let result = auth.check_request("GET", "/sockets", Some(&header), None, None);
+        assert!(result.is_err(), "token from removed file must be rejected");
+        assert_eq!(auth.token_count(), 0);
+    }
+
+    #[test]
+    fn test_gen_token_default_name_is_hash_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokens_path = dir.path().join("tokens");
+        let name = append_token(&tokens_path, "vhb_test", None).unwrap();
+        assert_eq!(name.len(), 8);
+        let content = std::fs::read_to_string(&tokens_path).unwrap();
+        assert!(content.contains(&name));
+    }
+
+    #[test]
+    fn test_gen_token_rejects_whitespace_in_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokens_path = dir.path().join("tokens");
+        assert!(append_token(&tokens_path, "vhb_test", Some("bad name")).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_token_auth_via_router() {
+        let (auth, token, _) = make_test_token_auth();
+        let app = make_token_test_router(vec![Box::new(auth)]);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/sockets")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(Request::get("/sockets").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+} // mod tokenauth_tests

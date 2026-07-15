@@ -402,3 +402,100 @@ $ varlink-httpd \
 This is recommended because for websocket requests only the initial
 "upgrade" request is signed with the ssh key, after the upgrade it is
 a plain WebSocket which relies on the underlying TLS for security.
+
+## Bearer token authentication
+
+For plain `curl` (shell scripts, cron jobs, CI) the bridge supports
+static bearer tokens presented as `Authorization: Bearer <token>`.
+The server only stores the SHA-256 hash of each token, so the tokens
+file is not itself a secret.
+
+> **TLS is required in production.** A bearer token has no
+> proof-of-possession: anyone who captures it can replay it. Only
+> transport TLS (or a non-sniffable transport like vsock) protects it
+> in flight. For stronger per-request authentication use SSH key auth.
+
+### Server setup
+
+Generate a token with the `gen-token` subcommand; it prints the token
+to stdout exactly once and appends its hash to the tokens file:
+
+```console
+$ run0 varlink-httpd gen-token --name=deploy-script
+vhb_9f8e7d6c5b4a...
+Appended hash of token 'deploy-script' to /etc/varlink-httpd/tokens, run with:
+  varlink-httpd
+```
+
+The bridge discovers token hashes automatically from these locations
+(first match wins):
+
+1. `--tokens=PATH` — explicit CLI flag
+2. `/etc/varlink-httpd/tokens` — config file
+3. `$CREDENTIALS_DIRECTORY/tokens` — systemd credential; the shipped
+   unit imports `varlink-httpd.tokens` from the credstore (see
+   `systemd.exec(5)`)
+
+The tokens file has one token per line, `sha256:<hex> [name]`, with
+`#` comments allowed. The name identifies the token in logs; revoke a
+token by deleting its line (the file is hot-reloaded, no restart
+needed). To add an externally generated token by hand:
+
+```console
+$ echo "sha256:$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1) ci-runner" \
+    >> /etc/varlink-httpd/tokens
+```
+
+### Using it with curl
+
+`gen-token` registers the hash on the machine it runs on, so run it on
+the server; only the printed token is copied to the client:
+
+```console
+myhost$ run0 varlink-httpd gen-token --name=laptop-cli
+vhb_2048f47eb397b0eed671280444b6f89692170d9ae33a94713681d1a22ea0dc55
+Appended hash of token 'laptop-cli' to /etc/varlink-httpd/tokens, run with:
+  varlink-httpd
+```
+
+Then, from anywhere that can reach the bridge:
+
+```console
+$ export TOKEN=vhb_2048f47eb397b0ee...   # the value printed above
+
+$ curl -s -H "Authorization: Bearer $TOKEN" https://myhost:1031/sockets | jq
+{
+  "sockets": [
+    "io.systemd.Hostname",
+...
+
+$ curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -X POST https://myhost:1031/call/io.systemd.Hostname.Describe -d '{}' \
+    | jq .StaticHostname
+"top"
+```
+
+### Client (varlinkctl-http)
+
+The `varlinkctl-http` bridge helper sends the token from
+`VARLINK_TOKEN`, which takes priority over SSH key auth:
+
+```console
+$ VARLINK_TOKEN="$TOKEN" \
+  VARLINK_BRIDGE_URL=https://myhost:1031/ws/sockets/io.systemd.Hostname \
+    varlinkctl call exec:/usr/libexec/varlinkctl-http \
+    io.systemd.Hostname.Describe '{}'
+```
+
+### Provisioning via systemd credentials
+
+Instead of a file in `/etc`, ship the hashes through the credstore;
+the shipped unit imports `varlink-httpd.tokens` automatically. Because
+the file only contains hashes it can also be generated on one machine
+and copied to the nodes as part of provisioning:
+
+```console
+$ varlink-httpd gen-token --name=deploy-script tokens
+vhb_9f8e7d6c5b4a...
+$ scp tokens myhost:/etc/credstore/varlink-httpd.tokens
+```
