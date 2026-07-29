@@ -1473,7 +1473,7 @@ mod sshauth_tests {
         assert_eq!(auth.key_count(), 2);
 
         std::fs::remove_file(&file_b).unwrap();
-        auth.reload_for_test();
+        auth.refresh();
         assert_eq!(
             auth.key_count(),
             1,
@@ -1481,7 +1481,7 @@ mod sshauth_tests {
         );
 
         std::fs::remove_file(&file_a).unwrap();
-        auth.reload_for_test();
+        auth.refresh();
         assert_eq!(
             auth.key_count(),
             0,

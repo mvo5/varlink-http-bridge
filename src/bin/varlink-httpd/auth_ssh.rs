@@ -4,7 +4,7 @@ use anyhow::Context;
 use log::{debug, info, warn};
 use ssh_key::{HashAlg, PublicKey};
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
 use crate::Authenticator;
@@ -72,6 +72,9 @@ impl AuthKeysFile {
 
 struct KeyCache {
     files: HashMap<String, AuthKeysFile>,
+    /// `Arc` so the cache lock is not held during the slow signature
+    /// verification.
+    snapshot: Arc<Vec<PublicKey>>,
 }
 
 impl KeyCache {
@@ -79,16 +82,24 @@ impl KeyCache {
     /// are silently skipped; they will be picked up by `reload` once
     /// they appear. Parse errors propagate (startup should fail loud).
     fn load_all(paths: &[String]) -> anyhow::Result<Self> {
-        let mut files = HashMap::new();
+        let mut cache = Self {
+            files: HashMap::new(),
+            snapshot: Arc::new(Vec::new()),
+        };
         for path in paths {
             match AuthKeysFile::load(path)? {
                 Some(f) => {
-                    files.insert(path.clone(), f);
+                    cache.files.insert(path.clone(), f);
                 }
                 None => info!("authorized keys file {path} does not exist yet, skipping"),
             }
         }
-        Ok(Self { files })
+        cache.snapshot = Arc::new(cache.all_keys());
+        Ok(cache)
+    }
+
+    fn snapshot(&self) -> Arc<Vec<PublicKey>> {
+        self.snapshot.clone()
     }
 
     /// Number of distinct key fingerprints across all tracked files.
@@ -179,6 +190,7 @@ impl KeyCache {
         }
 
         self.files = new_files;
+        self.snapshot = Arc::new(self.all_keys());
         if self.unique_key_count() == 0 {
             warn!("all authorized key sources are empty, SSH auth will reject all requests");
         }
@@ -270,14 +282,6 @@ impl SshKeyAuthenticator {
         self.nonces = Mutex::new(NonceStore::new(max_skew));
         self
     }
-
-    #[cfg(test)]
-    pub(crate) fn reload_for_test(&self) {
-        self.authorized_keys
-            .lock()
-            .unwrap()
-            .maybe_reload(&self.paths);
-    }
 }
 
 impl std::fmt::Debug for SshKeyAuthenticator {
@@ -343,6 +347,13 @@ pub(crate) fn create_ssh_authenticator(
 }
 
 impl Authenticator for SshKeyAuthenticator {
+    fn refresh(&self) {
+        self.authorized_keys
+            .lock()
+            .unwrap()
+            .maybe_reload(&self.paths);
+    }
+
     fn check_request(
         &self,
         method: &str,
@@ -351,11 +362,6 @@ impl Authenticator for SshKeyAuthenticator {
         nonce: Option<&str>,
         tls_channel_binding: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.authorized_keys
-            .lock()
-            .unwrap()
-            .maybe_reload(&self.paths);
-
         let auth_header = auth_header.context("missing Authorization header")?;
         let nonce = nonce.context("missing nonce header (x-auth-nonce)")?;
 
@@ -366,12 +372,7 @@ impl Authenticator for SshKeyAuthenticator {
         let unverified_token =
             sshauth::UnverifiedToken::try_from(token_str).context("invalid token")?;
 
-        // clone the keys to drop the authorized_keys.lock() ASAP and avoid it being
-        // held during the (slow) verify_for()
-        let authorized_keys: Vec<ssh_key::PublicKey> = {
-            let ak = self.authorized_keys.lock().unwrap();
-            ak.all_keys()
-        };
+        let authorized_keys = self.authorized_keys.lock().unwrap().snapshot();
 
         let verified = unverified_token
             .verify_for()
@@ -388,7 +389,7 @@ impl Authenticator for SshKeyAuthenticator {
                 // connections where channel binding is not relevant.
                 tls_channel_binding.unwrap_or_default(),
             )
-            .with_keys(&authorized_keys)
+            .with_keys(authorized_keys.iter())
             .context("token verification failed")?;
 
         // good signature, check that nonce is unique

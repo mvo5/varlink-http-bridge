@@ -530,6 +530,10 @@ fn resolve_tls_acceptor(
 }
 
 trait Authenticator: Send + Sync {
+    /// Called before `check_request` so it can pick up on-disk changes
+    /// (e.g. changed key files) while verification itself stays free of I/O.
+    fn refresh(&self) {}
+
     fn check_request(
         &self,
         method: &str,
@@ -600,6 +604,7 @@ async fn auth_middleware(
 
     let mut errors = Vec::new();
     for authenticator in state.authenticators.iter() {
+        authenticator.refresh();
         match authenticator.check_request(
             &method,
             &path,
