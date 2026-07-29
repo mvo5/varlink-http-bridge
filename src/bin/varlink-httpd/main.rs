@@ -22,9 +22,8 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::signal;
 use tokio_vsock::VsockListener;
@@ -34,6 +33,9 @@ use zlink::varlink_service::Proxy;
 mod auth_ssh;
 #[cfg(feature = "sshauth")]
 mod import_ssh;
+mod ws_framing;
+
+use ws_framing::VarlinkFramer;
 
 #[cfg(feature = "sshauth")]
 use auth_ssh::{create_ssh_authenticator, extract_nonce};
@@ -786,53 +788,23 @@ async fn route_ws(
     Ok(ws.on_upgrade(move |ws_socket| handle_ws(ws_socket, varlink_stream)))
 }
 
-// Forwards raw bytes between the websocket and the varlink unix
-// socket in both directions. Each NUL-delimited varlink message is
-// sent as one WS binary frame. Once a protocol upgrade happens this is
-// dropped and its just a raw byte stream.
-async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
-    let (unix_read, mut unix_write) = tokio::io::split(unix);
-    let mut unix_reader = tokio::io::BufReader::new(unix_read);
-    let (varlink_msg_tx, mut varlink_msg_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-    // the complexity here is a bit ugly but without it the websocket is very hard
-    // to use from tools like "websocat" which will add a \n or \0 after each "message"
-    let varlink_connection_upgraded = Arc::new(AtomicBool::new(false));
+/// Send each frame as one WS binary message.
+async fn send_ws_frames(
+    ws: &mut WebSocket,
+    frames: impl IntoIterator<Item = Vec<u8>>,
+) -> Result<(), axum::Error> {
+    for frame in frames {
+        ws.send(Message::Binary(frame.into())).await?;
+    }
+    Ok(())
+}
 
-    // read_until is not cancel-safe, so run it in a separate task and we need read_until
-    // to ensure we keep the \0 boundaries and send these via a varlink_msg channel.
-    //
-    // After a varlink protocol upgrade the connection carries raw bytes without \0
-    // delimiters, so the reader switches to plain read() once "upgraded" is set.
-    let reader_task = tokio::spawn({
-        let varlink_connection_upgraded = varlink_connection_upgraded.clone();
-        async move {
-            loop {
-                let mut buf = Vec::new();
-                let res = if varlink_connection_upgraded.load(Ordering::Relaxed) {
-                    buf.reserve(8192);
-                    unix_reader.read_buf(&mut buf).await
-                } else {
-                    unix_reader.read_until(0, &mut buf).await
-                };
-                match res {
-                    Err(e) => {
-                        warn!("varlink read error: {e}");
-                        break;
-                    }
-                    Ok(0) => {
-                        debug!("varlink socket closed (read returned 0)");
-                        break;
-                    }
-                    Ok(_) => {
-                        if varlink_msg_tx.send(buf).await.is_err() {
-                            warn!("varlink_msg channel closed, ws gone?");
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    });
+// Forwards bytes between the websocket and the varlink unix socket in
+// both directions; framing decisions live in [`VarlinkFramer`].
+async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
+    let (mut unix_read, mut unix_write) = tokio::io::split(unix);
+    let mut varlink_framer = VarlinkFramer::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
 
     loop {
         tokio::select! {
@@ -859,41 +831,38 @@ async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
                         continue;
                     }
                 };
-                // Detect varlink protocol upgrade request
-                if !varlink_connection_upgraded.load(Ordering::Relaxed) {
-                    let json_bytes = data.strip_suffix(&[0]).unwrap_or(&data);
-                    match serde_json::from_slice::<Value>(json_bytes) {
-                        Ok(v) => {
-                            if v.get("upgrade").and_then(Value::as_bool).unwrap_or(false) {
-                                debug!("varlink protocol upgrade detected");
-                                varlink_connection_upgraded.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        Err(e) => {
-                            warn!("failed to parse ws message as JSON for upgrade detection: {e}");
-                        }
-                    }
-                }
+                varlink_framer.detect_protocol_upgrade_request(&data);
                 if let Err(e) = unix_write.write_all(&data).await {
                     warn!("varlink write error: {e}");
                     break;
                 }
             }
-            Some(data) = varlink_msg_rx.recv() => {
-                if let Err(e) = ws.send(Message::Binary(data.into())).await {
-                    warn!("ws send error: {e}");
-                    break;
+            res = unix_read.read_buf(&mut buf) => {  // this is cancel-safe
+                match res {
+                    Err(e) => {
+                        warn!("varlink read error: {e}");
+                        break;
+                    }
+                    Ok(0) => {
+                        debug!("varlink socket closed (read returned 0)");
+                        if let Err(e) = send_ws_frames(&mut ws, varlink_framer.finish()).await {
+                            warn!("ws send error: {e}");
+                        }
+                        break;
+                    }
+                    Ok(_) => {
+                        let ws_frames = varlink_framer.push_varlink_bytes(&buf);
+                        buf.clear();  // clear() keeps the capacity of buf
+                        if let Err(e) = send_ws_frames(&mut ws, ws_frames).await {
+                            warn!("ws send error: {e}");
+                            break;
+                        }
+                    }
                 }
-            }
-            else => {
-                debug!("select: all branches closed");
-                break;
             }
         }
     }
     debug!("handle_ws loop exited");
-
-    reader_task.abort();
 }
 
 fn create_router(
