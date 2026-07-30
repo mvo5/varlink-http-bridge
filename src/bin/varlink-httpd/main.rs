@@ -257,7 +257,7 @@ impl VarlinkSockets {
     }
 }
 
-type VarlinkConns = HashMap<String, Arc<tokio::sync::Mutex<zlink::unix::Connection>>>;
+type VarlinkConns = HashMap<String, Arc<tokio::sync::Mutex<zlink::tokio::unix::Connection>>>;
 
 /// Per-HTTP-connection cache of varlink unix socket connections.
 ///
@@ -292,7 +292,7 @@ async fn get_varlink_connection(
     socket: &str,
     state: &AppState,
     conn_cache: &VarlinkConnCache,
-) -> Result<Arc<tokio::sync::Mutex<zlink::unix::Connection>>, AppError> {
+) -> Result<Arc<tokio::sync::Mutex<zlink::tokio::unix::Connection>>, AppError> {
     let varlink_socket_path = state.varlink_sockets.resolve_socket_with_validate(socket)?;
 
     let mut cache = conn_cache.conns.lock().await;
@@ -303,7 +303,7 @@ async fn get_varlink_connection(
 
     debug!("Creating varlink connection for: {varlink_socket_path}");
     let connection = Arc::new(tokio::sync::Mutex::new(
-        zlink::unix::connect(&varlink_socket_path).await?,
+        zlink::tokio::unix::connect(&varlink_socket_path).await?,
     ));
     cache.insert(socket.to_string(), connection.clone());
     Ok(connection)
@@ -681,7 +681,7 @@ async fn route_socket_interface_get(
 /// Each record is RS (0x1E) + JSON + LF.  The content-type is
 /// `application/json-seq`.
 fn varlink_call_to_jsonseq(
-    mut conn: tokio::sync::OwnedMutexGuard<zlink::unix::Connection>,
+    mut conn: tokio::sync::OwnedMutexGuard<zlink::tokio::unix::Connection>,
 ) -> Response {
     let stream = stream! {
         loop {
