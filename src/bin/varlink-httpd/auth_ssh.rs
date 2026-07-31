@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
 use crate::Authenticator;
-use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, SSHAUTH_NONCE_HEADER};
+use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, SSHAUTH_NONCE_HEADER, TlsChannelBinding};
 
 /// One tracked `authorized_keys` file: its mtime when last read and the
 /// (fingerprint -> key) map of supported keys it contained. Bundling
@@ -349,7 +349,7 @@ impl Authenticator for SshKeyAuthenticator {
         path: &str,
         auth_header: Option<&str>,
         nonce: Option<&str>,
-        tls_channel_binding: Option<&str>,
+        tls_channel_binding: Option<&TlsChannelBinding>,
     ) -> anyhow::Result<()> {
         self.authorized_keys
             .lock()
@@ -386,7 +386,7 @@ impl Authenticator for SshKeyAuthenticator {
                 // (TLS 1.3 enforced in load_tls_acceptor), so a token signed with ""
                 // will fail verification. The "" default only applies to non-TLS
                 // connections where channel binding is not relevant.
-                tls_channel_binding.unwrap_or_default(),
+                tls_channel_binding.map_or("", TlsChannelBinding::as_str),
             )
             .with_keys(&authorized_keys)
             .context("token verification failed")?;

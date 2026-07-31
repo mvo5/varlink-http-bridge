@@ -18,6 +18,9 @@ path = "src/bin/varlinkctl-http/main.rs"
 [features]
 default = ["sshauth"]
 sshauth = ["dep:ssh-key", "dep:sshauth", "dep:tempfile", "dep:ssh-key-import"]
+# never enable directly: pulled in via the self dev-dependency so that
+# test-only constructors exist in test builds but not in release builds
+test-helpers = []
 
 [dependencies]
 anyhow = "1.0.100"
@@ -60,6 +63,7 @@ tempfile = { version = "3.27", optional = true }
 ssh-key-import = { path = "crates/ssh-key-import", optional = true }
 
 [dev-dependencies]
+varlink-http-bridge = { path = ".", features = ["test-helpers"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 test-with = { version = "0.16", default-features = false, features = ["runtime"] }
 gethostname = "1.1.0"

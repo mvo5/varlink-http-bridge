@@ -14,6 +14,7 @@ use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{self, Message};
+use varlink_http_bridge::TlsChannelBinding;
 
 #[cfg(feature = "sshauth")]
 mod sshauth_client;
@@ -86,7 +87,7 @@ async fn connect_tls<S: AsyncStream + 'static>(
     verify_hostname: bool,
     stream: S,
     error_context: &'static str,
-) -> Result<(BoxedStream, Option<String>)> {
+) -> Result<(BoxedStream, Option<TlsChannelBinding>)> {
     let connector = build_ssl_connector()?;
     let mut config = connector.configure().context("SSL configure")?;
     config.set_verify_hostname(verify_hostname);
@@ -118,7 +119,10 @@ fn parse_vsock_url(url: &str) -> Result<(u32, u32, String)> {
     Ok((cid, port, path.to_string()))
 }
 
-async fn connect_vsock(url: &str, use_tls: bool) -> Result<(BoxedStream, String, Option<String>)> {
+async fn connect_vsock(
+    url: &str,
+    use_tls: bool,
+) -> Result<(BoxedStream, String, Option<TlsChannelBinding>)> {
     let (cid, port, path) = parse_vsock_url(url)?;
     debug!("connecting to vsock CID {cid}:{port} (tls: {use_tls})");
     let raw_stream = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, port))
@@ -139,7 +143,7 @@ async fn connect_vsock(url: &str, use_tls: bool) -> Result<(BoxedStream, String,
     }
 }
 
-async fn connect_tcp(url: &str) -> Result<(BoxedStream, String, Option<String>)> {
+async fn connect_tcp(url: &str) -> Result<(BoxedStream, String, Option<TlsChannelBinding>)> {
     let ws_url = if let Some(rest) = url.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = url.strip_prefix("http://") {
@@ -191,7 +195,7 @@ async fn connect_ws(url: &str) -> Result<Ws> {
     sshauth_client::connect_with_ssh_retry(async |key| {
         let (stream, mut request, tcb) = connect_transport(url).await?;
         if let Some(key) = key {
-            sshauth_client::add_auth_headers(&mut request, key, tcb.as_deref()).await?;
+            sshauth_client::add_auth_headers(&mut request, key, tcb.as_ref()).await?;
         }
         ws_upgrade(request, stream, tcb.is_some()).await
     })
@@ -208,7 +212,11 @@ async fn connect_ws(url: &str) -> Result<Ws> {
 /// over it before the WebSocket upgrade.
 async fn connect_transport(
     url: &str,
-) -> Result<(BoxedStream, tungstenite::http::Request<()>, Option<String>)> {
+) -> Result<(
+    BoxedStream,
+    tungstenite::http::Request<()>,
+    Option<TlsChannelBinding>,
+)> {
     use tungstenite::client::IntoClientRequest;
 
     let (stream, ws_url, tls_channel_binding) = if let Some(rest) = url.strip_prefix("vsock+tls://")

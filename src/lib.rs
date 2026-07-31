@@ -52,6 +52,27 @@ pub const TLS_CHANNEL_BINDING_LABEL: &str = "EXPORTER-Channel-Binding";
 /// Output length (bytes) for TLS channel binding export.
 pub const TLS_CHANNEL_BINDING_LEN: usize = 32;
 
+/// Base64-encoded RFC 9266 channel binding of a TLS 1.3 session.
+///
+/// Newtype: signing or verifying over one of the look-alike strings it
+/// travels next to (URLs, tokens, nonces) would silently lose its relay
+/// protection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsChannelBinding(String);
+
+impl TlsChannelBinding {
+    /// Test-only: real bindings come from [`export_tls_channel_binding`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Export the TLS channel binding value from an established TLS 1.3 session.
 ///
 /// Returns the base64-encoded result of `export_keying_material` per RFC 9266.
@@ -60,7 +81,7 @@ pub const TLS_CHANNEL_BINDING_LEN: usize = 32;
 /// Panics if `export_keying_material` fails (should never happen with
 /// TLS 1.3) or if the export does not work because of an underlying
 /// bug in openssl and returns only zeros (should also never happen).
-pub fn export_tls_channel_binding(ssl: &openssl::ssl::SslRef) -> String {
+pub fn export_tls_channel_binding(ssl: &openssl::ssl::SslRef) -> TlsChannelBinding {
     let mut buf = [0u8; TLS_CHANNEL_BINDING_LEN];
     ssl.export_keying_material(&mut buf, TLS_CHANNEL_BINDING_LABEL, Some(&[]))
         .expect("export_keying_material must succeed with TLS 1.3");
@@ -68,7 +89,7 @@ pub fn export_tls_channel_binding(ssl: &openssl::ssl::SslRef) -> String {
         buf.iter().any(|&b| b != 0),
         "TLS channel binding must not be all zeros"
     );
-    openssl::base64::encode_block(&buf)
+    TlsChannelBinding(openssl::base64::encode_block(&buf))
 }
 
 /// Enable `TCP_NODELAY` and `SO_KEEPALIVE` on a TCP socket.

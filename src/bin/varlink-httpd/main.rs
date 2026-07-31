@@ -28,6 +28,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::signal;
 use tokio_vsock::VsockListener;
+use varlink_http_bridge::TlsChannelBinding;
 use zlink::varlink_service::Proxy;
 
 #[cfg(feature = "sshauth")]
@@ -269,11 +270,11 @@ type VarlinkConns = HashMap<String, Arc<tokio::sync::Mutex<zlink::unix::Connecti
 #[derive(Clone)]
 struct VarlinkConnCache {
     conns: Arc<tokio::sync::Mutex<VarlinkConns>>,
-    tls_channel_binding: Option<String>,
+    tls_channel_binding: Option<TlsChannelBinding>,
 }
 
 impl VarlinkConnCache {
-    fn new(tls_channel_binding: Option<String>) -> Self {
+    fn new(tls_channel_binding: Option<TlsChannelBinding>) -> Self {
         Self {
             conns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             tls_channel_binding,
@@ -534,7 +535,7 @@ trait Authenticator: Send + Sync {
         path: &str,
         auth_header: Option<&str>,
         nonce: Option<&str>,
-        channel_binding: Option<&str>,
+        channel_binding: Option<&TlsChannelBinding>,
     ) -> anyhow::Result<()>;
 }
 
@@ -557,7 +558,7 @@ impl Authenticator for AllowAllAuthenticator {
         path: &str,
         _auth_header: Option<&str>,
         _nonce: Option<&str>,
-        _channel_binding: Option<&str>,
+        _channel_binding: Option<&TlsChannelBinding>,
     ) -> anyhow::Result<()> {
         debug!("auth: allowing {method} {path} ({})", self.reason);
         Ok(())
@@ -582,7 +583,7 @@ async fn auth_middleware(
     let auth_header = extract_auth_header(&request);
     let nonce = extract_nonce(request.headers());
 
-    let tls_channel_binding: Option<String> = request
+    let tls_channel_binding: Option<TlsChannelBinding> = request
         .extensions()
         .get::<ConnectInfo<VarlinkConnCache>>()
         .and_then(|ci| ci.0.tls_channel_binding.clone());
@@ -603,7 +604,7 @@ async fn auth_middleware(
             &path,
             auth_header.as_deref(),
             nonce.as_deref(),
-            tls_channel_binding.as_deref(),
+            tls_channel_binding.as_ref(),
         ) {
             Ok(()) => {
                 debug!("auth: accepted {method} {path}");

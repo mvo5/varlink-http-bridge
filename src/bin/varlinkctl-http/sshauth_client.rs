@@ -5,7 +5,7 @@ use std::fmt;
 use anyhow::{Context, Result, bail};
 use log::{debug, warn};
 use tokio_tungstenite::tungstenite;
-use varlink_http_bridge::SSHAUTH_MAGIC_PREFIX;
+use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, TlsChannelBinding};
 
 /// An SSH key that can be used for authentication.
 pub(crate) enum SshKey {
@@ -57,7 +57,7 @@ impl fmt::Display for SshKey {
 pub(crate) async fn add_auth_headers(
     request: &mut tungstenite::http::Request<()>,
     key: &SshKey,
-    tls_channel_binding: Option<&str>,
+    tls_channel_binding: Option<&TlsChannelBinding>,
 ) -> Result<()> {
     // to_string: ends the borrow of `request` before headers_mut() below
     let path_and_query = request
@@ -234,7 +234,7 @@ async fn sign_with_key(
     key: &SshKey,
     method: &str,
     path_and_query: &str,
-    tls_channel_binding: Option<&str>,
+    tls_channel_binding: Option<&TlsChannelBinding>,
 ) -> Result<(String, String)> {
     let nonce = generate_nonce();
 
@@ -261,7 +261,7 @@ async fn sign_with_key(
         .action("nonce", &nonce)
         .action(
             "tls-channel-binding",
-            tls_channel_binding.unwrap_or_default(),
+            tls_channel_binding.map_or("", TlsChannelBinding::as_str),
         );
     let token: sshauth::token::Token = tb.sign().await?;
 
