@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
+// Reduced-feature builds leave some shared auth plumbing unused; the
+// default build still gets full dead-code checking.
+#![cfg_attr(not(feature = "sshauth"), allow(dead_code))]
+
 use anyhow::{Context, bail};
 use async_stream::stream;
 use axum::{
@@ -37,11 +41,7 @@ mod auth_ssh;
 mod import_ssh;
 
 #[cfg(feature = "sshauth")]
-use auth_ssh::{create_ssh_authenticator, extract_nonce};
-#[cfg(not(feature = "sshauth"))]
-fn extract_nonce(_headers: &axum::http::HeaderMap) -> Option<String> {
-    None
-}
+use auth_ssh::create_ssh_authenticator;
 #[derive(Debug)]
 struct AppError {
     status: StatusCode,
@@ -528,15 +528,43 @@ fn resolve_tls_acceptor(
     }
 }
 
+/// Carries the raw headers so each auth method extracts what it needs
+/// without the trait growing a parameter per method.
+struct AuthRequest<'a> {
+    method: &'a str,
+    path: &'a str,
+    headers: &'a axum::http::HeaderMap,
+    /// From the TLS layer (RFC 9266 exporter), not a header.
+    tls_channel_binding: Option<&'a TlsChannelBinding>,
+}
+
+impl AuthRequest<'_> {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
+    fn authorization(&self) -> Option<&str> {
+        self.header("authorization")
+    }
+
+    /// Token from `Authorization: Bearer <token>`; the scheme is
+    /// case-insensitive per RFC 7235.
+    fn bearer_token(&self) -> anyhow::Result<&str> {
+        let header = self
+            .authorization()
+            .context("missing Authorization header")?;
+        let (scheme, token) = header
+            .split_once(' ')
+            .context("Authorization header must be 'Bearer <token>'")?;
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            bail!("Authorization scheme must be 'Bearer'");
+        }
+        Ok(token.trim_start_matches(' '))
+    }
+}
+
 trait Authenticator: Send + Sync {
-    fn check_request(
-        &self,
-        method: &str,
-        path: &str,
-        auth_header: Option<&str>,
-        nonce: Option<&str>,
-        channel_binding: Option<&TlsChannelBinding>,
-    ) -> anyhow::Result<()>;
+    fn check_request(&self, request: &AuthRequest) -> anyhow::Result<()>;
 }
 
 /// Authenticator that accepts every request.
@@ -552,27 +580,13 @@ struct AllowAllAuthenticator {
 }
 
 impl Authenticator for AllowAllAuthenticator {
-    fn check_request(
-        &self,
-        method: &str,
-        path: &str,
-        _auth_header: Option<&str>,
-        _nonce: Option<&str>,
-        _channel_binding: Option<&TlsChannelBinding>,
-    ) -> anyhow::Result<()> {
-        debug!("auth: allowing {method} {path} ({})", self.reason);
+    fn check_request(&self, request: &AuthRequest) -> anyhow::Result<()> {
+        debug!(
+            "auth: allowing {} {} ({})",
+            request.method, request.path, self.reason
+        );
         Ok(())
     }
-}
-
-/// Extract the Authorization header value, if present and valid UTF-8.
-fn extract_auth_header(request: &axum::http::Request<Body>) -> Option<String> {
-    request
-        .headers()
-        .get("authorization")?
-        .to_str()
-        .ok()
-        .map(String::from)
 }
 
 async fn auth_middleware(
@@ -580,38 +594,45 @@ async fn auth_middleware(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let auth_header = extract_auth_header(&request);
-    let nonce = extract_nonce(request.headers());
-
     let tls_channel_binding: Option<TlsChannelBinding> = request
         .extensions()
         .get::<ConnectInfo<VarlinkConnCache>>()
         .and_then(|ci| ci.0.tls_channel_binding.clone());
 
-    let method = request.method().as_str().to_string();
-    let path = request
-        .uri()
-        .path_and_query()
-        .map_or(request.uri().path(), axum::http::uri::PathAndQuery::as_str)
-        .to_string();
+    let auth_request = AuthRequest {
+        method: request.method().as_str(),
+        path: request
+            .uri()
+            .path_and_query()
+            .map_or(request.uri().path(), axum::http::uri::PathAndQuery::as_str),
+        headers: request.headers(),
+        tls_channel_binding: tls_channel_binding.as_ref(),
+    };
 
-    debug!("auth: checking {method} {path} (nonce={nonce:?}, tls_cb={tls_channel_binding:?})");
+    debug!(
+        "auth: checking {} {} (tls_cb={:?})",
+        auth_request.method, auth_request.path, auth_request.tls_channel_binding
+    );
 
     let mut errors = Vec::new();
+    // flag instead of early return: `auth_request` borrows `request`, and
+    // next.run() needs `request` back by value
+    let mut accepted = false;
     for authenticator in state.authenticators.iter() {
-        match authenticator.check_request(
-            &method,
-            &path,
-            auth_header.as_deref(),
-            nonce.as_deref(),
-            tls_channel_binding.as_ref(),
-        ) {
+        match authenticator.check_request(&auth_request) {
             Ok(()) => {
-                debug!("auth: accepted {method} {path}");
-                return next.run(request).await;
+                debug!(
+                    "auth: accepted {} {}",
+                    auth_request.method, auth_request.path
+                );
+                accepted = true;
+                break;
             }
             Err(e) => errors.push(e.to_string()),
         }
+    }
+    if accepted {
+        return next.run(request).await;
     }
 
     let joined = if errors.is_empty() {
@@ -619,7 +640,10 @@ async fn auth_middleware(
     } else {
         errors.join("; ")
     };
-    debug!("auth: rejected {method} {path}: {joined}");
+    debug!(
+        "auth: rejected {} {}: {joined}",
+        auth_request.method, auth_request.path
+    );
     (
         StatusCode::UNAUTHORIZED,
         axum::Json(json!({"error": joined})),

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
-use crate::Authenticator;
+use crate::{AuthRequest, Authenticator};
 use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, SSHAUTH_NONCE_HEADER, TlsChannelBinding};
 
 /// One tracked `authorized_keys` file: its mtime when last read and the
@@ -293,7 +293,7 @@ impl std::fmt::Debug for SshKeyAuthenticator {
 }
 
 /// Extract the replay-protection nonce from the request headers.
-pub(crate) fn extract_nonce(headers: &axum::http::HeaderMap) -> Option<String> {
+fn extract_nonce(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get(SSHAUTH_NONCE_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -343,25 +343,17 @@ pub(crate) fn create_ssh_authenticator(
 }
 
 impl Authenticator for SshKeyAuthenticator {
-    fn check_request(
-        &self,
-        method: &str,
-        path: &str,
-        auth_header: Option<&str>,
-        nonce: Option<&str>,
-        tls_channel_binding: Option<&TlsChannelBinding>,
-    ) -> anyhow::Result<()> {
+    fn check_request(&self, request: &AuthRequest) -> anyhow::Result<()> {
         self.authorized_keys
             .lock()
             .unwrap()
             .maybe_reload(&self.paths);
 
-        let auth_header = auth_header.context("missing Authorization header")?;
-        let nonce = nonce.context("missing nonce header (x-auth-nonce)")?;
-
-        let token_str = auth_header
-            .strip_prefix("Bearer ")
-            .context("Authorization header must start with 'Bearer '")?;
+        let (method, path) = (request.method, request.path);
+        let token_str = request.bearer_token()?;
+        let nonce =
+            extract_nonce(request.headers).context("missing nonce header (x-auth-nonce)")?;
+        let nonce = nonce.as_str();
 
         let unverified_token =
             sshauth::UnverifiedToken::try_from(token_str).context("invalid token")?;
@@ -386,7 +378,9 @@ impl Authenticator for SshKeyAuthenticator {
                 // (TLS 1.3 enforced in load_tls_acceptor), so a token signed with ""
                 // will fail verification. The "" default only applies to non-TLS
                 // connections where channel binding is not relevant.
-                tls_channel_binding.map_or("", TlsChannelBinding::as_str),
+                request
+                    .tls_channel_binding
+                    .map_or("", TlsChannelBinding::as_str),
             )
             .with_keys(&authorized_keys)
             .context("token verification failed")?;

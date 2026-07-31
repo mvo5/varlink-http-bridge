@@ -7,6 +7,32 @@ use reqwest::Client;
 use std::os::fd::OwnedFd;
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
+use varlink_http_bridge::TlsChannelBinding;
+
+/// Saves each test from assembling an `AuthRequest` and its backing `HeaderMap`.
+fn check_request(
+    auth: &dyn Authenticator,
+    method: &str,
+    path: &str,
+    auth_header: Option<&str>,
+    nonce: Option<&str>,
+    tls_channel_binding: Option<&TlsChannelBinding>,
+) -> anyhow::Result<()> {
+    let mut headers = axum::http::HeaderMap::new();
+    if let Some(v) = auth_header {
+        headers.insert("authorization", v.parse().unwrap());
+    }
+    if let Some(v) = nonce {
+        // literal SSHAUTH_NONCE_HEADER, which is compiled out without "sshauth"
+        headers.insert("x-auth-nonce", v.parse().unwrap());
+    }
+    auth.check_request(&AuthRequest {
+        method,
+        path,
+        headers: &headers,
+        tls_channel_binding,
+    })
+}
 
 /// Bundles a spawned test server task with its bound address.
 /// Dropping aborts the task, so each test's server is cleaned up
@@ -1506,7 +1532,7 @@ mod sshauth_tests {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let header = format!("Bearer {}", token.encode());
-        let result = auth.check_request("GET", "/sockets", Some(&header), Some(nonce), None);
+        let result = check_request(&auth, "GET", "/sockets", Some(&header), Some(nonce), None);
         assert!(result.is_err(), "expired token should be rejected");
     }
 
@@ -1528,7 +1554,7 @@ mod sshauth_tests {
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        let result = auth.check_request("GET", "/sockets", Some(&header), Some(nonce), None);
+        let result = check_request(&auth, "GET", "/sockets", Some(&header), Some(nonce), None);
         assert!(result.is_err());
         assert!(
             result
@@ -1544,9 +1570,7 @@ mod sshauth_tests {
         let signer = make_test_token_signer(&key_path);
 
         let nonce = "test-nonce-verify12345";
-        let cb = varlink_http_bridge::TlsChannelBinding::new(
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-        );
+        let cb = TlsChannelBinding::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
 
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
@@ -1556,8 +1580,15 @@ mod sshauth_tests {
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        auth.check_request("GET", "/sockets", Some(&header), Some(nonce), Some(&cb))
-            .expect("valid ed25519 token should pass");
+        check_request(
+            &auth,
+            "GET",
+            "/sockets",
+            Some(&header),
+            Some(nonce),
+            Some(&cb),
+        )
+        .expect("valid ed25519 token should pass");
     }
 
     #[tokio::test]
@@ -1610,14 +1641,7 @@ mod sshauth_tests {
 
     struct RejectingAuthenticator(&'static str);
     impl Authenticator for RejectingAuthenticator {
-        fn check_request(
-            &self,
-            _method: &str,
-            _path: &str,
-            _auth_header: Option<&str>,
-            _nonce: Option<&str>,
-            _channel_binding: Option<&varlink_http_bridge::TlsChannelBinding>,
-        ) -> anyhow::Result<()> {
+        fn check_request(&self, _request: &AuthRequest) -> anyhow::Result<()> {
             anyhow::bail!("{}", self.0)
         }
     }
@@ -1705,9 +1729,7 @@ mod sshauth_tests {
         let signer = make_test_token_signer(&key_path);
 
         let nonce = "replay-me12345678";
-        let cb = varlink_http_bridge::TlsChannelBinding::new(
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-        );
+        let cb = TlsChannelBinding::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
 
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
@@ -1718,11 +1740,25 @@ mod sshauth_tests {
         let header = format!("Bearer {}", token.encode());
 
         // First use should succeed
-        auth.check_request("GET", "/sockets", Some(&header), Some(nonce), Some(&cb))
-            .expect("first use of nonce should pass");
+        check_request(
+            &auth,
+            "GET",
+            "/sockets",
+            Some(&header),
+            Some(nonce),
+            Some(&cb),
+        )
+        .expect("first use of nonce should pass");
 
         // Replay with the same nonce should fail
-        let result = auth.check_request("GET", "/sockets", Some(&header), Some(nonce), Some(&cb));
+        let result = check_request(
+            &auth,
+            "GET",
+            "/sockets",
+            Some(&header),
+            Some(nonce),
+            Some(&cb),
+        );
         assert!(result.is_err(), "replayed nonce should be rejected");
         assert!(
             result
@@ -1744,7 +1780,7 @@ mod sshauth_tests {
         let header = format!("Bearer {}", token.encode());
 
         // Without a nonce, the request should be rejected
-        let result = auth.check_request("GET", "/sockets", Some(&header), None, None);
+        let result = check_request(&auth, "GET", "/sockets", Some(&header), None, None);
         assert!(result.is_err(), "request without nonce should be rejected");
         assert!(result.unwrap_err().to_string().contains("missing nonce"));
     }
@@ -1756,9 +1792,7 @@ mod sshauth_tests {
 
         let nonce = "cb-mismatch-test12345";
         let cb_signer = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-        let cb_verifier = varlink_http_bridge::TlsChannelBinding::new(
-            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
-        );
+        let cb_verifier = TlsChannelBinding::new("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=");
 
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
@@ -1768,7 +1802,8 @@ mod sshauth_tests {
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        let result = auth.check_request(
+        let result = check_request(
+            &auth,
             "GET",
             "/sockets",
             Some(&header),
@@ -1787,9 +1822,7 @@ mod sshauth_tests {
         let signer = make_test_token_signer(&key_path);
 
         let nonce = "cb-match-test-123456";
-        let cb = varlink_http_bridge::TlsChannelBinding::new(
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-        );
+        let cb = TlsChannelBinding::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
 
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
@@ -1799,8 +1832,15 @@ mod sshauth_tests {
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        auth.check_request("GET", "/sockets", Some(&header), Some(nonce), Some(&cb))
-            .expect("matching channel binding should pass");
+        check_request(
+            &auth,
+            "GET",
+            "/sockets",
+            Some(&header),
+            Some(nonce),
+            Some(&cb),
+        )
+        .expect("matching channel binding should pass");
     }
 
     #[test]
