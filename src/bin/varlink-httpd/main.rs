@@ -826,8 +826,9 @@ async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
                         debug!("ws recv close frame: {frame:?}");
                         break;
                     }
-                    other => {
-                        debug!("ws recv other: {other:?}");
+                    msg @ (Message::Ping(_) | Message::Pong(_)) => {
+                        // keepalives; axum answers pings automatically
+                        debug!("ws recv keepalive: {msg:?}");
                         continue;
                     }
                 };
