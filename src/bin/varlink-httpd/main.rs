@@ -504,10 +504,11 @@ fn resolve_tls_acceptor(
     cli_ca: Option<String>,
     creds_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<Option<openssl::ssl::SslAcceptor>> {
+    let creds = creds_dir.map(varlink_http_bridge::sysconf::CredentialsLoader::from_dir);
     let cred = |name: &str| -> Option<String> {
-        creds_dir
-            .map(|d| d.join(name))
-            .filter(|p| p.exists())
+        creds
+            .as_ref()
+            .and_then(|c| c.path(name))
             .and_then(|p| p.to_str().map(String::from))
     };
 
@@ -1289,7 +1290,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Bridge(cli) => cli,
     };
 
-    let creds_dir = std::env::var_os("CREDENTIALS_DIRECTORY").map(std::path::PathBuf::from);
+    let creds_dir = varlink_http_bridge::sysconf::CredentialsLoader::path_from_env();
 
     // Resolve mTLS: remember if trust was provided before consuming the options
     let has_mtls =

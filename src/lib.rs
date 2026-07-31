@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
+pub mod sysconf;
+
 #[cfg(feature = "sshauth")]
 /// Namespace prefix for SSH-based authentication tokens, analogous to
 /// `ssh-keygen -Y sign -n <namespace>`.  Binds signatures to this application
