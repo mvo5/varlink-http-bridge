@@ -3,12 +3,15 @@
 use std::fmt;
 
 use anyhow::{Context, Result, bail};
+use futures_util::future::LocalBoxFuture;
 use log::{debug, warn};
 use tokio_tungstenite::tungstenite;
 use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, TlsChannelBinding};
 
+use crate::client_auth::ClientAuth;
+
 /// An SSH key that can be used for authentication.
-pub(crate) enum SshKey {
+enum SshKey {
     /// A private key read from a file (`VARLINK_SSH_KEY`).
     PrivateKey {
         path: String,
@@ -54,7 +57,7 @@ impl fmt::Display for SshKey {
 ///
 /// A signing failure is returned as a [`SigningFailed`] error so the retry
 /// loop can skip the key and move on to the next one.
-pub(crate) async fn add_auth_headers(
+async fn add_auth_headers(
     request: &mut tungstenite::http::Request<()>,
     key: &SshKey,
     tls_channel_binding: Option<&TlsChannelBinding>,
@@ -81,20 +84,42 @@ pub(crate) async fn add_auth_headers(
     Ok(())
 }
 
-/// Try connecting with each available SSH key, retrying on 401.
+pub(crate) struct SshSignature;
+
+impl ClientAuth for SshSignature {
+    fn name(&self) -> &'static str {
+        "SSH signature auth (VARLINK_SSH_KEY or ssh-agent)"
+    }
+
+    fn configured(&self) -> bool {
+        std::env::var_os("VARLINK_SSH_KEY").is_some()
+    }
+
+    fn connect<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Result<Option<crate::Ws>>> {
+        Box::pin(connect_with_ssh_retry(url))
+    }
+}
+
+/// Try connecting with each available SSH key, retrying on 401;
+/// `Ok(None)` when no key is available.
 ///
-/// Enumerates keys from the environment (`VARLINK_SSH_KEY` or `SSH_AUTH_SOCK`),
-/// then calls `connect` for each key. Skip keys that fail to sign or get 401.
-/// Any other error is returned immediately.
-///
-/// When no key was ever presented to the server (none available, or all of
-/// them failed to sign), `connect` is called once with `None`
-/// (unauthenticated) and the server decides whether to allow that.
-pub(crate) async fn connect_with_ssh_retry<T>(
-    connect: impl AsyncFnMut(Option<&SshKey>) -> Result<T>,
-) -> Result<T> {
+/// When keys exist but none was ever presented to the server (all
+/// failed to sign), one unauthenticated attempt is made and the
+/// server decides whether to allow that.
+async fn connect_with_ssh_retry(url: &str) -> Result<Option<crate::Ws>> {
     let keys = list_ssh_keys().await?;
-    try_each_key(&keys, connect).await
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    let ws = try_each_key(&keys, async |key| {
+        let (stream, mut request, tcb) = crate::connect_transport(url).await?;
+        if let Some(key) = key {
+            add_auth_headers(&mut request, key, tcb.as_ref()).await?;
+        }
+        crate::ws_upgrade(request, stream, tcb.is_some()).await
+    })
+    .await?;
+    Ok(Some(ws))
 }
 
 /// Generic retry loop: try `connect` for each key.

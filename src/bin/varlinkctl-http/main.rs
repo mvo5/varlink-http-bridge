@@ -16,6 +16,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{self, Message};
 use varlink_http_bridge::TlsChannelBinding;
 
+mod client_auth;
 #[cfg(feature = "sshauth")]
 mod sshauth_client;
 
@@ -188,24 +189,6 @@ fn resp_body_text(resp: &tungstenite::http::Response<Option<Vec<u8>>>) -> Option
         .as_deref()
         .filter(|b| !b.is_empty())
         .map(|b| String::from_utf8_lossy(b).into_owned())
-}
-
-#[cfg(feature = "sshauth")]
-async fn connect_ws(url: &str) -> Result<Ws> {
-    sshauth_client::connect_with_ssh_retry(async |key| {
-        let (stream, mut request, tcb) = connect_transport(url).await?;
-        if let Some(key) = key {
-            sshauth_client::add_auth_headers(&mut request, key, tcb.as_ref()).await?;
-        }
-        ws_upgrade(request, stream, tcb.is_some()).await
-    })
-    .await
-}
-
-#[cfg(not(feature = "sshauth"))]
-async fn connect_ws(url: &str) -> Result<Ws> {
-    let (stream, request, tcb) = connect_transport(url).await?;
-    ws_upgrade(request, stream, tcb.is_some()).await
 }
 
 /// The TLS channel binding is returned so auth headers can be signed
@@ -399,7 +382,7 @@ async fn main() -> Result<()> {
     fd3.set_nonblocking(true)?;
     let fd3 = UnixStream::from_std(fd3)?;
 
-    let ws = tokio::time::timeout(CONNECT_TIMEOUT, connect_ws(&bridge_url))
+    let ws = tokio::time::timeout(CONNECT_TIMEOUT, client_auth::connect_ws(&bridge_url))
         .await
         .with_context(|| format!("timed out connecting to '{bridge_url}'"))??;
 
