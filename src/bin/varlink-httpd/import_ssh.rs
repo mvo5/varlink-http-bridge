@@ -10,12 +10,6 @@ pub(crate) struct ImportSsh {
 }
 
 fn default_authorized_keys_path() -> String {
-    if let Some(creds_dir) = std::env::var_os("CREDENTIALS_DIRECTORY") {
-        return std::path::Path::new(&creds_dir)
-            .join("authorized_keys")
-            .to_string_lossy()
-            .into_owned();
-    }
     if rustix::process::getuid().is_root() {
         return "/etc/varlink-httpd/authorized_keys".to_string();
     }
@@ -62,11 +56,7 @@ pub(crate) fn run(cmd: ImportSsh) -> anyhow::Result<()> {
         "Wrote {keys_count} key(s) to {output_path}, run with:",
         keys_count = imported.keys.len()
     );
-    if std::env::var_os("CREDENTIALS_DIRECTORY").is_some() {
-        eprintln!("  varlink-httpd");
-    } else {
-        eprintln!("  varlink-httpd --authorized-keys={output_path}");
-    }
+    eprintln!("  varlink-httpd --authorized-keys={output_path}");
 
     Ok(())
 }

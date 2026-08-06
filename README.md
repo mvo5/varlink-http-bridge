@@ -328,11 +328,15 @@ Ed25519 and ECDSA keys.
 #### Server setup
 
 The bridge discovers authorized keys automatically from these
-locations (first match wins):
+locations:
 
-1. `--authorized-keys PATH` — explicit CLI flag
+1. `--authorized-keys PATH` — explicit CLI flag (used exclusively)
 2. `/etc/varlink-httpd/authorized_keys` — config file
-3. `$CREDENTIALS_DIRECTORY/ssh.authorized_keys.root` — systemd credential (see `systemd.exec(5)`)
+3. `$CREDENTIALS_DIRECTORY/varlink-httpd.ssh.authorized-keys` — bridge-scoped systemd credential (see `systemd.exec(5)`)
+4. `$CREDENTIALS_DIRECTORY/ssh.authorized_keys.root` — well-known credential (see `systemd.system-credentials(7)`)
+5. `$CREDENTIALS_DIRECTORY/ssh.ephemeral-authorized_keys-all` — well-known credential
+
+Without the CLI flag, keys from all sources that exist are merged.
 
 The simplest setup is to pass the path explicitly:
 
@@ -356,13 +360,20 @@ argument.  Once written to `/etc/varlink-httpd/authorized_keys`,
 the bridge picks up the file automatically (discovery path 2) so the
 `--authorized-keys` flag is no longer needed.
 
-When running as a systemd service, the bridge discovers keys from
-credentials automatically (discovery paths 3 and 4):
+When running as a systemd service, provision keys as the bridge-scoped
+credential (imported by the shipped unit file, following the same
+naming as the `varlink-httpd.tls.*` credentials):
 
-```ini
-[Service]
-LoadCredential=ssh.authorized_keys.root:/root/.ssh/authorized_keys
+```console
+# cp authorized_keys /etc/credstore/varlink-httpd.ssh.authorized-keys
 ```
+
+The well-known `ssh.authorized_keys.root` and
+`ssh.ephemeral-authorized_keys-all` credentials are honored as
+fallback (useful for dev/VM flows that inject them e.g. via SMBIOS).
+Prefer the bridge-scoped credential for provisioning:
+`ssh.authorized_keys.root` also grants root login via sshd, which is
+usually more than the bridge needs.
 
 #### Client setup (key selection)
 

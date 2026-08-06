@@ -1829,6 +1829,20 @@ mod sshauth_tests {
             create_ssh_authenticator(None, Some(creds_dir.path()), empty_root.path()).unwrap();
         assert_eq!(auth.key_count(), 1, "should find key from creds_dir");
 
+        // 3b. bridge-scoped credential is found alone and merged with .root
+        let creds = tempfile::tempdir().unwrap();
+        let scoped = creds.path().join("varlink-httpd.ssh.authorized-keys");
+        std::fs::write(&scoped, pubkey_a.as_bytes()).unwrap();
+        let auth = create_ssh_authenticator(None, Some(creds.path()), empty_root.path()).unwrap();
+        assert_eq!(auth.key_count(), 1, "should find scoped credential");
+        std::fs::write(
+            creds.path().join("ssh.authorized_keys.root"),
+            pubkey_b1.as_bytes(),
+        )
+        .unwrap();
+        let auth = create_ssh_authenticator(None, Some(creds.path()), empty_root.path()).unwrap();
+        assert_eq!(auth.key_count(), 2, "scoped + .root should be merged");
+
         // 4. Both /etc and $CREDENTIALS_DIRECTORY exist → keys are merged
         let root_both = tempfile::tempdir().unwrap();
         let etc_dir = root_both.path().join("etc/varlink-httpd");

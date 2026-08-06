@@ -300,10 +300,13 @@ pub(crate) fn extract_nonce(headers: &axum::http::HeaderMap) -> Option<String> {
         .map(String::from)
 }
 
-/// Well-known credential names for SSH authorized keys, see
-/// systemd.system-credentials(7).  The dedicated credential is checked
-/// first so it takes priority over the broader ephemeral one.
+/// Credential names probed in $`CREDENTIALS_DIRECTORY`; keys from all
+/// present sources are merged.  The bridge-scoped name is the preferred
+/// provisioning path: the well-known ssh.* names (see
+/// systemd.system-credentials(7)) also grant root sshd login, so they
+/// are kept only as fallback for dev/VM flows.
 const SSH_AUTHORIZED_KEYS_CREDENTIALS: &[&str] = &[
+    "varlink-httpd.ssh.authorized-keys",
     "ssh.authorized_keys.root",
     "ssh.ephemeral-authorized_keys-all",
 ];

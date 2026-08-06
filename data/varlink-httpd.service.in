@@ -48,7 +48,11 @@ ImportCredential=varlink-httpd.tls.certificate:cert
 ImportCredential=varlink-httpd.tls.key:key
 ImportCredential=varlink-httpd.tls.trust:trust
 
-# SSH authorized keys (see systemd.system-credentials(7))
+# SSH authorized keys. The bridge-scoped credential is the preferred
+# provisioning path; the well-known ssh.* names (see
+# systemd.system-credentials(7)) also grant root sshd login and are
+# kept only as fallback for dev/VM flows.
+ImportCredential=varlink-httpd.ssh.authorized-keys
 ImportCredential=ssh.authorized_keys.root
 ImportCredential=ssh.ephemeral-authorized_keys-all
 
