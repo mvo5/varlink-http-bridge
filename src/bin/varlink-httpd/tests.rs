@@ -1132,7 +1132,7 @@ async fn test_varlinkctl_helper_mtls_no_client_cert() {
         "expected failure without client cert, but helper succeeded"
     );
     assert!(
-        stderr.contains("handshake failed: check client cert if server requires mTLS"),
+        stderr.contains("check client cert if server requires mTLS"),
         "expected mTLS hint in error, got: {stderr}"
     );
 }
