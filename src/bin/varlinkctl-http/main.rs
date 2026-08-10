@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::BorrowedFd;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
@@ -375,8 +375,18 @@ async fn main() -> Result<()> {
     };
 
     // Safety: fd 3 is passed to us via the sd_listen_fds() protocol.
-    let fd3 = unsafe { OwnedFd::from_raw_fd(3) };
-    rustix::io::fcntl_getfd(&fd3).context("fd 3 is not valid (LISTEN_FDS protocol error?)")?;
+    let fd3 = unsafe { BorrowedFd::borrow_raw(3) };
+    rustix::io::fcntl_getfd(fd3).context("fd 3 is not valid (LISTEN_FDS protocol error?)")?;
+    // We are called by systemds "varlinkctl" which monitors fd3 and
+    // if that closes immediately kills us. The implication of this is
+    // that closing it too early can lead to us getting killed before
+    // we had a chance to e.g. print a "connection failed" or similar
+    // messages. So we never take ownership of fd3 itself (it stays
+    // open until the OS closes it at process exit) and work on a
+    // duplicate instead. This guarantees varlinkctl cannot see EOF
+    // (and SIGTERM us) before any error output has reached stderr or
+    // any cleanup has happened.
+    let fd3 = fd3.try_clone_to_owned().context("duplicating fd 3")?;
     let fd3 = std::os::unix::net::UnixStream::from(fd3);
     fd3.set_nonblocking(true)?;
     let fd3 = UnixStream::from_std(fd3)?;
