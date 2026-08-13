@@ -328,11 +328,22 @@ Ed25519 and ECDSA keys.
 #### Server setup
 
 The bridge discovers authorized keys automatically from these
-locations (first match wins):
+locations:
 
-1. `--authorized-keys PATH` — explicit CLI flag
+1. `--authorized-keys PATH` — explicit CLI flag; when given it is the only
+   source used
 2. `/etc/varlink-httpd/authorized_keys` — config file
-3. `$CREDENTIALS_DIRECTORY/ssh.authorized_keys.root` — systemd credential (see `systemd.exec(5)`)
+3. `$CREDENTIALS_DIRECTORY/ssh.authorized_keys.root` and
+   `ssh.ephemeral-authorized_keys-all` — systemd credentials (see
+   `systemd.exec(5)`)
+4. `$CREDENTIALS_DIRECTORY/varlink-httpd.ssh.authorized-keys.*` — additional
+   credentials, imported by the unit using a glob. Each provider (a
+   generated node config, a local admin, a confext) ships its own
+   `/etc/credstore/varlink-httpd.ssh.authorized-keys.<provider>` rather than
+   overwriting a shared file, which neither the credstore nor overlaid
+   confexts can merge.
+
+Keys from 2, 3 and 4 are merged and deduplicated.
 
 The simplest setup is to pass the path explicitly:
 

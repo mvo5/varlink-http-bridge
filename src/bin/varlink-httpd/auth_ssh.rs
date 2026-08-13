@@ -308,6 +308,30 @@ const SSH_AUTHORIZED_KEYS_CREDENTIALS: &[&str] = &[
     "ssh.ephemeral-authorized_keys-all",
 ];
 
+/// One credential per provider, because neither the credstore nor overlaid
+/// confexts can merge the contents of a shared file.
+const SSH_AUTHORIZED_KEYS_PREFIX: &str = "varlink-httpd.ssh.authorized-keys.";
+
+/// Sorted so the merge order is stable. Enumerated rather than watched like
+/// the names above: systemd fills `$CREDENTIALS_DIRECTORY` at unit start and
+/// it is read-only after, so no new match can appear while we run.
+fn ssh_authorized_keys_prefixed(dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<String> = entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(SSH_AUTHORIZED_KEYS_PREFIX))
+        })
+        .map(|e| e.path().to_string_lossy().into_owned())
+        .collect();
+    paths.sort();
+    paths
+}
+
 pub(crate) fn create_ssh_authenticator(
     cli_authorized_keys: Option<String>,
     creds_dir: Option<&std::path::Path>,
@@ -329,6 +353,7 @@ pub(crate) fn create_ssh_authenticator(
             for name in SSH_AUTHORIZED_KEYS_CREDENTIALS {
                 paths.push(d.join(name).to_string_lossy().to_string());
             }
+            paths.extend(ssh_authorized_keys_prefixed(d));
         }
         paths
     };

@@ -51,6 +51,7 @@ ImportCredential=varlink-httpd.tls.trust:trust
 # SSH authorized keys (see systemd.system-credentials(7))
 ImportCredential=ssh.authorized_keys.root
 ImportCredential=ssh.ephemeral-authorized_keys-all
+ImportCredential=varlink-httpd.ssh.authorized-keys.*
 
 [Install]
 WantedBy=network.target

@@ -1950,6 +1950,53 @@ mod sshauth_tests {
         );
     }
 
+    #[test]
+    fn test_ssh_auth_multiple_authorized_keys_credentials() {
+        let keygen_dir_a = tempfile::tempdir().unwrap();
+        let (pubkey_a, _) = generate_ed25519_keypair(keygen_dir_a.path());
+        let keygen_dir_b1 = tempfile::tempdir().unwrap();
+        let (pubkey_b1, _) = generate_ed25519_keypair(keygen_dir_b1.path());
+        let keygen_dir_b2 = tempfile::tempdir().unwrap();
+        let (pubkey_b2, _) = generate_ed25519_keypair(keygen_dir_b2.path());
+        let empty_root = tempfile::tempdir().unwrap();
+
+        // Credentials and the well-known names are merged into a list.
+        // The order is stable.
+        let creds_dir_multi = tempfile::tempdir().unwrap();
+        std::fs::write(
+            creds_dir_multi.path().join("ssh.authorized_keys.root"),
+            pubkey_a.as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            creds_dir_multi
+                .path()
+                .join("varlink-httpd.ssh.authorized-keys.nodeconfig"),
+            format!("{}\n", pubkey_b1.trim()),
+        )
+        .unwrap();
+        std::fs::write(
+            creds_dir_multi
+                .path()
+                .join("varlink-httpd.ssh.authorized-keys.local"),
+            format!("{}\n", pubkey_b2.trim()),
+        )
+        .unwrap();
+        // An unrelated credential in the same directory must not be read.
+        std::fs::write(
+            creds_dir_multi.path().join("varlink-httpd.tls.certificate"),
+            b"not a key",
+        )
+        .unwrap();
+        let auth = create_ssh_authenticator(None, Some(creds_dir_multi.path()), empty_root.path())
+            .unwrap();
+        assert_eq!(
+            auth.key_count(),
+            3,
+            ".root (1 key) + two per-provider credentials (1 key each) should be merged"
+        );
+    }
+
     #[test_with::path(/usr/bin/varlinkctl)]
     #[test_with::path(/run/systemd/io.systemd.Hostname)]
     #[tokio::test]
