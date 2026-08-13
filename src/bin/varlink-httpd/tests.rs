@@ -1491,7 +1491,7 @@ mod sshauth_tests {
         std::fs::write(&file_a, pubkey_a.as_bytes()).unwrap();
         std::fs::write(&file_b, pubkey_b.as_bytes()).unwrap();
 
-        let auth = crate::auth_ssh::SshKeyAuthenticator::new(vec![
+        let auth = crate::auth_ssh::SshKeyAuthenticator::from_paths(vec![
             file_a.to_string_lossy().into_owned(),
             file_b.to_string_lossy().into_owned(),
         ])
@@ -1947,6 +1947,67 @@ mod sshauth_tests {
             auth.key_count(),
             1,
             "CLI path should be used exclusively, not /etc or credential"
+        );
+    }
+
+    /// Write an `authorized_keys` file under `root/base/`.
+    fn write_authorized_keys_at(root: &std::path::Path, base: &str, pubkeys: &[&str]) {
+        use std::io::Write;
+        let path = root.join(base).join("varlink-httpd/authorized_keys");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&path).unwrap();
+        for key in pubkeys {
+            writeln!(f, "{key}").unwrap();
+        }
+    }
+
+    #[test]
+    fn test_ssh_auth_config_hierarchy_precedence() {
+        let keydir_a = tempfile::tempdir().unwrap();
+        let keydir_b = tempfile::tempdir().unwrap();
+        let (vendor_key, _) = generate_ed25519_keypair(keydir_a.path());
+        let (admin_key, _) = generate_ed25519_keypair(keydir_b.path());
+
+        let root = tempfile::tempdir().unwrap();
+        write_authorized_keys_at(root.path(), "usr/lib", &[vendor_key.trim()]);
+        let auth = create_ssh_authenticator(None, None, root.path()).unwrap();
+        assert_eq!(auth.key_count(), 1, "/usr/lib keys should be used");
+
+        write_authorized_keys_at(root.path(), "run", &[admin_key.trim()]);
+        auth.reload_for_test();
+        assert_eq!(auth.key_count(), 1, "/run should shadow /usr/lib");
+
+        write_authorized_keys_at(root.path(), "etc", &[]);
+        auth.reload_for_test();
+        assert_eq!(auth.key_count(), 0, "empty /etc should revoke lower keys");
+
+        std::fs::remove_file(root.path().join("etc/varlink-httpd/authorized_keys")).unwrap();
+        auth.reload_for_test();
+        assert_eq!(auth.key_count(), 1, "removing /etc should restore /run");
+    }
+
+    #[test]
+    fn test_ssh_auth_hierarchy_merges_credentials() {
+        use std::io::Write;
+
+        let keydir_a = tempfile::tempdir().unwrap();
+        let keydir_b = tempfile::tempdir().unwrap();
+        let (etc_key, _) = generate_ed25519_keypair(keydir_a.path());
+        let (cred_key, _) = generate_ed25519_keypair(keydir_b.path());
+
+        let root = tempfile::tempdir().unwrap();
+        write_authorized_keys_at(root.path(), "etc", &[etc_key.trim()]);
+        let creds_dir = tempfile::tempdir().unwrap();
+        let mut f =
+            std::fs::File::create(creds_dir.path().join("ssh.authorized_keys.root")).unwrap();
+        writeln!(f, "{}", cred_key.trim()).unwrap();
+        drop(f);
+
+        let auth = create_ssh_authenticator(None, Some(creds_dir.path()), root.path()).unwrap();
+        assert_eq!(
+            auth.key_count(),
+            2,
+            "credentials merge on top of the hierarchy instead of being shadowed"
         );
     }
 

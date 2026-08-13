@@ -23,12 +23,30 @@ impl CredentialsLoader {
         Self { dir: dir.into() }
     }
 
+    /// Where credential `id` would live, existing or not, for callers that
+    /// watch the path so a credential appearing later is picked up.
+    #[must_use]
+    pub fn candidate(&self, id: &str) -> PathBuf {
+        self.dir.join(id)
+    }
+
     /// Path of credential `id`, if the file exists.
     #[must_use]
     pub fn path(&self, id: &str) -> Option<PathBuf> {
-        let path = self.dir.join(id);
+        let path = self.candidate(id);
         path.exists().then_some(path)
     }
+}
+
+/// Every location `rel` could live in, highest precedence first, existing
+/// or not, for callers that watch all of them so a higher-precedence file
+/// appearing later takes over.
+#[must_use]
+pub fn config_candidates(rel: &str, root: &Path) -> Vec<PathBuf> {
+    ["etc", "run", "usr/lib"]
+        .into_iter()
+        .map(|base| root.join(base).join(rel))
+        .collect()
 }
 
 /// Highest-precedence existing config file for `rel`, following the systemd
@@ -36,9 +54,8 @@ impl CredentialsLoader {
 /// production, a tempdir in tests.
 #[must_use]
 pub fn find_config(rel: &str, root: &Path) -> Option<PathBuf> {
-    ["etc", "run", "usr/lib"]
+    config_candidates(rel, root)
         .into_iter()
-        .map(|base| root.join(base).join(rel))
         .find(|path| path.exists())
 }
 
@@ -54,6 +71,27 @@ mod tests {
         let loader = CredentialsLoader::from_dir(dir.path());
         assert_eq!(loader.path("cert"), Some(dir.path().join("cert")));
         assert_eq!(loader.path("missing"), None);
+    }
+
+    #[test]
+    fn test_credentials_loader_candidate_ignores_existence() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = CredentialsLoader::from_dir(dir.path());
+        assert_eq!(loader.candidate("missing"), dir.path().join("missing"));
+        assert_eq!(loader.path("missing"), None);
+    }
+
+    #[test]
+    fn test_config_candidates_order_ignores_existence() {
+        let root = std::path::Path::new("/fake-root");
+        assert_eq!(
+            config_candidates("varlink-httpd/api-keys", root),
+            vec![
+                root.join("etc/varlink-httpd/api-keys"),
+                root.join("run/varlink-httpd/api-keys"),
+                root.join("usr/lib/varlink-httpd/api-keys"),
+            ]
+        );
     }
 
     #[test]
