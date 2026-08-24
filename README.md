@@ -349,6 +349,13 @@ locations:
 
 Keys from 2, 3 and 4 are merged and deduplicated.
 
+All sources are re-read when they change (checked lazily on each
+request), so key updates need no restart. Note that systemd imports
+credentials only at service start: updating credential-sourced keys
+requires a `systemctl reload varlink-httpd` to refresh the imported
+credentials, which needs systemd >= 260 (`RefreshOnReload=`). On older
+systemd the setting is ignored and a full restart is needed instead.
+
 The simplest setup is to pass the path explicitly:
 
 ```console

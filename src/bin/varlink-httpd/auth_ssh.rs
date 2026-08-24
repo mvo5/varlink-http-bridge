@@ -70,6 +70,26 @@ impl AuthKeysFile {
     }
 }
 
+/// Keep track of the mtime of the tracked paths. This means when comparing two
+/// MtimeSnapshots for "eq" we cover changed, appeared or vanished files.
+#[derive(PartialEq)]
+struct MtimeSnapshot(HashMap<String, SystemTime>);
+
+impl MtimeSnapshot {
+    /// Takes a snapshot of the given paths. Any error that is not
+    /// ENOENT fails the snapshot and returns an error that contains
+    /// the failing path.
+    fn take(paths: &[String]) -> Result<Self, (String, std::io::Error)> {
+        let mut on_disk = HashMap::new();
+        for path in paths {
+            if let Some(t) = AuthKeysFile::stat_mtime(path).map_err(|e| (path.clone(), e))? {
+                on_disk.insert(path.clone(), t);
+            }
+        }
+        Ok(Self(on_disk))
+    }
+}
+
 struct KeyCache {
     files: HashMap<String, AuthKeysFile>,
 }
@@ -122,28 +142,26 @@ impl KeyCache {
         fps.into_iter().collect()
     }
 
-    /// Ok(true) if any `path` in `paths` has an mtime that differs from
-    /// what this cache has recorded (including "file now exists" and
-    /// "file now gone"). Err carries the path that failed a transient
-    /// stat so the caller can log it.
-    fn any_mtime_changed(&self, paths: &[String]) -> Result<bool, (String, std::io::Error)> {
-        for path in paths {
-            let now = AuthKeysFile::stat_mtime(path).map_err(|e| (path.clone(), e))?;
-            let cached = self.files.get(path).map(|f| f.mtime);
-            if now != cached {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+    /// The snapshot this cache currently reflects.
+    fn snapshot(&self) -> MtimeSnapshot {
+        MtimeSnapshot(
+            self.files
+                .iter()
+                .map(|(p, f)| (p.clone(), f.mtime))
+                .collect(),
+        )
     }
 
     /// If any tracked path has changed on disk, re-read it; transient
     /// stat errors are logged and the cache is left untouched (retried
     /// on the next call).
     fn maybe_reload(&mut self, paths: &[String]) {
-        match self.any_mtime_changed(paths) {
-            Ok(false) => {}
-            Ok(true) => self.reload(paths),
+        match MtimeSnapshot::take(paths) {
+            Ok(on_disk) => {
+                if on_disk != self.snapshot() {
+                    self.reload(on_disk);
+                }
+            }
             Err((path, e)) => {
                 // Transient error (permissions, IO): skip this reload cycle
                 // rather than risk dropping valid keys. Retry next request.
@@ -152,17 +170,21 @@ impl KeyCache {
         }
     }
 
-    /// Re-read all `paths` into this cache, replacing previously tracked
-    /// entries. On parse errors the file's mtime is still recorded (with
-    /// empty keys) so we don't log-spam the same warning on every request
-    /// until the file changes again.
-    fn reload(&mut self, paths: &[String]) {
+    /// Re-read the changed files in the snapshot into this cache,
+    /// replacing previously tracked entries; entries whose mtime is
+    /// unchanged are kept as-is. On parse errors the file's mtime is
+    /// still recorded (with empty keys) so we don't log-spam the same
+    /// warning on every request until the file changes again.
+    fn reload(&mut self, on_disk: MtimeSnapshot) {
         let mut new_files = HashMap::new();
-        for path in paths {
-            let Ok(Some(mtime)) = AuthKeysFile::stat_mtime(path) else {
-                continue; // file is gone or unreadable; drop its cached keys
-            };
-            let keys = match AuthKeysFile::parse_keys(path) {
+        for (path, mtime) in on_disk.0 {
+            if let Some(cached) = self.files.remove(&path)
+                && cached.mtime == mtime
+            {
+                new_files.insert(path, cached);
+                continue;
+            }
+            let keys = match AuthKeysFile::parse_keys(&path) {
                 Ok(keys) => {
                     info!(
                         "reloaded {count} SSH key(s) from {path} (file changed)",
@@ -175,7 +197,7 @@ impl KeyCache {
                     HashMap::new()
                 }
             };
-            new_files.insert(path.clone(), AuthKeysFile { mtime, keys });
+            new_files.insert(path, AuthKeysFile { mtime, keys });
         }
 
         self.files = new_files;
@@ -235,33 +257,57 @@ impl NonceStore {
 }
 
 pub(crate) struct SshKeyAuthenticator {
+    /// Fixed paths only; the prefixed credentials under `creds_dir` are
+    /// re-enumerated on every reload check.
     paths: Vec<String>,
+    creds_dir: Option<std::path::PathBuf>,
     max_skew: u64,
     authorized_keys: Mutex<KeyCache>,
     nonces: Mutex<NonceStore>,
 }
 
 impl SshKeyAuthenticator {
-    pub(crate) fn new(paths: Vec<String>) -> anyhow::Result<Self> {
-        let cache = KeyCache::load_all(&paths)?;
+    pub(crate) fn new(
+        paths: Vec<String>,
+        creds_dir: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<Self> {
+        let all_paths = current_paths(&paths, creds_dir.as_deref())
+            .context("failed to enumerate prefixed credentials")?;
+        let cache = KeyCache::load_all(&all_paths)?;
         if cache.unique_key_count() == 0 {
             warn!(
                 "no supported SSH public keys in {} (note: RSA is not supported, use Ed25519 or ECDSA); SSH auth will reject all requests until keys appear",
-                paths.join(", "),
+                all_paths.join(", "),
             );
         }
+        info!(
+            "Authenticator: adding SSH authorized keys ({count} keys from {sources})",
+            count = cache.unique_key_count(),
+            sources = all_paths.join(", "),
+        );
 
         let max_skew = 60;
         Ok(Self {
             paths,
+            creds_dir,
             max_skew,
             authorized_keys: Mutex::new(cache),
             nonces: Mutex::new(NonceStore::new(max_skew)),
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn key_count(&self) -> usize {
         self.authorized_keys.lock().unwrap().unique_key_count()
+    }
+
+    fn maybe_reload(&self) {
+        let Ok(paths) = current_paths(&self.paths, self.creds_dir.as_deref()).inspect_err(|e| {
+            warn!("cannot enumerate credentials: {e}, skipping reload (keeping cached keys)")
+        }) else {
+            return;
+        };
+        self.authorized_keys.lock().unwrap().maybe_reload(&paths);
     }
 
     #[cfg(test)]
@@ -273,10 +319,7 @@ impl SshKeyAuthenticator {
 
     #[cfg(test)]
     pub(crate) fn reload_for_test(&self) {
-        self.authorized_keys
-            .lock()
-            .unwrap()
-            .maybe_reload(&self.paths);
+        self.maybe_reload();
     }
 }
 
@@ -286,6 +329,7 @@ impl std::fmt::Debug for SshKeyAuthenticator {
         let fingerprints = ak.fingerprints();
         f.debug_struct("SshKeyAuthenticator")
             .field("paths", &self.paths)
+            .field("creds_dir", &self.creds_dir)
             .field("max_skew", &self.max_skew)
             .field("fingerprints", &fingerprints)
             .finish_non_exhaustive()
@@ -312,24 +356,41 @@ const SSH_AUTHORIZED_KEYS_CREDENTIALS: &[&str] = &[
 /// confexts can merge the contents of a shared file.
 const SSH_AUTHORIZED_KEYS_PREFIX: &str = "varlink-httpd.ssh.authorized-keys.";
 
-/// Sorted so the merge order is stable. Enumerated rather than watched like
-/// the names above: systemd fills `$CREDENTIALS_DIRECTORY` at unit start and
-/// it is read-only after, so no new match can appear while we run.
-fn ssh_authorized_keys_prefixed(dir: &std::path::Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+/// Sorted so the merge order is stable. Re-enumerated on every reload
+/// check because `RefreshOnReload=credentials` swaps in a fresh tree on
+/// `systemctl reload`, so matches can appear and disappear while we run.
+/// A missing directory means no credentials; other errors propagate so
+/// the caller keeps the cached keys.
+fn ssh_authorized_keys_prefixed(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
-    let mut paths: Vec<String> = entries
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with(SSH_AUTHORIZED_KEYS_PREFIX))
-        })
-        .map(|e| e.path().to_string_lossy().into_owned())
-        .collect();
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(SSH_AUTHORIZED_KEYS_PREFIX))
+        {
+            paths.push(entry.path().to_string_lossy().into_owned());
+        }
+    }
     paths.sort();
-    paths
+    Ok(paths)
+}
+
+fn current_paths(
+    paths: &[String],
+    creds_dir: Option<&std::path::Path>,
+) -> std::io::Result<Vec<String>> {
+    let mut all = paths.to_vec();
+    if let Some(d) = creds_dir {
+        all.extend(ssh_authorized_keys_prefixed(d)?);
+    }
+    Ok(all)
 }
 
 pub(crate) fn create_ssh_authenticator(
@@ -337,9 +398,9 @@ pub(crate) fn create_ssh_authenticator(
     creds_dir: Option<&std::path::Path>,
     root: &std::path::Path,
 ) -> anyhow::Result<SshKeyAuthenticator> {
-    let paths: Vec<String> = if let Some(cli_path) = cli_authorized_keys {
+    let (paths, creds_dir) = if let Some(cli_path) = cli_authorized_keys {
         // Explicit CLI path overrides all auto-discovery
-        vec![cli_path]
+        (vec![cli_path], None)
     } else {
         // Register all well-known sources; files that don't exist yet
         // will be picked up by maybe_reload() once they appear.
@@ -353,26 +414,16 @@ pub(crate) fn create_ssh_authenticator(
             for name in SSH_AUTHORIZED_KEYS_CREDENTIALS {
                 paths.push(d.join(name).to_string_lossy().to_string());
             }
-            paths.extend(ssh_authorized_keys_prefixed(d));
         }
-        paths
+        (paths, creds_dir.map(std::path::Path::to_path_buf))
     };
 
-    let ssh_auth = SshKeyAuthenticator::new(paths.clone())?;
-    info!(
-        "Authenticator: adding SSH authorized keys ({count} keys from {sources})",
-        count = ssh_auth.key_count(),
-        sources = paths.join(", "),
-    );
-    Ok(ssh_auth)
+    SshKeyAuthenticator::new(paths, creds_dir)
 }
 
 impl Authenticator for SshKeyAuthenticator {
     fn check_request(&self, request: &AuthRequest) -> anyhow::Result<()> {
-        self.authorized_keys
-            .lock()
-            .unwrap()
-            .maybe_reload(&self.paths);
+        self.maybe_reload();
 
         let (method, path) = (request.method, request.path);
         let token_str = request.bearer_token()?;
