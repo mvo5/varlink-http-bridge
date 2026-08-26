@@ -7,6 +7,9 @@ use reqwest::Client;
 use std::os::fd::OwnedFd;
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 use varlink_http_bridge::TlsChannelBinding;
 
 /// Saves each test from assembling an `AuthRequest` and its backing `HeaderMap`.
@@ -660,6 +663,84 @@ async fn test_ws_hostname_describe() {
     assert_eq!(body["parameters"]["Hostname"], expected_hostname);
 }
 
+/// A stub varlink socket, so that the close handshake tests do not
+/// depend on a real varlink service being around. With `keep_open` the
+/// accepted connections are held so the bridge does not see EOF.
+struct StubVarlinkSocket {
+    _tmpdir: tempfile::TempDir,
+    path: std::path::PathBuf,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for StubVarlinkSocket {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+fn run_stub_varlink_socket(keep_open: bool) -> StubVarlinkSocket {
+    let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
+    let path = tmpdir.path().join("io.test.Stub");
+    let listener = tokio::net::UnixListener::bind(&path).expect("failed to bind stub socket");
+
+    let handle = tokio::spawn(async move {
+        let mut conns = Vec::new();
+        while let Ok((conn, _)) = listener.accept().await {
+            if keep_open {
+                conns.push(conn);
+            }
+        }
+    });
+
+    StubVarlinkSocket {
+        _tmpdir: tmpdir,
+        path,
+        handle,
+    }
+}
+
+async fn connect_stub_ws(stub: &StubVarlinkSocket) -> (TestServer<std::net::SocketAddr>, WsStream) {
+    let server = run_test_server(stub.path.to_str().expect("stub path not utf8")).await;
+    let url = format!("ws://{}/ws/sockets/io.test.Stub", server.addr);
+    let (ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WS connect failed");
+    (server, ws)
+}
+
+/// The stream must end cleanly, i.e. tungstenite must not report
+/// `ResetWithoutClosingHandshake` because the peer just went away.
+async fn assert_ws_closed_cleanly(ws: &mut WsStream) {
+    let msg = ws
+        .next()
+        .await
+        .expect("no close frame, connection just went away")
+        .expect("WS recv error instead of a close frame");
+    assert!(
+        matches!(msg, WsMsg::Close(_)),
+        "expected close, got {msg:?}"
+    );
+    assert!(ws.next().await.is_none(), "expected end of stream");
+}
+
+#[tokio::test]
+async fn test_ws_close_from_client_is_answered() {
+    let stub = run_stub_varlink_socket(true);
+    let (_server, mut ws) = connect_stub_ws(&stub).await;
+
+    ws.close(None).await.expect("WS close failed");
+
+    assert_ws_closed_cleanly(&mut ws).await;
+}
+
+#[tokio::test]
+async fn test_ws_close_when_varlink_socket_closes() {
+    let stub = run_stub_varlink_socket(false);
+    let (_server, mut ws) = connect_stub_ws(&stub).await;
+
+    assert_ws_closed_cleanly(&mut ws).await;
+}
+
 #[test_with::path(/run/systemd/userdb/io.systemd.Multiplexer)]
 #[tokio::test]
 async fn test_ws_userdb_get_user_record_more() {
@@ -851,6 +932,11 @@ async fn test_varlinkctl_helper_hostname_describe() {
     )
     .await;
     assert_hostname_reply(&output);
+
+    // an incomplete close handshake still delivers the reply, it only
+    // shows up as a warning from the helper
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(!stderr.contains("WARN"), "unexpected warning: {stderr}");
 }
 
 #[test_with::path(/usr/bin/varlinkctl)]

@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::signal;
@@ -923,6 +924,33 @@ async fn send_ws_frames(
     Ok(())
 }
 
+// Time to wait for the close handshake to finish before giving up.
+const WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Finish the close handshake. Bounded so that a stuck peer cannot
+/// hold this task forever.
+async fn close_ws(ws: &mut WebSocket) {
+    let closing_handshake = async {
+        // tungstenite only queues the reply to a received close frame,
+        // it gets written on the next flush; close() does that flush and
+        // sends our own close frame when we are closing first
+        if let Err(e) = futures_util::SinkExt::close(ws).await {
+            debug!("ws close failed: {e}");
+            return;
+        }
+        // ends when the peers close frame arrived or the connection died
+        while let Some(Ok(msg)) = ws.recv().await {
+            debug!("ws recv while closing: {msg:?}");
+        }
+    };
+    if tokio::time::timeout(WS_CLOSE_TIMEOUT, closing_handshake)
+        .await
+        .is_err()
+    {
+        debug!("timed out closing WebSocket");
+    }
+}
+
 // Forwards bytes between the websocket and the varlink unix socket in
 // both directions; framing decisions live in [`VarlinkFramer`].
 async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
@@ -948,6 +976,7 @@ async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
                     }
                     Message::Close(frame) => {
                         debug!("ws recv close frame: {frame:?}");
+                        close_ws(&mut ws).await;
                         break;
                     }
                     msg @ (Message::Ping(_) | Message::Pong(_)) => {
@@ -959,6 +988,7 @@ async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
                 varlink_framer.detect_protocol_upgrade_request(&data);
                 if let Err(e) = unix_write.write_all(&data).await {
                     warn!("varlink write error: {e}");
+                    close_ws(&mut ws).await;
                     break;
                 }
             }
@@ -966,6 +996,7 @@ async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
                 match res {
                     Err(e) => {
                         warn!("varlink read error: {e}");
+                        close_ws(&mut ws).await;
                         break;
                     }
                     Ok(0) => {
@@ -973,6 +1004,7 @@ async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
                         if let Err(e) = send_ws_frames(&mut ws, varlink_framer.finish()).await {
                             warn!("ws send error: {e}");
                         }
+                        close_ws(&mut ws).await;
                         break;
                     }
                     Ok(_) => {
