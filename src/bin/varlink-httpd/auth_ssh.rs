@@ -71,7 +71,7 @@ impl AuthKeysFile {
 }
 
 /// Keep track of the mtime of the tracked paths. This means when comparing two
-/// MtimeSnapshots for "eq" we cover changed, appeared or vanished files.
+/// `MtimeSnapshot`s for "eq" we cover changed, appeared or vanished files.
 #[derive(PartialEq)]
 struct MtimeSnapshot(HashMap<String, SystemTime>);
 
@@ -303,7 +303,7 @@ impl SshKeyAuthenticator {
 
     fn maybe_reload(&self) {
         let Ok(paths) = current_paths(&self.paths, self.creds_dir.as_deref()).inspect_err(|e| {
-            warn!("cannot enumerate credentials: {e}, skipping reload (keeping cached keys)")
+            warn!("cannot enumerate credentials: {e}, skipping reload (keeping cached keys)");
         }) else {
             return;
         };
