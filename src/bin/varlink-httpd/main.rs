@@ -356,10 +356,16 @@ fn log_tls_connection(ssl: &openssl::ssl::SslRef, addr: &std::net::SocketAddr) {
 
 /// Perform a TLS handshake on an already-accepted stream.
 async fn tls_accept<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
-    acceptor: &openssl::ssl::SslAcceptor,
+    config: &TlsConfig,
     stream: S,
 ) -> anyhow::Result<tokio_openssl::SslStream<S>> {
-    let ssl = openssl::ssl::Ssl::new(acceptor.context()).context("SSL context error")?;
+    let mut ssl = openssl::ssl::Ssl::new(config.acceptor.context()).context("SSL context error")?;
+    if let Some(trust) = &config.client_trust {
+        // Per handshake so a CA that changed on disk applies to new connections
+        // without restarting the listener.
+        ssl.set_verify_cert_store(trust.store()?)
+            .context("installing client CA store")?;
+    }
     let mut tls_stream =
         tokio_openssl::SslStream::new(ssl, stream).context("SSL stream creation failed")?;
     std::pin::Pin::new(&mut tls_stream)
@@ -384,7 +390,7 @@ where
     L::Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     L::Addr: Clone + Send + std::fmt::Display + 'static,
 {
-    fn new(mut inner: L, acceptor: openssl::ssl::SslAcceptor) -> std::io::Result<Self> {
+    fn new(mut inner: L, config: TlsConfig) -> std::io::Result<Self> {
         let local_addr = inner.local_addr()?;
         let (tx, rx) = tokio::sync::mpsc::channel(256);
 
@@ -392,9 +398,9 @@ where
             loop {
                 let (stream, addr) = inner.accept().await;
                 let tx = tx.clone();
-                let acceptor = acceptor.clone();
+                let config = config.clone();
                 tokio::spawn(async move {
-                    match tls_accept(&acceptor, stream).await {
+                    match tls_accept(&config, stream).await {
                         Ok(tls_stream) => {
                             if tx.send((tls_stream, addr)).await.is_err() {
                                 warn!("TLS listener receiver dropped");
@@ -478,12 +484,143 @@ impl Connected<IncomingStream<'_, AsyncTlsListener<VsockListener>>> for VarlinkC
     }
 }
 
-fn load_tls_acceptor(
+/// The CAs that client certificates are verified against, re-read when the
+/// file changes so a `trust` credential that appears or rotates after start
+/// takes effect without a restart.
+///
+/// Holding no CAs is a valid state: it rejects every client, which is what
+/// mTLS that is enabled but not yet configured has to do.
+struct ClientTrust {
+    path: Option<std::path::PathBuf>,
+    cache: std::sync::Mutex<TrustCache>,
+}
+
+struct TrustCache {
+    /// `None` when the file does not (yet) exist.
+    mtime: Option<std::time::SystemTime>,
+    cas: Vec<openssl::x509::X509>,
+}
+
+impl ClientTrust {
+    fn new(path: Option<&str>) -> Self {
+        let trust = Self {
+            path: path.map(std::path::PathBuf::from),
+            cache: std::sync::Mutex::new(TrustCache {
+                mtime: None,
+                cas: Vec::new(),
+            }),
+        };
+        trust.maybe_reload();
+        if trust.cache.lock().unwrap().cas.is_empty() {
+            // Otherwise the only symptom is a per-connection "certificate
+            // verify failed", which reads as a bad client certificate.
+            match &trust.path {
+                Some(p) => warn!(
+                    "mTLS is enabled but {} holds no CA, every client is rejected until one appears",
+                    p.display()
+                ),
+                None => warn!(
+                    "mTLS is enabled but no CA is configured, so every client will be rejected. \
+                     Pass --trust= or supply a 'trust' credential."
+                ),
+            }
+        }
+        trust
+    }
+
+    /// Re-read the CA file when its mtime changed. A file that cannot be read
+    /// or parsed keeps the previous CAs and leaves the mtime alone, so the
+    /// next connection retries; a file that is gone drops them.
+    fn maybe_reload(&self) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        let mut cache = self.cache.lock().unwrap();
+        let on_disk = match path.metadata().and_then(|m| m.modified()) {
+            Ok(mtime) => Some(mtime),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                warn!(
+                    "cannot stat {}: {e}, keeping cached client CAs",
+                    path.display()
+                );
+                return;
+            }
+        };
+        if on_disk == cache.mtime {
+            return;
+        }
+
+        let Some(mtime) = on_disk else {
+            warn!(
+                "{} is gone, mTLS will reject every client until it returns",
+                path.display()
+            );
+            *cache = TrustCache {
+                mtime: None,
+                cas: Vec::new(),
+            };
+            return;
+        };
+
+        match std::fs::read(path)
+            .map_err(anyhow::Error::from)
+            .and_then(|pem| Ok(openssl::x509::X509::stack_from_pem(&pem)?))
+        {
+            Ok(cas) if cas.is_empty() => {
+                warn!(
+                    "no certificates in {}, mTLS will reject every client",
+                    path.display()
+                );
+                *cache = TrustCache {
+                    mtime: Some(mtime),
+                    cas,
+                };
+            }
+            Ok(cas) => {
+                info!("loaded {} client CA(s) from {}", cas.len(), path.display());
+                *cache = TrustCache {
+                    mtime: Some(mtime),
+                    cas,
+                };
+            }
+            // Leave mtime untouched so the next connection tries again.
+            Err(e) => warn!(
+                "cannot load {}: {e:#}, keeping cached client CAs",
+                path.display()
+            ),
+        }
+    }
+
+    /// A store for one handshake. `SSL_set0_verify_cert_store` takes ownership,
+    /// so this cannot be shared; the certificates themselves are refcounted and
+    /// only the store wrapper is rebuilt.
+    fn store(&self) -> anyhow::Result<openssl::x509::store::X509Store> {
+        self.maybe_reload();
+        let cache = self.cache.lock().unwrap();
+        let mut builder = openssl::x509::store::X509StoreBuilder::new()?;
+        for ca in &cache.cas {
+            builder.add_cert(ca.clone())?;
+        }
+        Ok(builder.build())
+    }
+}
+
+/// A TLS listener's configuration: the handshake parameters, plus the client
+/// CAs when mTLS is enabled.
+#[derive(Clone)]
+struct TlsConfig {
+    acceptor: openssl::ssl::SslAcceptor,
+    /// `None` when mTLS is off, so no client certificate is requested.
+    client_trust: Option<Arc<ClientTrust>>,
+}
+
+fn load_tls_config(
     cert_path: &str,
     key_path: &str,
     client_ca_path: Option<&str>,
     require_client_cert: bool,
-) -> anyhow::Result<openssl::ssl::SslAcceptor> {
+) -> anyhow::Result<TlsConfig> {
     use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
 
     let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())?;
@@ -494,19 +631,16 @@ fn load_tls_acceptor(
     builder.set_private_key_file(key_path, SslFiletype::PEM)?;
     builder.check_private_key()?;
 
-    if let Some(ca_path) = client_ca_path {
-        builder.set_cert_store(varlink_http_bridge::exclusive_ca_store(
-            std::path::Path::new(ca_path),
-        )?);
-    }
-    if require_client_cert {
-        // Set independently of the CA: with no trust anchors loaded the store
-        // is empty and every chain fails, so mTLS that is enabled but not yet
-        // configured rejects clients instead of waving them through.
+    // The CAs store is configured per-handshake.
+    let client_trust = require_client_cert.then(|| {
         builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
-    }
+        Arc::new(ClientTrust::new(client_ca_path))
+    });
 
-    Ok(builder.build())
+    Ok(TlsConfig {
+        acceptor: builder.build(),
+        client_trust,
+    })
 }
 
 /// Resolve TLS configuration: explicit paths take priority, then systemd's
@@ -514,13 +648,13 @@ fn load_tls_acceptor(
 /// certificate generated and persisted under the state directory.
 ///
 /// Credential file names match the CLI flag names: cert, key, trust.
-fn resolve_tls_acceptor(
+fn resolve_tls_config(
     cli_cert: Option<String>,
     cli_key: Option<String>,
     cli_ca: Option<String>,
     creds_dir: Option<&std::path::Path>,
     require_mtls: bool,
-) -> anyhow::Result<openssl::ssl::SslAcceptor> {
+) -> anyhow::Result<TlsConfig> {
     let creds = creds_dir.map(varlink_http_bridge::sysconf::CredentialsLoader::from_dir);
     let cred = |name: &str| -> Option<String> {
         creds
@@ -531,17 +665,15 @@ fn resolve_tls_acceptor(
 
     let tls_cert = cli_cert.or_else(|| cred("cert"));
     let tls_key = cli_key.or_else(|| cred("key"));
-    let client_ca = cli_ca.or_else(|| cred("trust"));
-
-    if require_mtls && client_ca.is_none() {
-        warn!(
-            "mTLS is enabled but no CA is configured, so every client will be rejected. \
-             Pass --trust= or supply a 'trust' credential."
-        );
-    }
+    // Fall back to where the credential will appear, not just where one
+    // already is: with --require-mtls the CA may only show up on a later
+    // `systemctl reload`, and a path we never learned cannot be watched.
+    let client_ca = cli_ca
+        .or_else(|| cred("trust"))
+        .or_else(|| creds_dir.map(|d| d.join("trust").to_string_lossy().into_owned()));
 
     match (tls_cert.as_deref(), tls_key.as_deref()) {
-        (Some(cert), Some(key)) => load_tls_acceptor(cert, key, client_ca.as_deref(), require_mtls),
+        (Some(cert), Some(key)) => load_tls_config(cert, key, client_ca.as_deref(), require_mtls),
         (None, None) => {
             // TLS is not optional, generate a self-signed cert.
             let dir = tls_cert::state_dir()?;
@@ -554,7 +686,7 @@ fn resolve_tls_acceptor(
                      Pass --cert=/--key= issued by that CA, or have clients pin the key above."
                 );
             }
-            load_tls_acceptor(
+            load_tls_config(
                 cert_path
                     .to_str()
                     .expect("failed to convert cert path to str"),
@@ -1194,13 +1326,13 @@ impl std::fmt::Display for Transport {
 /// Create a [`Transport`] from a socket-activated file descriptor.
 fn listener_from_activated_fd(
     fd: OwnedFd,
-    tls_acceptor: Option<openssl::ssl::SslAcceptor>,
-) -> anyhow::Result<(Transport, Option<openssl::ssl::SslAcceptor>)> {
+    tls_config: Option<TlsConfig>,
+) -> anyhow::Result<(Transport, Option<TlsConfig>)> {
     let addr = rustix::net::getsockname(fd.as_fd())?;
     match addr.address_family() {
         rustix::net::AddressFamily::VSOCK => {
             let listener = VsockListener::from(fd);
-            Ok((Transport::Vsock(listener), tls_acceptor))
+            Ok((Transport::Vsock(listener), tls_config))
         }
         rustix::net::AddressFamily::INET | rustix::net::AddressFamily::INET6 => {
             let std_listener = std::net::TcpListener::from(fd);
@@ -1208,7 +1340,7 @@ fn listener_from_activated_fd(
             std_listener.set_nonblocking(true)?;
             Ok((
                 Transport::Tcp(TcpListener::from_std(std_listener)?),
-                tls_acceptor,
+                tls_config,
             ))
         }
         family => bail!("unsupported socket family from socket activation: {family:?}"),
@@ -1232,14 +1364,14 @@ async fn listener_from_bind_addr(bind: BindAddr) -> anyhow::Result<Transport> {
 
 async fn serve_listener(
     listener: Transport,
-    tls_acceptor: Option<openssl::ssl::SslAcceptor>,
+    tls_config: Option<TlsConfig>,
     app: Router,
 ) -> anyhow::Result<()> {
     let make_svc = app.into_make_service_with_connect_info::<VarlinkConnCache>();
 
-    match (listener, tls_acceptor) {
-        (Transport::Vsock(l), Some(acceptor)) => {
-            axum::serve(AsyncTlsListener::new(l, acceptor)?, make_svc)
+    match (listener, tls_config) {
+        (Transport::Vsock(l), Some(config)) => {
+            axum::serve(AsyncTlsListener::new(l, config)?, make_svc)
                 .with_graceful_shutdown(shutdown_signal())
                 .await?;
         }
@@ -1248,9 +1380,9 @@ async fn serve_listener(
                 .with_graceful_shutdown(shutdown_signal())
                 .await?;
         }
-        (Transport::Tcp(l), Some(acceptor)) => {
+        (Transport::Tcp(l), Some(config)) => {
             let plain = PlainListener { inner: l };
-            axum::serve(AsyncTlsListener::new(plain, acceptor)?, make_svc)
+            axum::serve(AsyncTlsListener::new(plain, config)?, make_svc)
                 .with_graceful_shutdown(shutdown_signal())
                 .await?;
         }
@@ -1267,12 +1399,12 @@ async fn serve_listener(
 #[cfg(test)]
 async fn start_server(
     listener: Transport,
-    tls_acceptor: Option<openssl::ssl::SslAcceptor>,
+    tls_config: Option<TlsConfig>,
     varlink_sockets_path: &str,
     authenticators: Vec<Box<dyn Authenticator>>,
 ) -> anyhow::Result<()> {
     let app = create_router(varlink_sockets_path, authenticators)?;
-    serve_listener(listener, tls_acceptor, app).await
+    serve_listener(listener, tls_config, app).await
 }
 
 #[derive(Debug)]
@@ -1626,7 +1758,7 @@ async fn main() -> anyhow::Result<()> {
     // Enabling mTLS from the mere presence of a credential would mean a
     // credential that fails to show up silently drops the requirement.
     if !cli.require_mtls && creds_dir.as_ref().is_some_and(|d| d.join("trust").exists()) {
-        bail!("a 'trust' credential is present but mTLS is not enabled, pass --require-mtls");
+        warn!("a 'trust' credential is present but unused, pass --require-mtls to enable mTLS");
     }
 
     let authenticators = build_authenticators(
@@ -1638,10 +1770,10 @@ async fn main() -> anyhow::Result<()> {
         std::path::Path::new("/"),
     )?;
 
-    let tls_acceptor = if cli.insecure {
+    let tls_config = if cli.insecure {
         None
     } else {
-        Some(resolve_tls_acceptor(
+        Some(resolve_tls_config(
             cli.cert,
             cli.key,
             cli.trust,
@@ -1649,7 +1781,7 @@ async fn main() -> anyhow::Result<()> {
             cli.require_mtls,
         )?)
     };
-    let scheme = if tls_acceptor.is_some() {
+    let scheme = if tls_config.is_some() {
         "HTTPS"
     } else {
         "HTTP"
@@ -1659,13 +1791,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Socket activation: consume all activated fds, or fall back to explicit --bind
     // run with e.g. "systemd-socket-activate -l 127.0.0.1:1031 -- varlink-httpd"
-    let mut listeners: Vec<(Transport, Option<openssl::ssl::SslAcceptor>)> = Vec::new();
+    let mut listeners: Vec<(Transport, Option<TlsConfig>)> = Vec::new();
     let mut listenfd = ListenFd::from_env();
     for idx in 0..listenfd.len() {
         if let Some(raw_fd) = listenfd.take_raw_fd(idx)? {
             // SAFETY: listenfd.take_raw_fd() returns a valid, owned fd from socket activation
             let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-            listeners.push(listener_from_activated_fd(fd, tls_acceptor.clone())?);
+            listeners.push(listener_from_activated_fd(fd, tls_config.clone())?);
         }
     }
 
@@ -1673,7 +1805,7 @@ async fn main() -> anyhow::Result<()> {
         // No socket activation: bind explicitly based on --bind (or default)
         for bind in cli.binds {
             let listener = listener_from_bind_addr(bind).await?;
-            listeners.push((listener, tls_acceptor.clone()));
+            listeners.push((listener, tls_config.clone()));
         }
     } else {
         eprintln!("Varlink proxy started (socket-activated)");

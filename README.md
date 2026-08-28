@@ -330,6 +330,16 @@ ExecStart=/usr/bin/varlink-httpd --auth=ssh --require-mtls
 
 Explicit CLI flags take priority over credentials.
 
+The CA is re-read when it changes (checked on each handshake), so a
+rotated CA, or one that only appears on a later `systemctl reload`,
+takes effect without a restart. Removing it rejects every client again
+rather than falling back to accepting them. As with SSH keys, systemd
+refreshes credentials on reload only with systemd >= 260
+(`RefreshOnReload=`); on older versions a restart is needed.
+
+The server's own certificate and key are read once at start, so
+replacing those does still require a restart.
+
 #### Client (varlinkctl-http)
 
 The `varlinkctl-http` binary acts as a bridge between `varlinkctl`

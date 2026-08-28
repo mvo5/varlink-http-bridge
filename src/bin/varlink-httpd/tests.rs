@@ -1071,13 +1071,13 @@ fn make_test_pki() -> TestPki {
 
 async fn run_test_tls_server(
     varlink_sockets_path: &str,
-    tls_acceptor: openssl::ssl::SslAcceptor,
+    tls_config: TlsConfig,
 ) -> TestServer<std::net::SocketAddr> {
     // mirror the production mTLS-only path: the client is verified during
     // the TLS handshake, no per-request HTTP authentication
     run_test_tls_server_with_auth(
         varlink_sockets_path,
-        tls_acceptor,
+        tls_config,
         vec![Box::new(crate::AllowAllAuthenticator { reason: "test" })],
     )
     .await
@@ -1085,7 +1085,7 @@ async fn run_test_tls_server(
 
 async fn run_test_tls_server_with_auth(
     varlink_sockets_path: &str,
-    tls_acceptor: openssl::ssl::SslAcceptor,
+    tls_config: TlsConfig,
     authenticators: Vec<Box<dyn Authenticator>>,
 ) -> TestServer<std::net::SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -1099,7 +1099,7 @@ async fn run_test_tls_server_with_auth(
     let handle = tokio::spawn(async move {
         start_server(
             Transport::Tcp(listener),
-            Some(tls_acceptor),
+            Some(tls_config),
             &varlink_sockets_path,
             authenticators,
         )
@@ -1116,7 +1116,7 @@ async fn test_tls_basic_connection() {
     let pki = make_test_pki();
     let varlink_dir = tempfile::tempdir().unwrap();
 
-    let acceptor = load_tls_acceptor(
+    let tls = load_tls_config(
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         None,
@@ -1124,7 +1124,7 @@ async fn test_tls_basic_connection() {
     )
     .unwrap();
 
-    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), tls).await;
     let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
     let client = Client::builder()
         .add_root_certificate(ca_cert)
@@ -1148,7 +1148,7 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
     let pki = make_test_pki();
     let varlink_dir = tempfile::tempdir().unwrap();
 
-    let acceptor = load_tls_acceptor(
+    let tls = load_tls_config(
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         Some(pki.ca_cert_path.to_str().unwrap()),
@@ -1156,7 +1156,7 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
     )
     .unwrap();
 
-    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), tls).await;
     // Without a client certificate the TLS handshake is rejected
     let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
     let client_no_cert = Client::builder()
@@ -1202,6 +1202,79 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
     );
 }
 
+/// A credential that does not exist yet resolves to no path at all, so the
+/// expected location has to be watched instead or the CA could never arrive.
+#[test_with::path(/usr/bin/openssl)]
+#[test]
+fn test_mtls_watches_trust_credential_before_it_exists() {
+    let pki = make_test_pki();
+    let creds_dir = tempfile::tempdir().unwrap();
+    std::fs::copy(&pki.server_cert_path, creds_dir.path().join("cert")).unwrap();
+    std::fs::copy(&pki.server_key_path, creds_dir.path().join("key")).unwrap();
+
+    let tls = resolve_tls_config(None, None, None, Some(creds_dir.path()), true).unwrap();
+
+    let trust = tls.client_trust.expect("mTLS must carry a trust store");
+    assert_eq!(
+        trust.path.as_deref(),
+        Some(creds_dir.path().join("trust").as_path())
+    );
+}
+
+/// The CA may show up after start, when systemd refreshes credentials on
+/// reload. It has to take effect without restarting the listener, and
+/// removing it again has to take effect just as immediately.
+#[test_with::path(/usr/bin/openssl)]
+#[tokio::test]
+async fn test_mtls_trust_reloads_when_ca_appears_and_vanishes() {
+    let pki = make_test_pki();
+    let varlink_dir = tempfile::tempdir().unwrap();
+    let creds_dir = tempfile::tempdir().unwrap();
+    let ca_path = creds_dir.path().join("trust");
+
+    // enabled, but the CA is not there yet
+    let tls = load_tls_config(
+        pki.server_cert_path.to_str().unwrap(),
+        pki.server_key_path.to_str().unwrap(),
+        Some(ca_path.to_str().unwrap()),
+        true,
+    )
+    .unwrap();
+
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), tls).await;
+    let url = format!("https://localhost:{}/health", server.addr.port());
+    let client = || {
+        Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap())
+            .identity(
+                reqwest::Identity::from_pkcs8_pem(&pki.client_cert_pem, &pki.client_key_pem)
+                    .unwrap(),
+            )
+            .resolve("localhost", server.addr)
+            .build()
+            .unwrap()
+    };
+
+    assert!(
+        client().get(&url).send().await.is_err(),
+        "must reject before the CA exists"
+    );
+
+    std::fs::copy(&pki.ca_cert_path, &ca_path).unwrap();
+    let res = client()
+        .get(&url)
+        .send()
+        .await
+        .expect("must accept once the CA appears");
+    assert_eq!(res.status(), 200);
+
+    std::fs::remove_file(&ca_path).unwrap();
+    assert!(
+        client().get(&url).send().await.is_err(),
+        "must reject again once the CA is removed"
+    );
+}
+
 /// mTLS may be enabled before the CA credential arrives. Until it does the
 /// trust store is empty, and an empty store must reject rather than accept.
 #[test_with::path(/usr/bin/openssl)]
@@ -1210,7 +1283,7 @@ async fn test_mtls_without_ca_rejects_every_client() {
     let pki = make_test_pki();
     let varlink_dir = tempfile::tempdir().unwrap();
 
-    let acceptor = load_tls_acceptor(
+    let tls = load_tls_config(
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         None,
@@ -1218,7 +1291,7 @@ async fn test_mtls_without_ca_rejects_every_client() {
     )
     .unwrap();
 
-    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), tls).await;
     let url = format!("https://localhost:{}/health", server.addr.port());
 
     for (what, identity) in [
@@ -1256,12 +1329,12 @@ async fn test_tls_credentials_directory_fallback() {
     std::fs::copy(&pki.server_cert_path, creds_dir.path().join("cert")).unwrap();
     std::fs::copy(&pki.server_key_path, creds_dir.path().join("key")).unwrap();
 
-    // No CLI flags; resolve_tls_acceptor should pick up creds from the directory
-    let acceptor = resolve_tls_acceptor(None, None, None, Some(creds_dir.path()), false)
+    // No CLI flags; resolve_tls_config should pick up creds from the directory
+    let tls = resolve_tls_config(None, None, None, Some(creds_dir.path()), false)
         .expect("credentials directory fallback failed");
 
     let varlink_dir = tempfile::tempdir().unwrap();
-    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), tls).await;
     let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
     let client = Client::builder()
         .add_root_certificate(ca_cert)
@@ -1284,7 +1357,7 @@ async fn test_tls_credentials_directory_fallback() {
 async fn test_varlinkctl_helper_mtls_hostname_describe() {
     let pki = make_test_pki();
 
-    let acceptor = load_tls_acceptor(
+    let tls = load_tls_config(
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         Some(pki.ca_cert_path.to_str().unwrap()),
@@ -1292,7 +1365,7 @@ async fn test_varlinkctl_helper_mtls_hostname_describe() {
     )
     .unwrap();
 
-    let server = run_test_tls_server("/run/systemd", acceptor).await;
+    let server = run_test_tls_server("/run/systemd", tls).await;
     let fake_xdg_home = tempfile::tempdir().unwrap();
     let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
     std::fs::create_dir_all(&tls_dir).unwrap();
@@ -1323,7 +1396,7 @@ async fn test_varlinkctl_helper_mtls_hostname_describe() {
 async fn test_varlinkctl_helper_mtls_no_client_cert() {
     let pki = make_test_pki();
 
-    let acceptor = load_tls_acceptor(
+    let tls = load_tls_config(
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         Some(pki.ca_cert_path.to_str().unwrap()),
@@ -1331,7 +1404,7 @@ async fn test_varlinkctl_helper_mtls_no_client_cert() {
     )
     .unwrap();
 
-    let server = run_test_tls_server("/run/systemd", acceptor).await;
+    let server = run_test_tls_server("/run/systemd", tls).await;
     // Provide the server CA (so the client trusts the server) but NO client cert/key
     let fake_xdg_home = tempfile::tempdir().unwrap();
     let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
@@ -1370,7 +1443,7 @@ fn test_tls_half_configured_is_rejected() {
         (Some("/nonexistent/cert.pem".to_string()), None),
         (None, Some("/nonexistent/key.pem".to_string())),
     ] {
-        let Err(err) = resolve_tls_acceptor(cert, key, None, Some(empty_dir.path()), false) else {
+        let Err(err) = resolve_tls_config(cert, key, None, Some(empty_dir.path()), false) else {
             panic!("--cert and --key must be given together");
         };
         assert!(
@@ -2369,7 +2442,7 @@ mod sshauth_tests {
         let pki = make_test_pki();
         let (auth, key_path) = make_test_ssh_auth();
 
-        let acceptor = load_tls_acceptor(
+        let tls = load_tls_config(
             pki.server_cert_path.to_str().unwrap(),
             pki.server_key_path.to_str().unwrap(),
             None,
@@ -2377,8 +2450,7 @@ mod sshauth_tests {
         )
         .unwrap();
 
-        let server =
-            run_test_tls_server_with_auth("/run/systemd", acceptor, vec![Box::new(auth)]).await;
+        let server = run_test_tls_server_with_auth("/run/systemd", tls, vec![Box::new(auth)]).await;
         let fake_xdg_home = tempfile::tempdir().unwrap();
         let tls_dir = fake_xdg_home.path().join("varlinkctl-http");
         std::fs::create_dir_all(&tls_dir).unwrap();
