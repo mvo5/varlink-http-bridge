@@ -1120,6 +1120,7 @@ async fn test_tls_basic_connection() {
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         None,
+        false,
     )
     .unwrap();
 
@@ -1151,6 +1152,7 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         Some(pki.ca_cert_path.to_str().unwrap()),
+        true,
     )
     .unwrap();
 
@@ -1200,6 +1202,50 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
     );
 }
 
+/// mTLS may be enabled before the CA credential arrives. Until it does the
+/// trust store is empty, and an empty store must reject rather than accept.
+#[test_with::path(/usr/bin/openssl)]
+#[tokio::test]
+async fn test_mtls_without_ca_rejects_every_client() {
+    let pki = make_test_pki();
+    let varlink_dir = tempfile::tempdir().unwrap();
+
+    let acceptor = load_tls_acceptor(
+        pki.server_cert_path.to_str().unwrap(),
+        pki.server_key_path.to_str().unwrap(),
+        None,
+        true,
+    )
+    .unwrap();
+
+    let server = run_test_tls_server(varlink_dir.path().to_str().unwrap(), acceptor).await;
+    let url = format!("https://localhost:{}/health", server.addr.port());
+
+    for (what, identity) in [
+        ("no client cert", None),
+        (
+            "a client cert signed by the CA we have not been given",
+            Some(
+                reqwest::Identity::from_pkcs8_pem(&pki.client_cert_pem, &pki.client_key_pem)
+                    .unwrap(),
+            ),
+        ),
+    ] {
+        let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
+        let mut builder = Client::builder()
+            .add_root_certificate(ca_cert)
+            .resolve("localhost", server.addr);
+        if let Some(identity) = identity {
+            builder = builder.identity(identity);
+        }
+        let result = builder.build().unwrap().get(&url).send().await;
+        assert!(
+            result.is_err(),
+            "mTLS with an unconfigured CA must reject, but {what} was accepted"
+        );
+    }
+}
+
 #[test_with::path(/usr/bin/openssl)]
 #[tokio::test]
 async fn test_tls_credentials_directory_fallback() {
@@ -1211,7 +1257,7 @@ async fn test_tls_credentials_directory_fallback() {
     std::fs::copy(&pki.server_key_path, creds_dir.path().join("key")).unwrap();
 
     // No CLI flags; resolve_tls_acceptor should pick up creds from the directory
-    let acceptor = resolve_tls_acceptor(None, None, None, Some(creds_dir.path()))
+    let acceptor = resolve_tls_acceptor(None, None, None, Some(creds_dir.path()), false)
         .expect("credentials directory fallback failed");
 
     let varlink_dir = tempfile::tempdir().unwrap();
@@ -1242,6 +1288,7 @@ async fn test_varlinkctl_helper_mtls_hostname_describe() {
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         Some(pki.ca_cert_path.to_str().unwrap()),
+        true,
     )
     .unwrap();
 
@@ -1280,6 +1327,7 @@ async fn test_varlinkctl_helper_mtls_no_client_cert() {
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         Some(pki.ca_cert_path.to_str().unwrap()),
+        true,
     )
     .unwrap();
 
@@ -1322,7 +1370,7 @@ fn test_tls_half_configured_is_rejected() {
         (Some("/nonexistent/cert.pem".to_string()), None),
         (None, Some("/nonexistent/key.pem".to_string())),
     ] {
-        let Err(err) = resolve_tls_acceptor(cert, key, None, Some(empty_dir.path())) else {
+        let Err(err) = resolve_tls_acceptor(cert, key, None, Some(empty_dir.path()), false) else {
             panic!("--cert and --key must be given together");
         };
         assert!(
@@ -1537,10 +1585,10 @@ async fn test_varlinkctl_helper_vsock_hostname_describe() {
 fn build_authenticators_in(
     auth: &[AuthMechanism],
     insecure: bool,
-    has_mtls: bool,
+    require_mtls: bool,
     etc_root: &std::path::Path,
 ) -> anyhow::Result<Vec<Box<dyn Authenticator>>> {
-    crate::build_authenticators(auth, insecure, has_mtls, None, None, etc_root)
+    crate::build_authenticators(auth, insecure, require_mtls, None, None, etc_root)
 }
 
 #[test]
@@ -2325,6 +2373,7 @@ mod sshauth_tests {
             pki.server_cert_path.to_str().unwrap(),
             pki.server_key_path.to_str().unwrap(),
             None,
+            false,
         )
         .unwrap();
 

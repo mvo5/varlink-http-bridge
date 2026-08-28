@@ -482,6 +482,7 @@ fn load_tls_acceptor(
     cert_path: &str,
     key_path: &str,
     client_ca_path: Option<&str>,
+    require_client_cert: bool,
 ) -> anyhow::Result<openssl::ssl::SslAcceptor> {
     use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
 
@@ -497,6 +498,11 @@ fn load_tls_acceptor(
         builder.set_cert_store(varlink_http_bridge::exclusive_ca_store(
             std::path::Path::new(ca_path),
         )?);
+    }
+    if require_client_cert {
+        // Set independently of the CA: with no trust anchors loaded the store
+        // is empty and every chain fails, so mTLS that is enabled but not yet
+        // configured rejects clients instead of waving them through.
         builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
     }
 
@@ -513,6 +519,7 @@ fn resolve_tls_acceptor(
     cli_key: Option<String>,
     cli_ca: Option<String>,
     creds_dir: Option<&std::path::Path>,
+    require_mtls: bool,
 ) -> anyhow::Result<openssl::ssl::SslAcceptor> {
     let creds = creds_dir.map(varlink_http_bridge::sysconf::CredentialsLoader::from_dir);
     let cred = |name: &str| -> Option<String> {
@@ -526,13 +533,27 @@ fn resolve_tls_acceptor(
     let tls_key = cli_key.or_else(|| cred("key"));
     let client_ca = cli_ca.or_else(|| cred("trust"));
 
+    if require_mtls && client_ca.is_none() {
+        warn!(
+            "mTLS is enabled but no CA is configured, so every client will be rejected. \
+             Pass --trust= or supply a 'trust' credential."
+        );
+    }
+
     match (tls_cert.as_deref(), tls_key.as_deref()) {
-        (Some(cert), Some(key)) => load_tls_acceptor(cert, key, client_ca.as_deref()),
+        (Some(cert), Some(key)) => load_tls_acceptor(cert, key, client_ca.as_deref(), require_mtls),
         (None, None) => {
             // TLS is not optional, generate a self-signed cert.
             let dir = tls_cert::state_dir()?;
             let (cert_path, key_path) = tls_cert::load_or_generate(&dir)?;
             tls_cert::print_pin(&cert_path)?;
+            if require_mtls {
+                warn!(
+                    "The server certificate is self-signed while mTLS is enabled. \
+                     Clients verifying it against your CA will refuse to connect. \
+                     Pass --cert=/--key= issued by that CA, or have clients pin the key above."
+                );
+            }
             load_tls_acceptor(
                 cert_path
                     .to_str()
@@ -541,6 +562,7 @@ fn resolve_tls_acceptor(
                     .to_str()
                     .expect("failed to convert key path to str"),
                 client_ca.as_deref(),
+                require_mtls,
             )
         }
         _ => bail!("--cert and --key must be specified together"),
@@ -1342,6 +1364,7 @@ struct BridgeCli {
     cert: Option<String>,
     key: Option<String>,
     trust: Option<String>,
+    require_mtls: bool,
     authorized_keys: Option<String>,
     auth: Vec<AuthMechanism>,
     insecure: bool,
@@ -1368,13 +1391,17 @@ fn print_help() {
                                             use vsock::PORT for vsock (e.g. vsock::{DEFAULT_PORT})
           --auth=MECHANISMS                 comma-separated per-request authentication
                                             ({auth}); required unless --insecure.
-                                            mTLS is enabled by --trust= and applies
+                                            mTLS is enabled separately and applies
                                             on top of whatever is selected here
           --cert=PATH                       TLS certificate PEM file
                                             (default: self-signed, generated
                                             and persisted on first start)
           --key=PATH                        TLS private key PEM file
-          --trust=PATH                      CA certificate PEM for client verification (mTLS)
+          --trust=PATH                      CA certificate PEM for client verification
+                                            (mTLS); implies --require-mtls
+          --require-mtls                    require a verified client certificate. The CA
+                                            may be supplied later via a 'trust' credential.
+                                            Until then every client is rejected
           --authorized-keys=PATH            authorized SSH public keys file
           --insecure                        run over plain HTTP without any
                                             authentication (DANGEROUS)
@@ -1409,6 +1436,7 @@ fn parse_cli() -> anyhow::Result<Command> {
     let mut cert = None;
     let mut key = None;
     let mut trust = None;
+    let mut require_mtls = false;
     let mut authorized_keys = None;
     let mut auth = None;
     let mut insecure = false;
@@ -1421,6 +1449,7 @@ fn parse_cli() -> anyhow::Result<Command> {
             Long("cert") => cert = Some(parser.value()?.parse()?),
             Long("key") => key = Some(parser.value()?.parse()?),
             Long("trust") => trust = Some(parser.value()?.parse()?),
+            Long("require-mtls") => require_mtls = true,
             Long("authorized-keys") => authorized_keys = Some(parser.value()?.parse()?),
             Long("auth") => auth = Some(parse_auth(&parser.value()?.string()?)?),
             Long("insecure") => insecure = true,
@@ -1452,16 +1481,19 @@ fn parse_cli() -> anyhow::Result<Command> {
         .map(|s| s.parse())
         .collect::<Result<_, _>>()?;
 
+    let require_mtls = require_mtls || trust.is_some();
+
     // Under --insecure the TLS options are never read. Silently dropping
     // --trust would turn a setup that asked for mTLS into an open one.
     if insecure {
         for (name, set) in [
-            ("--cert", cert.is_some()),
-            ("--key", key.is_some()),
-            ("--trust", trust.is_some()),
+            ("--cert=", cert.is_some()),
+            ("--key=", key.is_some()),
+            ("--trust=", trust.is_some()),
+            ("--require-mtls", require_mtls),
         ] {
             if set {
-                bail!("--insecure serves plain HTTP and can't be combined with {name}=");
+                bail!("--insecure serves plain HTTP and can't be combined with {name}");
             }
         }
     }
@@ -1498,6 +1530,7 @@ fn parse_cli() -> anyhow::Result<Command> {
         cert,
         key,
         trust,
+        require_mtls,
         authorized_keys,
         auth,
         insecure,
@@ -1537,7 +1570,7 @@ fn parse_import_ssh_args(parser: &mut lexopt::Parser) -> anyhow::Result<Command>
 fn build_authenticators(
     auth: &[AuthMechanism],
     insecure: bool,
-    has_mtls: bool,
+    require_mtls: bool,
     authorized_keys: Option<&str>,
     creds_dir: Option<&std::path::Path>,
     etc_root: &std::path::Path,
@@ -1559,13 +1592,15 @@ fn build_authenticators(
             }
             // Every other way of having no per-request mechanism needs mTLS to
             // carry the authentication, so refuse to serve without it.
-            AuthMechanism::None if has_mtls => {
+            AuthMechanism::None if require_mtls => {
                 authenticators.push(Box::new(AllowAllAuthenticator {
                     reason: "--auth=none, client verified at TLS layer",
                 }));
             }
             AuthMechanism::None => {
-                bail!("--auth=none needs mTLS (--trust=) to authenticate clients, or --insecure");
+                bail!(
+                    "--auth=none needs mTLS (--require-mtls) to authenticate clients, or --insecure"
+                );
             }
         }
     }
@@ -1588,14 +1623,16 @@ async fn main() -> anyhow::Result<()> {
 
     let creds_dir = varlink_http_bridge::sysconf::CredentialsLoader::path_from_env();
 
-    // Resolve mTLS: remember if trust was provided before consuming the options
-    let has_mtls =
-        cli.trust.is_some() || creds_dir.as_ref().is_some_and(|d| d.join("trust").exists());
+    // Enabling mTLS from the mere presence of a credential would mean a
+    // credential that fails to show up silently drops the requirement.
+    if !cli.require_mtls && creds_dir.as_ref().is_some_and(|d| d.join("trust").exists()) {
+        bail!("a 'trust' credential is present but mTLS is not enabled, pass --require-mtls");
+    }
 
     let authenticators = build_authenticators(
         &cli.auth,
         cli.insecure,
-        has_mtls,
+        cli.require_mtls,
         cli.authorized_keys.as_deref(),
         creds_dir.as_deref(),
         std::path::Path::new("/"),
@@ -1609,6 +1646,7 @@ async fn main() -> anyhow::Result<()> {
             cli.key,
             cli.trust,
             creds_dir.as_deref(),
+            cli.require_mtls,
         )?)
     };
     let scheme = if tls_acceptor.is_some() {

@@ -281,11 +281,18 @@ TLS flag names follow the systemd convention.
 --cert=PATH    path to TLS certificate PEM file
 --key=PATH     path to TLS private key PEM file
 --trust=PATH   path to CA certificate PEM for client verification (mTLS)
+--require-mtls require a verified client certificate
 --insecure     run over plain HTTP without any authentication (DANGEROUS)
 ```
 
-Providing `--trust=` implicitly enables mTLS: the server will
-require clients to present a certificate signed by that CA.
+`--require-mtls` makes every client present a certificate signed by the
+configured CA. `--trust=` implies it, since a CA is only ever used to
+verify clients.
+
+Pass `--require-mtls` on its own when the CA arrives as a credential
+rather than a file, which systemd may only provide on a later
+`systemctl reload`. Until a CA is available every client is rejected.
+A `trust` credential without `--require-mtls` won't enable mTLS.
 
 Listeners always speak TLS unless `--insecure` is given. Without
 `--cert=`/`--key=` the bridge generates a self-signed certificate on
@@ -310,6 +317,15 @@ them to the short names the service expects.  To provision TLS:
 # cp server.pem     /etc/credstore/varlink-httpd.tls.certificate
 # systemd-creds encrypt server-key.pem /etc/credstore.encrypted/varlink-httpd.tls.key
 # cp ca.pem         /etc/credstore/varlink-httpd.tls.trust
+```
+
+The `trust` credential only takes effect together with `--require-mtls`,
+so add it to the unit with a drop-in:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/bin/varlink-httpd --auth=ssh --require-mtls
 ```
 
 Explicit CLI flags take priority over credentials.
