@@ -1531,6 +1531,77 @@ async fn test_varlinkctl_helper_vsock_hostname_describe() {
     assert_hostname_reply(&output);
 }
 
+// --- --auth= mechanism selection tests ---
+
+/// Every `build_authenticators()` case, with `/` never touched.
+fn build_authenticators_in(
+    auth: &[AuthMechanism],
+    insecure: bool,
+    has_mtls: bool,
+    etc_root: &std::path::Path,
+) -> anyhow::Result<Vec<Box<dyn Authenticator>>> {
+    crate::build_authenticators(auth, insecure, has_mtls, None, None, etc_root)
+}
+
+#[test]
+fn test_parse_auth_rejects_unknown_mechanism() {
+    let err = crate::parse_auth("nope").unwrap_err().to_string();
+    assert!(err.contains("unknown --auth mechanism 'nope'"), "{err}");
+}
+
+#[test]
+fn test_parse_auth_rejects_empty() {
+    let err = crate::parse_auth(",,").unwrap_err().to_string();
+    assert!(err.contains("needs at least one mechanism"), "{err}");
+}
+
+/// "none" means no mechanism, so pairing it with one is a contradiction.
+#[cfg(feature = "sshauth")]
+#[test]
+fn test_parse_auth_rejects_none_combined_with_mechanism() {
+    let err = crate::parse_auth("none,ssh").unwrap_err().to_string();
+    assert!(err.contains("cannot be combined"), "{err}");
+}
+
+/// Without mTLS or --insecure nothing would authenticate the client, so
+/// refuse to start rather than serve every request.
+#[test]
+fn test_build_authenticators_none_without_mtls_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let Err(err) = build_authenticators_in(&[AuthMechanism::None], false, false, root.path())
+    else {
+        panic!("--auth=none without mTLS must not produce an authenticator");
+    };
+    assert!(err.to_string().contains("--auth=none needs mTLS"), "{err}");
+}
+
+#[test]
+fn test_build_authenticators_none_with_mtls_accepts() {
+    let root = tempfile::tempdir().unwrap();
+    let auths = build_authenticators_in(&[AuthMechanism::None], false, true, root.path()).unwrap();
+    assert_eq!(auths.len(), 1);
+    check_request(auths[0].as_ref(), "GET", "/health", None, None, None).unwrap();
+}
+
+#[test]
+fn test_build_authenticators_insecure_accepts() {
+    let root = tempfile::tempdir().unwrap();
+    let auths = build_authenticators_in(&[AuthMechanism::None], true, false, root.path()).unwrap();
+    assert_eq!(auths.len(), 1);
+    check_request(auths[0].as_ref(), "GET", "/health", None, None, None).unwrap();
+}
+
+/// Selecting a mechanism must never fall back to open access, not even when
+/// it has no keys to check against yet.
+#[cfg(feature = "sshauth")]
+#[test]
+fn test_build_authenticators_ssh_without_keys_rejects() {
+    let root = tempfile::tempdir().unwrap();
+    let auths = build_authenticators_in(&[AuthMechanism::Ssh], false, false, root.path()).unwrap();
+    assert_eq!(auths.len(), 1);
+    assert!(check_request(auths[0].as_ref(), "GET", "/health", None, None, None).is_err());
+}
+
 // --- SSH key auth tests ---
 
 #[cfg(feature = "sshauth")]

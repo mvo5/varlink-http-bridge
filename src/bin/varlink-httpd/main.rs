@@ -582,6 +582,75 @@ impl AuthRequest<'_> {
     }
 }
 
+/// A per-request authentication mechanism selected with `--auth=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthMechanism {
+    /// Bearer token signed by an authorized SSH key.
+    #[cfg(feature = "sshauth")]
+    Ssh,
+    /// No per-request authentication.
+    None,
+}
+
+impl AuthMechanism {
+    const ALL: &'static [Self] = &[
+        #[cfg(feature = "sshauth")]
+        Self::Ssh,
+        Self::None,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            #[cfg(feature = "sshauth")]
+            Self::Ssh => "ssh",
+            Self::None => "none",
+        }
+    }
+
+    /// The mechanisms this build accepts, for help and error messages.
+    fn names() -> String {
+        Self::ALL
+            .iter()
+            .map(|m| m.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn parse(name: &str) -> anyhow::Result<Self> {
+        if let Some(mechanism) = Self::ALL.iter().copied().find(|m| m.as_str() == name) {
+            return Ok(mechanism);
+        }
+        #[cfg(not(feature = "sshauth"))]
+        if name == "ssh" {
+            bail!("--auth=ssh requires building with the 'sshauth' feature");
+        }
+        bail!(
+            "unknown --auth mechanism '{name}' (valid: {})",
+            Self::names()
+        );
+    }
+}
+
+fn parse_auth(value: &str) -> anyhow::Result<Vec<AuthMechanism>> {
+    let mut auth = Vec::new();
+    for name in value.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        let mechanism = AuthMechanism::parse(name)?;
+        if !auth.contains(&mechanism) {
+            auth.push(mechanism);
+        }
+    }
+    if auth.is_empty() {
+        bail!(
+            "--auth= needs at least one mechanism ({})",
+            AuthMechanism::names()
+        );
+    }
+    if auth.contains(&AuthMechanism::None) && auth.len() > 1 {
+        bail!("--auth=none cannot be combined with other mechanisms");
+    }
+    Ok(auth)
+}
+
 trait Authenticator: Send + Sync {
     fn check_request(&self, request: &AuthRequest) -> anyhow::Result<()>;
 }
@@ -1274,6 +1343,7 @@ struct BridgeCli {
     key: Option<String>,
     trust: Option<String>,
     authorized_keys: Option<String>,
+    auth: Vec<AuthMechanism>,
     insecure: bool,
 }
 
@@ -1296,6 +1366,10 @@ fn print_help() {
           --bind=ADDR                       address to bind to (repeatable;
                                             default: 0.0.0.0:{DEFAULT_PORT})
                                             use vsock::PORT for vsock (e.g. vsock::{DEFAULT_PORT})
+          --auth=MECHANISMS                 comma-separated per-request authentication
+                                            ({auth}); required unless --insecure.
+                                            mTLS is enabled by --trust= and applies
+                                            on top of whatever is selected here
           --cert=PATH                       TLS certificate PEM file
                                             (default: self-signed, generated
                                             and persisted on first start)
@@ -1305,7 +1379,9 @@ fn print_help() {
           --insecure                        run over plain HTTP without any
                                             authentication (DANGEROUS)
           --help                            display this help and exit
-    "}
+    ",
+            auth = AuthMechanism::names(),
+        }
     );
 }
 
@@ -1334,6 +1410,7 @@ fn parse_cli() -> anyhow::Result<Command> {
     let mut key = None;
     let mut trust = None;
     let mut authorized_keys = None;
+    let mut auth = None;
     let mut insecure = false;
     let mut got_positional = false;
 
@@ -1345,6 +1422,7 @@ fn parse_cli() -> anyhow::Result<Command> {
             Long("key") => key = Some(parser.value()?.parse()?),
             Long("trust") => trust = Some(parser.value()?.parse()?),
             Long("authorized-keys") => authorized_keys = Some(parser.value()?.parse()?),
+            Long("auth") => auth = Some(parse_auth(&parser.value()?.string()?)?),
             Long("insecure") => insecure = true,
             Long("help") => {
                 print_help();
@@ -1388,6 +1466,32 @@ fn parse_cli() -> anyhow::Result<Command> {
         }
     }
 
+    let auth = match auth {
+        Some(auth) if insecure && auth != [AuthMechanism::None] => bail!(
+            "--insecure runs without authentication and can't be combined with --auth={}",
+            auth.iter()
+                .map(|m| m.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        Some(auth) => auth,
+        // --insecure already states that no authentication is wanted.
+        None if insecure => vec![AuthMechanism::None],
+        None => bail!(
+            "--auth= is required, pick the mechanisms to enable ({})",
+            AuthMechanism::names()
+        ),
+    };
+
+    #[cfg(feature = "sshauth")]
+    if authorized_keys.is_some() && !auth.contains(&AuthMechanism::Ssh) {
+        bail!("--authorized-keys= is only used with --auth=ssh");
+    }
+    #[cfg(not(feature = "sshauth"))]
+    if authorized_keys.is_some() {
+        bail!("--authorized-keys= requires building with the 'sshauth' feature");
+    }
+
     Ok(Command::Bridge(BridgeCli {
         binds,
         varlink_sockets_path,
@@ -1395,6 +1499,7 @@ fn parse_cli() -> anyhow::Result<Command> {
         key,
         trust,
         authorized_keys,
+        auth,
         insecure,
     }))
 }
@@ -1425,45 +1530,43 @@ fn parse_import_ssh_args(parser: &mut lexopt::Parser) -> anyhow::Result<Command>
 
 /// The middleware accepts a request as soon as one of these accepts it, so an
 /// empty list rejects everything.
+///
+/// `etc_root` is the filesystem root for the well-known `/etc/varlink-httpd`
+/// key discovery; only tests override it.
 #[cfg_attr(not(feature = "sshauth"), allow(unused_variables))]
 fn build_authenticators(
+    auth: &[AuthMechanism],
     insecure: bool,
     has_mtls: bool,
-    authorized_keys: Option<String>,
+    authorized_keys: Option<&str>,
     creds_dir: Option<&std::path::Path>,
+    etc_root: &std::path::Path,
 ) -> anyhow::Result<Vec<Box<dyn Authenticator>>> {
-    #[cfg(not(feature = "sshauth"))]
-    if authorized_keys.is_some() {
-        bail!("--authorized-keys= requires building with the 'sshauth' feature");
-    }
-
     let mut authenticators: Vec<Box<dyn Authenticator>> = Vec::new();
-
-    #[cfg(feature = "sshauth")]
-    authenticators.push(Box::new(create_ssh_authenticator(
-        authorized_keys,
-        creds_dir,
-        std::path::Path::new("/"),
-    )?));
-
-    if insecure {
-        authenticators.clear();
-        authenticators.push(Box::new(AllowAllAuthenticator {
-            reason: "--insecure",
-        }));
-        warn!("running without authentication");
-    } else if authenticators.is_empty() {
-        if has_mtls {
-            // mTLS verifies the client during the TLS handshake; no
-            // additional per-request HTTP authentication is needed.
-            authenticators.push(Box::new(AllowAllAuthenticator {
-                reason: "mTLS verified at TLS layer",
-            }));
-        } else {
-            #[cfg(not(feature = "sshauth"))]
-            bail!(
-                "no authentication configured: build with 'sshauth' feature, use --trust=, or --insecure"
-            );
+    for mechanism in auth {
+        match mechanism {
+            #[cfg(feature = "sshauth")]
+            AuthMechanism::Ssh => authenticators.push(Box::new(create_ssh_authenticator(
+                authorized_keys.map(String::from),
+                creds_dir,
+                etc_root,
+            )?)),
+            AuthMechanism::None if insecure => {
+                warn!("running without authentication");
+                authenticators.push(Box::new(AllowAllAuthenticator {
+                    reason: "--insecure",
+                }));
+            }
+            // Every other way of having no per-request mechanism needs mTLS to
+            // carry the authentication, so refuse to serve without it.
+            AuthMechanism::None if has_mtls => {
+                authenticators.push(Box::new(AllowAllAuthenticator {
+                    reason: "--auth=none, client verified at TLS layer",
+                }));
+            }
+            AuthMechanism::None => {
+                bail!("--auth=none needs mTLS (--trust=) to authenticate clients, or --insecure");
+            }
         }
     }
 
@@ -1489,6 +1592,15 @@ async fn main() -> anyhow::Result<()> {
     let has_mtls =
         cli.trust.is_some() || creds_dir.as_ref().is_some_and(|d| d.join("trust").exists());
 
+    let authenticators = build_authenticators(
+        &cli.auth,
+        cli.insecure,
+        has_mtls,
+        cli.authorized_keys.as_deref(),
+        creds_dir.as_deref(),
+        std::path::Path::new("/"),
+    )?;
+
     let tls_acceptor = if cli.insecure {
         None
     } else {
@@ -1504,13 +1616,6 @@ async fn main() -> anyhow::Result<()> {
     } else {
         "HTTP"
     };
-
-    let authenticators = build_authenticators(
-        cli.insecure,
-        has_mtls,
-        cli.authorized_keys,
-        creds_dir.as_deref(),
-    )?;
 
     let app = create_router(&cli.varlink_sockets_path, authenticators)?;
 

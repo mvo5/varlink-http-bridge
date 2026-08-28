@@ -258,9 +258,20 @@ Since `varlink-httpd` runs as root, allows connections over the
 network, exposes privileged information and allows arbitrary commands
 to be invoked, authentication MUST be used.
 
-Two modes of authenentication are supported:
-TLS certificates and SSH key signatures.
+Authentication has two orthogonal layers that compose:
 
+```
+--auth=MECHANISMS   per-request authentication to enable (required)
+```
+
+`--auth=ssh` authenticates every request by an SSH key signature.
+`--auth=none` selects no per-request mechanism, leaving mTLS to
+authenticate the client; without mTLS the bridge refuses to start.
+
+mTLS is enabled separately (see below) and applies on top of whatever
+`--auth=` selects, so `--auth=ssh` together with mTLS requires both to
+pass. `--insecure` is the one way to serve with no authentication at
+all, and implies `--auth=none`.
 
 ### TLS / mTLS
 
@@ -377,7 +388,7 @@ systemd the setting is ignored and a full restart is needed instead.
 The simplest setup is to pass the path explicitly:
 
 ```console
-$ varlink-httpd --authorized-keys ~/.ssh/authorized_keys
+$ varlink-httpd --auth=ssh --authorized-keys ~/.ssh/authorized_keys
 ```
 
 To fetch keys from GitHub (or any HTTPS URL) and save them locally,
@@ -385,8 +396,8 @@ use the `import-ssh` subcommand:
 
 ```console
 $ run0 varlink-httpd import-ssh gh:myuser
-Wrote 3 key line(s) to /etc/varlink-httpd/authorized_keys, run with:
-  varlink-httpd --authorized-keys /etc/varlink-httpd/authorized_keys
+Wrote 3 key(s) to /etc/varlink-httpd/authorized_keys, run with:
+  varlink-httpd --auth=ssh --authorized-keys=/etc/varlink-httpd/authorized_keys
 ```
 
 The source can be `gh:<user>` (shorthand for
@@ -394,7 +405,7 @@ The source can be `gh:<user>` (shorthand for
 path is auto-detected but can be overridden with a second positional
 argument.  Once written to `/etc/varlink-httpd/authorized_keys`,
 the bridge picks up the file automatically (discovery path 2) so the
-`--authorized-keys` flag is no longer needed.
+`--authorized-keys` flag is no longer needed; `--auth=ssh` still is.
 
 When running as a systemd service, the bridge discovers keys from
 credentials automatically (discovery paths 3 and 4):
@@ -435,7 +446,7 @@ example, use regular TLS (not mTLS) for transport encryption and SSH
 keys for user authentication:
 
 ```console
-$ varlink-httpd \
+$ varlink-httpd --auth=ssh \
     --cert=server.pem \
     --key=server-key.pem \
     --authorized-keys ~/.ssh/authorized_keys
@@ -463,7 +474,7 @@ only an `--insecure` server.
 
 ```console
 # Server (inside the guest):
-$ varlink-httpd --bind=vsock --authorized-keys ~/.ssh/authorized_keys
+$ varlink-httpd --auth=ssh --bind=vsock --authorized-keys ~/.ssh/authorized_keys
 
 # Client (on the host):
 $ varlinkctl call vsock+tls://3/ws/sockets/io.systemd.Hostname \
@@ -479,7 +490,7 @@ See the installation instructions above.)
 Server (inside the guest):
 
 ```console
-$ varlink-httpd --bind=vsock \
+$ varlink-httpd --auth=none --bind=vsock \
     --cert=server.pem --key=server-key.pem --trust=ca.pem
 ```
 
