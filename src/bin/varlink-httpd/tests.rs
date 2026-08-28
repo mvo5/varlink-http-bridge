@@ -1652,6 +1652,111 @@ async fn test_varlinkctl_helper_vsock_hostname_describe() {
     assert_hostname_reply(&output);
 }
 
+// --- unused credential reporting tests ---
+
+/// Just the names, so assertions read as "which credentials go unread".
+fn unread_names(
+    creds_dir: &std::path::Path,
+    insecure: bool,
+    require_mtls: bool,
+    auth: &[AuthMechanism],
+    authorized_keys: Option<&str>,
+) -> Vec<String> {
+    crate::unread_credentials(creds_dir, insecure, require_mtls, auth, authorized_keys)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Every credential the daemon knows how to read, so each test only has to say
+/// which of them it expects to be ignored.
+fn creds_dir_with_everything() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for name in [
+        "cert",
+        "key",
+        "trust",
+        "ssh.authorized_keys.root",
+        "varlink-httpd.ssh.authorized-keys.example",
+    ] {
+        std::fs::write(dir.path().join(name), b"").unwrap();
+    }
+    dir
+}
+
+#[test]
+fn test_unread_credentials_none_when_all_are_used() {
+    let dir = creds_dir_with_everything();
+    let auth = [
+        #[cfg(feature = "sshauth")]
+        AuthMechanism::Ssh,
+        #[cfg(not(feature = "sshauth"))]
+        AuthMechanism::None,
+    ];
+    assert!(unread_names(dir.path(), false, true, &auth, None).is_empty());
+}
+
+#[test]
+fn test_unread_credentials_reports_trust_without_mtls() {
+    let dir = creds_dir_with_everything();
+    let unread = unread_names(dir.path(), false, false, &[AuthMechanism::None], None);
+    assert!(unread.contains(&"trust".to_string()), "{unread:?}");
+}
+
+/// --insecure never reads TLS material at all.
+#[test]
+fn test_unread_credentials_reports_tls_material_under_insecure() {
+    let dir = creds_dir_with_everything();
+    let unread = unread_names(dir.path(), true, false, &[AuthMechanism::None], None);
+    for name in ["cert", "key", "trust"] {
+        assert!(
+            unread.contains(&name.to_string()),
+            "{name} missing: {unread:?}"
+        );
+    }
+}
+
+#[cfg(feature = "sshauth")]
+#[test]
+fn test_unread_credentials_reports_ssh_keys_without_ssh_auth() {
+    let dir = creds_dir_with_everything();
+    let unread = unread_names(dir.path(), false, true, &[AuthMechanism::None], None);
+    for name in [
+        "ssh.authorized_keys.root",
+        "varlink-httpd.ssh.authorized-keys.example",
+    ] {
+        assert!(
+            unread.contains(&name.to_string()),
+            "{name} missing: {unread:?}"
+        );
+    }
+}
+
+/// An explicit path replaces credential discovery instead of adding to it, so
+/// the credentials go unread even though ssh auth is on.
+#[cfg(feature = "sshauth")]
+#[test]
+fn test_unread_credentials_reports_ssh_keys_hidden_by_explicit_path() {
+    let dir = creds_dir_with_everything();
+    let unread = unread_names(
+        dir.path(),
+        false,
+        true,
+        &[AuthMechanism::Ssh],
+        Some("/etc/varlink-httpd/authorized_keys"),
+    );
+    assert!(
+        unread.contains(&"ssh.authorized_keys.root".to_string()),
+        "{unread:?}"
+    );
+}
+
+#[test]
+fn test_unread_credentials_ignores_absent_files() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(unread_names(dir.path(), true, false, &[AuthMechanism::None], None).is_empty());
+}
+
 // --- --auth= mechanism selection tests ---
 
 /// Every `build_authenticators()` case, with `/` never touched.

@@ -382,6 +382,29 @@ fn ssh_authorized_keys_prefixed(dir: &std::path::Path) -> std::io::Result<Vec<St
     Ok(paths)
 }
 
+/// Names of the authorized-keys credentials present in `dir`, so a
+/// configuration that never reads them can say which ones it is ignoring.
+pub(crate) fn authorized_keys_credentials(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = SSH_AUTHORIZED_KEYS_CREDENTIALS
+        .iter()
+        .filter(|name| dir.join(name).exists())
+        .map(|name| (*name).to_string())
+        .collect();
+    names.extend(
+        ssh_authorized_keys_prefixed(dir)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|path| {
+                std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(String::from)
+            }),
+    );
+    names.sort();
+    names
+}
+
 fn current_paths(
     paths: &[String],
     creds_dir: Option<&std::path::Path>,

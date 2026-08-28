@@ -1693,6 +1693,55 @@ fn parse_import_ssh_args(parser: &mut lexopt::Parser) -> anyhow::Result<Command>
     Ok(Command::ImportSsh(import_ssh::ImportSsh { source, output }))
 }
 
+/// Credentials present in `creds_dir` that this configuration never reads,
+/// paired with what would make them count.
+///
+/// Enabling a mechanism from the mere presence of a credential would mean one
+/// that fails to show up silently drops it, so the flags decide and provisioned
+/// material can go unread. That is easy to mistake for having taken effect.
+#[cfg_attr(not(feature = "sshauth"), allow(unused_variables))]
+fn unread_credentials(
+    creds_dir: &std::path::Path,
+    insecure: bool,
+    require_mtls: bool,
+    auth: &[AuthMechanism],
+    authorized_keys: Option<&str>,
+) -> Vec<(String, &'static str)> {
+    let mut unread = Vec::new();
+
+    for (name, read, why) in [
+        ("cert", !insecure, "--insecure serves plain HTTP"),
+        ("key", !insecure, "--insecure serves plain HTTP"),
+        ("trust", require_mtls, "pass --require-mtls to enable mTLS"),
+    ] {
+        if !read && creds_dir.join(name).exists() {
+            unread.push((name.to_string(), why));
+        }
+    }
+
+    #[cfg(feature = "sshauth")]
+    {
+        // An explicit --authorized-keys= replaces discovery rather than adding
+        // to it, so it hides credentials even when ssh auth is selected.
+        let why = if authorized_keys.is_some() {
+            Some("--authorized-keys= replaces credential discovery")
+        } else if !auth.contains(&AuthMechanism::Ssh) {
+            Some("pass --auth=ssh to use them")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            unread.extend(
+                auth_ssh::authorized_keys_credentials(creds_dir)
+                    .into_iter()
+                    .map(|name| (name, why)),
+            );
+        }
+    }
+
+    unread
+}
+
 /// The middleware accepts a request as soon as one of these accepts it, so an
 /// empty list rejects everything.
 ///
@@ -1755,10 +1804,23 @@ async fn main() -> anyhow::Result<()> {
 
     let creds_dir = varlink_http_bridge::sysconf::CredentialsLoader::path_from_env();
 
-    // Enabling mTLS from the mere presence of a credential would mean a
-    // credential that fails to show up silently drops the requirement.
-    if !cli.require_mtls && creds_dir.as_ref().is_some_and(|d| d.join("trust").exists()) {
-        warn!("a 'trust' credential is present but unused, pass --require-mtls to enable mTLS");
+    if let Some(dir) = creds_dir.as_deref() {
+        let unread: Vec<String> = unread_credentials(
+            dir,
+            cli.insecure,
+            cli.require_mtls,
+            &cli.auth,
+            cli.authorized_keys.as_deref(),
+        )
+        .iter()
+        .map(|(name, why)| format!("{name} ({why})"))
+        .collect();
+        if !unread.is_empty() {
+            warn!(
+                "credential(s) present but unused by this configuration: {}",
+                unread.join("; ")
+            );
+        }
     }
 
     let authenticators = build_authenticators(
