@@ -917,7 +917,7 @@ async fn test_jsonseq_userdb_get_user_record_more() {
     assert!(users.contains(&"root"), "root user not found in {users:#?}");
 }
 
-#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::executable(varlinkctl)]
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_varlinkctl_helper_hostname_describe() {
@@ -939,7 +939,7 @@ async fn test_varlinkctl_helper_hostname_describe() {
     assert!(!stderr.contains("WARN"), "unexpected warning: {stderr}");
 }
 
-#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::executable(varlinkctl)]
 #[test_with::path(/run/systemd/userdb/io.systemd.Multiplexer)]
 #[tokio::test]
 async fn test_varlinkctl_helper_userdb_get_user_record() {
@@ -1110,7 +1110,7 @@ async fn run_test_tls_server_with_auth(
     TestServer { handle, addr }
 }
 
-#[test_with::path(/usr/bin/openssl)]
+#[test_with::executable(openssl)]
 #[tokio::test]
 async fn test_tls_basic_connection() {
     let pki = make_test_pki();
@@ -1140,7 +1140,7 @@ async fn test_tls_basic_connection() {
     assert_eq!(res.status(), 200);
 }
 
-#[test_with::path(/usr/bin/openssl)]
+#[test_with::executable(openssl)]
 #[tokio::test]
 async fn test_mtls_accepts_client_cert_and_rejects_without() {
     init_test_logger();
@@ -1204,7 +1204,7 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
 
 /// A credential that does not exist yet resolves to no path at all, so the
 /// expected location has to be watched instead or the CA could never arrive.
-#[test_with::path(/usr/bin/openssl)]
+#[test_with::executable(openssl)]
 #[test]
 fn test_mtls_watches_trust_credential_before_it_exists() {
     let pki = make_test_pki();
@@ -1224,7 +1224,7 @@ fn test_mtls_watches_trust_credential_before_it_exists() {
 /// The CA may show up after start, when systemd refreshes credentials on
 /// reload. It has to take effect without restarting the listener, and
 /// removing it again has to take effect just as immediately.
-#[test_with::path(/usr/bin/openssl)]
+#[test_with::executable(openssl)]
 #[tokio::test]
 async fn test_mtls_trust_reloads_when_ca_appears_and_vanishes() {
     let pki = make_test_pki();
@@ -1277,7 +1277,7 @@ async fn test_mtls_trust_reloads_when_ca_appears_and_vanishes() {
 
 /// mTLS may be enabled before the CA credential arrives. Until it does the
 /// trust store is empty, and an empty store must reject rather than accept.
-#[test_with::path(/usr/bin/openssl)]
+#[test_with::executable(openssl)]
 #[tokio::test]
 async fn test_mtls_without_ca_rejects_every_client() {
     let pki = make_test_pki();
@@ -1319,7 +1319,7 @@ async fn test_mtls_without_ca_rejects_every_client() {
     }
 }
 
-#[test_with::path(/usr/bin/openssl)]
+#[test_with::executable(openssl)]
 #[tokio::test]
 async fn test_tls_credentials_directory_fallback() {
     let pki = make_test_pki();
@@ -1350,8 +1350,8 @@ async fn test_tls_credentials_directory_fallback() {
     assert_eq!(res.status(), 200);
 }
 
-#[test_with::path(/usr/bin/openssl)]
-#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::executable(openssl)]
+#[test_with::executable(varlinkctl)]
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_varlinkctl_helper_mtls_hostname_describe() {
@@ -1389,8 +1389,8 @@ async fn test_varlinkctl_helper_mtls_hostname_describe() {
     assert_hostname_reply(&output);
 }
 
-#[test_with::path(/usr/bin/openssl)]
-#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::executable(openssl)]
+#[test_with::executable(varlinkctl)]
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_varlinkctl_helper_mtls_no_client_cert() {
@@ -1453,7 +1453,7 @@ fn test_tls_half_configured_is_rejected() {
     }
 }
 
-#[test_with::path(/usr/bin/openssl)]
+#[test_with::executable(openssl)]
 #[test]
 fn test_format_x509_subject() {
     let pki = make_test_pki();
@@ -1463,7 +1463,7 @@ fn test_format_x509_subject() {
     assert_eq!(subject, "CN=test-client");
 }
 
-#[test_with::path(/usr/bin/openssl)]
+#[test_with::executable(openssl)]
 #[test]
 fn test_format_x509_subject_multiple_fields() {
     use std::process::Command;
@@ -1630,7 +1630,7 @@ async fn test_vsock_health_endpoint() {
     );
 }
 
-#[test_with::path(/usr/bin/varlinkctl)]
+#[test_with::executable(varlinkctl)]
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_varlinkctl_helper_vsock_hostname_describe() {
@@ -2540,7 +2540,7 @@ mod sshauth_tests {
         );
     }
 
-    #[test_with::path(/usr/bin/varlinkctl)]
+    #[test_with::executable(varlinkctl)]
     #[test_with::path(/run/systemd/io.systemd.Hostname)]
     #[tokio::test]
     async fn test_tls_ssh_e2e() {
