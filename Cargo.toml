@@ -41,8 +41,9 @@ lexopt = "0.3"
 regex-lite = "0.1"
 listenfd = "1.0.2"
 tokio-tungstenite = "0.30"
-futures-util = { version = "0.3" }
+futures-util = { version = "0.3", features = ["sink"] }
 bytes = "1"
+h2 = "0.4"
 rustix = { version = "1.0", features = ["net", "process", "system"] }
 # TODO: switch back to crates.io once tokio-vsock releases a version with
 # From<OwnedFd> support (https://github.com/rust-vsock/tokio-vsock/pull/72)
@@ -64,6 +65,7 @@ tempfile = "3.27"
 ssh-key-import = { path = "crates/ssh-key-import", optional = true }
 
 [dev-dependencies]
+http = "1"
 varlink-http-bridge = { path = ".", features = ["test-helpers"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 test-with = { version = "0.17", default-features = false, features = ["runtime", "executable"] }

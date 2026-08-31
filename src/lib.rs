@@ -3,6 +3,7 @@
 #[cfg(feature = "sshauth")]
 pub mod sshauth_token;
 pub mod sysconf;
+pub mod tunnel;
 
 /// Default port for the HTTP bridge when listening on or connecting via vsock.
 pub const DEFAULT_PORT: u32 = 1031;
