@@ -228,7 +228,7 @@ existing auth paths apply untouched. No local TCP listener is exposed.
 
 | # | Status | Step |
 |---|---|---|
-| 1 | [ ] | `varlink-relayd`: `--bind`, `--connect-bind`, CONNECT demux, node registry, h2 PING heartbeat, TLS, `--insecure` guard rails, tested against a stub node |
+| 1 | [x] | `varlink-relayd`: `--bind`, `--connect-bind`, CONNECT demux, node registry, h2 PING heartbeat, TLS, `--insecure` guard rails, tested against a stub node |
 | 2 | [ ] | `varlink-httpd --relay <url>`: dial-out with redial and backoff, `--instance <label>`, end-to-end test against `varlink-relayd` |
 | 3 | [ ] | fairness: a connection window sized for `MAX_TUNNEL_STREAMS`, a slot timeout and a `503` rather than one caller starving a tunnel |
 | 4 | [ ] | operations: per-tunnel load tiers, one `debug` line per caller, `--auth=none` for a relay-only instance serving named sockets |
