@@ -10,22 +10,16 @@ use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, warn};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{self, Message};
-use varlink_http_bridge::TlsChannelBinding;
+use varlink_http_bridge::{AsyncStream, BoxedStream, TlsChannelBinding};
 
 mod client_auth;
 #[cfg(feature = "sshauth")]
 mod sshauth_client;
-
-/// One object-safe type for all transport combinations
-/// (TCP/vsock, with/without TLS).
-trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
-type BoxedStream = Box<dyn AsyncStream>;
 
 type Ws = WebSocketStream<BoxedStream>;
 

@@ -1761,6 +1761,8 @@ fn cli_looking_up_credentials(
         authorized_keys: authorized_keys.map(String::from),
         auth: auth.to_vec(),
         insecure,
+        relay: None,
+        instance: None,
     }
 }
 

@@ -201,6 +201,13 @@ fn accept_retry_delay(e: &std::io::Error) -> Option<std::time::Duration> {
     }
 }
 
+/// One object-safe stream type for every transport combination (TCP,
+/// vsock, a tunnel stream, with or without TLS), so what runs on top is
+/// instantiated once.
+pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncStream for T {}
+pub type BoxedStream = Box<dyn AsyncStream>;
+
 /// The TLS 1.3 server side for `cert_path`/`key_path`, left unbuilt so
 /// each listener adds its own client certificate policy.
 ///

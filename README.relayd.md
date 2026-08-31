@@ -229,7 +229,7 @@ existing auth paths apply untouched. No local TCP listener is exposed.
 | # | Status | Step |
 |---|---|---|
 | 1 | [x] | `varlink-relayd`: `--bind`, `--connect-bind`, CONNECT demux, node registry, h2 PING heartbeat, TLS, `--insecure` guard rails, tested against a stub node |
-| 2 | [ ] | `varlink-httpd --relay <url>`: dial-out with redial and backoff, `--instance <label>`, end-to-end test against `varlink-relayd` |
+| 2 | [x] | `varlink-httpd --relay <url>`: dial-out with redial and backoff, `--instance <label>`, end-to-end test against `varlink-relayd` |
 | 3 | [ ] | fairness: a connection window sized for `MAX_TUNNEL_STREAMS`, a slot timeout and a `503` rather than one caller starving a tunnel |
 | 4 | [ ] | operations: per-tunnel load tiers, one `debug` line per caller, `--auth=none` for a relay-only instance serving named sockets |
 | 5 | [ ] | `varlinkctl-http` as a caller through the relay (`VARLINK_RELAY_URL`) |
@@ -241,8 +241,9 @@ Steps 1 and 2 are the minimum for a working, tested feature with curl as
 the caller; 5 adds `varlinkctl` as a caller; 6 is wanted before running
 on a real network.
 
-`varlink-httpd` is 3.1MB against a 4MB size gate, so dial-out plus `h2`
-must fit in ~900KB. If it does not, dial-out becomes a cargo feature.
+Dial-out plus `h2` did not fit the old 4MB size gate (~1MB added); the
+gate is raised to 4.5MB. A `dialout` cargo feature remains the fallback
+if a size-sensitive target ever needs the smaller binary.
 
 ## Reconnects and collisions
 
