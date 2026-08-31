@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 pub mod sysconf;
+pub mod tunnel;
 
 #[cfg(feature = "sshauth")]
 /// Namespace prefix for SSH-based authentication tokens, analogous to
