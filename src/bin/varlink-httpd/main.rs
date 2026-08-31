@@ -315,23 +315,6 @@ async fn get_varlink_connection(
     Ok(connection)
 }
 
-/// Accept a TCP connection, configure socket options, and retry on transient errors.
-async fn accept_and_configure(
-    listener: &TcpListener,
-) -> (tokio::net::TcpStream, std::net::SocketAddr) {
-    loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                if let Err(e) = varlink_http_bridge::set_tcp_keepalive_and_nodelay(&stream) {
-                    warn!("on accept from {addr}: {e:#}");
-                }
-                return (stream, addr);
-            }
-            Err(e) => warn!("TCP accept failed: {e}"),
-        }
-    }
-}
-
 fn format_x509_subject(cert: &openssl::x509::X509Ref) -> String {
     cert.subject_name()
         .entries()
@@ -359,20 +342,14 @@ async fn tls_accept<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     config: &TlsConfig,
     stream: S,
 ) -> anyhow::Result<tokio_openssl::SslStream<S>> {
-    let mut ssl = openssl::ssl::Ssl::new(config.acceptor.context()).context("SSL context error")?;
-    if let Some(trust) = &config.client_trust {
-        // Per handshake so a CA that changed on disk applies to new connections
-        // without restarting the listener.
-        ssl.set_verify_cert_store(trust.store()?)
-            .context("installing client CA store")?;
-    }
-    let mut tls_stream =
-        tokio_openssl::SslStream::new(ssl, stream).context("SSL stream creation failed")?;
-    std::pin::Pin::new(&mut tls_stream)
-        .accept()
-        .await
-        .context("TLS handshake failed")?;
-    Ok(tls_stream)
+    // Per handshake so a CA that changed on disk applies to new connections
+    // without restarting the listener.
+    let client_store = config
+        .client_trust
+        .as_ref()
+        .map(|trust| trust.store())
+        .transpose()?;
+    varlink_http_bridge::tls_accept(&config.acceptor, client_store, stream).await
 }
 
 /// TLS wrapper for any `axum::serve::Listener`. Performs handshakes concurrently
@@ -449,7 +426,7 @@ impl axum::serve::Listener for PlainListener {
     type Addr = std::net::SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        accept_and_configure(&self.inner).await
+        varlink_http_bridge::accept_and_configure(&self.inner).await
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
@@ -621,15 +598,9 @@ fn load_tls_config(
     client_ca_path: Option<&str>,
     require_client_cert: bool,
 ) -> anyhow::Result<TlsConfig> {
-    use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
+    use openssl::ssl::SslVerifyMode;
 
-    let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())?;
-    // mozilla_modern_v5 allows TLS 1.2, but we need 1.3 for channel binding
-    // (export_keying_material requires TLS 1.3).
-    builder.set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_3))?;
-    builder.set_certificate_chain_file(cert_path)?;
-    builder.set_private_key_file(key_path, SslFiletype::PEM)?;
-    builder.check_private_key()?;
+    let mut builder = varlink_http_bridge::tls_acceptor_builder(cert_path, key_path)?;
 
     // The CAs store is configured per-handshake.
     let client_trust = require_client_cert.then(|| {

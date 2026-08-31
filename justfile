@@ -29,7 +29,7 @@ install_config:
 build profile:
 	cargo build --profile {{profile}} --locked
 
-check: check_srv_binary_size check_helper_binary_size
+check: (check_binary_size srv_binary srv_max_size) (check_binary_size helper_binary helper_max_size) (check_binary_size relay_binary relay_max_size)
 	cargo fmt --check
 	cargo clippy --all-targets --locked -- -W clippy::pedantic
 
@@ -46,24 +46,22 @@ srv_max_size := "4 * 1024 * 1024"
 helper_binary := "target/release/varlinkctl-http"
 helper_max_size := "2 * 1024 * 1024"
 
+# the relay for varlink-httpd nodes behind NAT (README.relayd.md)
+relay_binary := "target/release/varlink-relayd"
+relay_max_size := "3 * 1024 * 1024"
+
 [script]
-check_srv_binary_size:
+check_binary_size binary max_size:
 	cargo build --release --locked
-	max_size_kb="$(({{srv_max_size}} / 1024 ))"
-	cur_size_kb=$(( $(stat --format='%s' {{srv_binary}}) / 1024 ))
-	echo "release varlink-httpd binary: ${cur_size_kb}KB / ${max_size_kb}KB"
+	max_size_kb="$(({{max_size}} / 1024 ))"
+	cur_size_kb=$(( $(stat --format='%s' {{binary}}) / 1024 ))
+	echo "release {{binary}}: ${cur_size_kb}KB / ${max_size_kb}KB"
 	if [ "$cur_size_kb" -gt "$max_size_kb" ]; then
-	  echo "ERROR: release binary exceeds limit"
+	  echo "ERROR: release {{binary}} exceeds limit"
 	  exit 1
 	fi
 
-[script]
-check_helper_binary_size:
-	cargo build --release --locked
-	max_size_kb="$(({{helper_max_size}} / 1024 ))"
-	cur_size_kb=$(( $(stat --format='%s' {{helper_binary}}) / 1024 ))
-	echo "release varlinkctl-http binary: ${cur_size_kb}KB / ${max_size_kb}KB"
-	if [ "$cur_size_kb" -gt "$max_size_kb" ]; then
-	  echo "ERROR: release varlinkctl-http binary exceeds limit"
-	  exit 1
-	fi
+# deliberately not part of `just install` yet: the spec file and units
+# ship with the relay in a later chunk (README.relayd.md)
+install_relay: (build "release")
+	install -Dm755 {{relay_binary}} {{destdir}}{{bindir}}/varlink-relayd
