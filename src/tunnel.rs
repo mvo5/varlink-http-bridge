@@ -401,6 +401,21 @@ pub const TUNNEL_PATH: &str = "/v1/tunnel";
 /// renames every node in every deployment at once.
 const TUNNEL_APP_ID: u128 = 0x7a16_4c93_87b5_48ae_aaa0_8cbf_80d2_7865;
 
+/// The [`NodeId`] this machine registers under, from `/etc/machine-id`
+/// and, for an additional bridge instance on the same host, its label.
+///
+/// # Errors
+/// Returns an error if `/etc/machine-id` cannot be read or parsed
+/// (empty and "uninitialized" are valid states per `machine-id(5)`).
+pub fn local_node_id(instance: Option<&str>) -> anyhow::Result<NodeId> {
+    let text = std::fs::read_to_string("/etc/machine-id").context("reading /etc/machine-id")?;
+    let machine_id: MachineId = text.trim().parse()?;
+    match instance {
+        Some(label) => machine_id.instance_node_id(label),
+        None => machine_id.node_id(),
+    }
+}
+
 /// The machine id from `/etc/machine-id`.
 ///
 /// Confidential per `machine-id(5)` and must never go on the wire; the
@@ -438,6 +453,22 @@ impl MachineId {
         Ok(NodeId(hmac_id128(
             &self.0.to_be_bytes(),
             &TUNNEL_APP_ID.to_be_bytes(),
+        )?))
+    }
+
+    /// The id an additional bridge instance on this host registers
+    /// under: the instance's own app id, derived from the fixed one
+    /// plus the label, put through the same machine-specific
+    /// derivation. `systemd-id128 machine-id -a <instance-app-id>`
+    /// still prints the same value.
+    ///
+    /// # Errors
+    /// Returns an error if the HMAC computation fails.
+    pub fn instance_node_id(&self, label: &str) -> anyhow::Result<NodeId> {
+        let instance_app_id = hmac_id128(&TUNNEL_APP_ID.to_be_bytes(), label.as_bytes())?;
+        Ok(NodeId(hmac_id128(
+            &self.0.to_be_bytes(),
+            &instance_app_id.to_be_bytes(),
         )?))
     }
 }
@@ -781,6 +812,28 @@ mod tests {
         assert_eq!(
             machine_id.node_id().unwrap().to_string(),
             "f2315cbd916742ecaab3178006407118"
+        );
+    }
+
+    #[test]
+    fn instance_node_id_matches_fixed_vector() {
+        // computed independently (python hmac) for TUNNEL_APP_ID; the
+        // derived instance app id for "update" is
+        // 4608112769664e2db94e37a233b9572b, still usable with
+        // `systemd-id128 machine-id -a`
+        let machine_id: MachineId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        assert_eq!(
+            machine_id.instance_node_id("update").unwrap().to_string(),
+            "0e4178539a8045b492c42674e271b422"
+        );
+        // distinct namespaces: default, per label, per machine
+        assert_ne!(
+            machine_id.instance_node_id("update").unwrap(),
+            machine_id.node_id().unwrap()
+        );
+        assert_ne!(
+            machine_id.instance_node_id("update").unwrap(),
+            machine_id.instance_node_id("metrics").unwrap()
         );
     }
 

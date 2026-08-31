@@ -186,8 +186,9 @@ Chunks 1 to 3 are the minimum for a working, tested feature, with curl
 as the caller; 4 adds `varlinkctl` as a caller; 5 is wanted before
 running on a real network.
 
-`varlink-httpd` is 3.1MB against a 4MB size gate, so dial-out plus `h2`
-must fit in ~900KB. If it does not, dial-out becomes a cargo feature.
+Dial-out plus `h2` did not fit the old 4MB size gate (~1MB added); the
+gate is raised to 4.5MB. A `dialout` cargo feature remains the fallback
+if a size-sensitive target ever needs the smaller binary.
 
 ## Reconnects and collisions
 
