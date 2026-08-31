@@ -38,6 +38,7 @@ use zlink::varlink_service::Proxy;
 mod auth_api_key;
 #[cfg(feature = "sshauth")]
 mod auth_ssh;
+mod dialout;
 #[cfg(feature = "sshauth")]
 mod import_ssh;
 mod openapi;
@@ -1599,6 +1600,8 @@ struct BridgeCli {
     auth: Vec<AuthMechanism>,
     api_keys: Option<String>,
     insecure: bool,
+    relay: Option<String>,
+    instance: Option<String>,
 }
 
 fn print_help() {
@@ -1642,6 +1645,11 @@ fn print_help() {
                                             authentication (DANGEROUS); listens
                                             on localhost only unless --bind= says
                                             otherwise
+          --relay=URL                       additionally serve through a
+                                            varlink-relayd tunnel; ws://HOST[:PORT]
+                                            or wss://HOST[:PORT] (README.relayd.md)
+          --instance=LABEL                  register the tunnel under a
+                                            per-instance node id (with --relay)
           --help                            display this help and exit
     ",
             auth = AuthMechanism::names(),
@@ -1713,6 +1721,8 @@ fn parse_cli() -> anyhow::Result<Command> {
     let mut auth = None;
     let mut api_keys = None;
     let mut insecure = false;
+    let mut relay = None;
+    let mut instance = None;
     let mut got_positional = false;
 
     let mut parser = lexopt::Parser::from_env();
@@ -1727,6 +1737,8 @@ fn parse_cli() -> anyhow::Result<Command> {
             Long("auth") => auth = Some(parse_auth(&parser.value()?.string()?)?),
             Long("api-keys") => api_keys = Some(parser.value()?.parse()?),
             Long("insecure") => insecure = true,
+            Long("relay") => relay = Some(parser.value()?.parse()?),
+            Long("instance") => instance = Some(parser.value()?.parse()?),
             Long("help") => {
                 print_help();
                 std::process::exit(0);
@@ -1817,6 +1829,8 @@ fn parse_cli() -> anyhow::Result<Command> {
         auth,
         api_keys,
         insecure,
+        relay,
+        instance,
     }))
 }
 
@@ -2118,6 +2132,19 @@ async fn main() -> anyhow::Result<()> {
         );
         let app_clone = app.clone();
         join_set.spawn(async move { serve_listener(listener, tls, app_clone).await });
+    }
+
+    if let Some(url) = cli.relay {
+        let node_id = varlink_http_bridge::tunnel::local_node_id(cli.instance.as_deref())?;
+        eprintln!(
+            "Relaying {scheme} via {url} as node {node_id} -> Varlink: {}",
+            cli.varlink_sockets_path
+        );
+        let listener = dialout::DialOutListener::start(&url, node_id, tls_config.clone())?;
+        let app_clone = app.clone();
+        join_set.spawn(async move { dialout::serve(listener, app_clone).await });
+    } else if cli.instance.is_some() {
+        bail!("--instance only makes sense together with --relay");
     }
 
     // Wait for all listeners; propagate the first error

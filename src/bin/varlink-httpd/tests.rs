@@ -1907,6 +1907,8 @@ fn cli_looking_up_credentials(
         api_keys: None,
         auth: auth.to_vec(),
         insecure,
+        relay: None,
+        instance: None,
     }
 }
 

@@ -39,8 +39,10 @@ test:
 # the httpd service
 srv_binary := "target/release/varlink-httpd"
 # max_size_kb is a bit arbitrary but it should ensure we don't increase size too much
-# without noticing
-srv_max_size := "4 * 1024 * 1024"
+# without noticing. Raised from 4MB when --relay added h2 plus the
+# WebSocket client (~1MB); a `dialout` cargo feature is the fallback if
+# a size-sensitive target ever needs the old size.
+srv_max_size := "4608 * 1024"
 
 # the varlinkctl http transport so that varlinkctl can talk over http/ws
 helper_binary := "target/release/varlinkctl-http"
