@@ -144,6 +144,121 @@ pub fn exclusive_ca_store(
     Ok(store.build())
 }
 
+/// Accept a TCP connection, configure socket options, and retry on
+/// transient errors: a failed accept (ECONNABORTED, fd exhaustion) or
+/// setsockopt must never take the whole listener down.
+///
+/// Running out of file descriptors is the awkward one: the connection
+/// stays pending, so `accept` fails again immediately. Retrying flat out
+/// would spin a core and bury the journal, so the retry pauses and only
+/// the first failure of a run is loud.
+pub async fn accept_and_configure(
+    listener: &tokio::net::TcpListener,
+) -> (tokio::net::TcpStream, std::net::SocketAddr) {
+    use log::{debug, info, warn};
+
+    let mut failures: u64 = 0;
+    loop {
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                if failures > 0 {
+                    info!("accepting again after {failures} failed attempts");
+                }
+                if let Err(e) = set_tcp_keepalive_and_nodelay(&stream) {
+                    warn!("on accept from {addr}: {e:#}");
+                }
+                return (stream, addr);
+            }
+            Err(e) => {
+                failures += 1;
+                match accept_retry_delay(&e) {
+                    Some(delay) => {
+                        // the fd/memory limit: the same error will
+                        // repeat until the pressure goes away
+                        if failures == 1 {
+                            warn!(
+                                "TCP accept failed: {e}; out of resources, retrying every \
+                                 {}ms -- raise LimitNOFILE if this persists",
+                                delay.as_millis()
+                            );
+                        } else {
+                            debug!("TCP accept still failing after {failures} attempts: {e}");
+                        }
+                        tokio::time::sleep(delay).await;
+                    }
+                    // a client that hung up between SYN and accept:
+                    // routine, and the next accept works
+                    None => debug!("TCP accept failed: {e}"),
+                }
+            }
+        }
+    }
+}
+
+/// How long to wait before accepting again, or `None` when the error
+/// says nothing about the listener's own resources and retrying
+/// straight away is right.
+fn accept_retry_delay(e: &std::io::Error) -> Option<std::time::Duration> {
+    use rustix::io::Errno;
+    match Errno::from_io_error(e) {
+        // no fd or memory for this connection, and it stays queued
+        // until there is one, so the same error repeats
+        Some(Errno::MFILE | Errno::NFILE | Errno::NOBUFS | Errno::NOMEM) => {
+            Some(std::time::Duration::from_millis(100))
+        }
+        _ => None,
+    }
+}
+
+/// TLS 1.3 server acceptor for `cert_path`/`key_path`, additionally
+/// requiring a client certificate signed by `client_ca_path` when one
+/// is given.
+///
+/// # Errors
+/// Returns an error if the certificate, key, or client CA cannot be
+/// loaded or do not match.
+pub fn tls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+    client_ca_path: Option<&str>,
+) -> anyhow::Result<openssl::ssl::SslAcceptor> {
+    use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
+
+    let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())?;
+    // mozilla_modern_v5 allows TLS 1.2, but we need 1.3 for channel binding
+    // (export_keying_material requires TLS 1.3).
+    builder.set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_3))?;
+    builder.set_certificate_chain_file(cert_path)?;
+    builder.set_private_key_file(key_path, SslFiletype::PEM)?;
+    builder.check_private_key()?;
+
+    if let Some(ca_path) = client_ca_path {
+        builder.set_cert_store(exclusive_ca_store(std::path::Path::new(ca_path))?);
+        builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    }
+
+    Ok(builder.build())
+}
+
+/// Perform a TLS handshake on an already-accepted stream.
+///
+/// # Errors
+/// Returns an error if the handshake fails.
+pub async fn tls_accept<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    acceptor: &openssl::ssl::SslAcceptor,
+    stream: S,
+) -> anyhow::Result<tokio_openssl::SslStream<S>> {
+    use anyhow::Context;
+    let ssl = openssl::ssl::Ssl::new(acceptor.context()).context("SSL context error")?;
+    let mut tls_stream =
+        tokio_openssl::SslStream::new(ssl, stream).context("SSL stream creation failed")?;
+    std::pin::Pin::new(&mut tls_stream)
+        .accept()
+        .await
+        .context("TLS handshake failed")?;
+    Ok(tls_stream)
+}
+
 /// Enable `TCP_NODELAY` and `SO_KEEPALIVE` on a TCP socket.
 ///
 /// Keepalive timing uses the OS defaults. Tunable via
@@ -173,6 +288,29 @@ pub fn set_tcp_keepalive_and_nodelay(fd: &impl std::os::fd::AsFd) -> anyhow::Res
 mod tests {
     use super::*;
     use openssl::x509::{X509, X509StoreContext, store::X509StoreRef};
+
+    #[test]
+    fn only_resource_exhaustion_makes_accept_pause() {
+        use rustix::io::Errno;
+        // out of fds or memory: the pending connection stays queued, so
+        // accepting again immediately would spin
+        for errno in [Errno::MFILE, Errno::NFILE, Errno::NOBUFS, Errno::NOMEM] {
+            let e = std::io::Error::from(errno);
+            assert!(
+                accept_retry_delay(&e).is_some(),
+                "{errno:?} must make the accept loop pause"
+            );
+        }
+        // a client that hung up before accept, and anything else: the
+        // next accept is expected to work, pausing would add latency
+        for errno in [Errno::CONNABORTED, Errno::INTR, Errno::AGAIN] {
+            let e = std::io::Error::from(errno);
+            assert!(
+                accept_retry_delay(&e).is_none(),
+                "{errno:?} must be retried straight away"
+            );
+        }
+    }
 
     type Identity = (X509, openssl::pkey::PKey<openssl::pkey::Private>);
 

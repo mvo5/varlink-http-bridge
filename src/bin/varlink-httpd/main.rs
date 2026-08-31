@@ -315,23 +315,6 @@ async fn get_varlink_connection(
     Ok(connection)
 }
 
-/// Accept a TCP connection, configure socket options, and retry on transient errors.
-async fn accept_and_configure(
-    listener: &TcpListener,
-) -> (tokio::net::TcpStream, std::net::SocketAddr) {
-    loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                if let Err(e) = varlink_http_bridge::set_tcp_keepalive_and_nodelay(&stream) {
-                    warn!("on accept from {addr}: {e:#}");
-                }
-                return (stream, addr);
-            }
-            Err(e) => warn!("TCP accept failed: {e}"),
-        }
-    }
-}
-
 fn format_x509_subject(cert: &openssl::x509::X509Ref) -> String {
     cert.subject_name()
         .entries()
@@ -352,21 +335,6 @@ fn log_tls_connection(ssl: &openssl::ssl::SslRef, addr: &std::net::SocketAddr) {
         }
         None => info!("New TLS connection from {addr}, no client cert"),
     }
-}
-
-/// Perform a TLS handshake on an already-accepted stream.
-async fn tls_accept<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
-    acceptor: &openssl::ssl::SslAcceptor,
-    stream: S,
-) -> anyhow::Result<tokio_openssl::SslStream<S>> {
-    let ssl = openssl::ssl::Ssl::new(acceptor.context()).context("SSL context error")?;
-    let mut tls_stream =
-        tokio_openssl::SslStream::new(ssl, stream).context("SSL stream creation failed")?;
-    std::pin::Pin::new(&mut tls_stream)
-        .accept()
-        .await
-        .context("TLS handshake failed")?;
-    Ok(tls_stream)
 }
 
 /// TLS wrapper for any `axum::serve::Listener`. Performs handshakes concurrently
@@ -394,7 +362,7 @@ where
                 let tx = tx.clone();
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
-                    match tls_accept(&acceptor, stream).await {
+                    match varlink_http_bridge::tls_accept(&acceptor, stream).await {
                         Ok(tls_stream) => {
                             if tx.send((tls_stream, addr)).await.is_err() {
                                 warn!("TLS listener receiver dropped");
@@ -443,7 +411,7 @@ impl axum::serve::Listener for PlainListener {
     type Addr = std::net::SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        accept_and_configure(&self.inner).await
+        varlink_http_bridge::accept_and_configure(&self.inner).await
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
@@ -478,31 +446,6 @@ impl Connected<IncomingStream<'_, AsyncTlsListener<VsockListener>>> for VarlinkC
     }
 }
 
-fn load_tls_acceptor(
-    cert_path: &str,
-    key_path: &str,
-    client_ca_path: Option<&str>,
-) -> anyhow::Result<openssl::ssl::SslAcceptor> {
-    use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
-
-    let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())?;
-    // mozilla_modern_v5 allows TLS 1.2, but we need 1.3 for channel binding
-    // (export_keying_material requires TLS 1.3).
-    builder.set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_3))?;
-    builder.set_certificate_chain_file(cert_path)?;
-    builder.set_private_key_file(key_path, SslFiletype::PEM)?;
-    builder.check_private_key()?;
-
-    if let Some(ca_path) = client_ca_path {
-        builder.set_cert_store(varlink_http_bridge::exclusive_ca_store(
-            std::path::Path::new(ca_path),
-        )?);
-        builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
-    }
-
-    Ok(builder.build())
-}
-
 /// Resolve TLS configuration: explicit paths take priority, then systemd's
 /// $`CREDENTIALS_DIRECTORY` (see systemd.exec(5)), then a self-signed
 /// certificate generated and persisted under the state directory.
@@ -527,13 +470,15 @@ fn resolve_tls_acceptor(
     let client_ca = cli_ca.or_else(|| cred("trust"));
 
     match (tls_cert.as_deref(), tls_key.as_deref()) {
-        (Some(cert), Some(key)) => load_tls_acceptor(cert, key, client_ca.as_deref()),
+        (Some(cert), Some(key)) => {
+            varlink_http_bridge::tls_acceptor(cert, key, client_ca.as_deref())
+        }
         (None, None) => {
             // TLS is not optional, generate a self-signed cert.
             let dir = tls_cert::state_dir()?;
             let (cert_path, key_path) = tls_cert::load_or_generate(&dir)?;
             tls_cert::print_pin(&cert_path)?;
-            load_tls_acceptor(
+            varlink_http_bridge::tls_acceptor(
                 cert_path
                     .to_str()
                     .expect("failed to convert cert path to str"),

@@ -15,6 +15,10 @@ path = "src/bin/varlink-httpd/main.rs"
 name = "varlinkctl-http"
 path = "src/bin/varlinkctl-http/main.rs"
 
+[[bin]]
+name = "varlink-relayd"
+path = "src/bin/varlink-relayd/main.rs"
+
 [features]
 default = ["sshauth"]
 sshauth = ["dep:ssh-key", "dep:sshauth", "dep:ssh-key-import"]
@@ -43,6 +47,8 @@ tokio-tungstenite = "0.30"
 futures-util = { version = "0.3", features = ["sink"] }
 bytes = "1"
 h2 = "0.4"
+http = "1"
+httparse = "1"
 rustix = { version = "1.0", features = ["net", "process", "system"] }
 # TODO: switch back to crates.io once tokio-vsock releases a version with
 # From<OwnedFd> support (https://github.com/rust-vsock/tokio-vsock/pull/72)
@@ -64,7 +70,6 @@ tempfile = "3.27"
 ssh-key-import = { path = "crates/ssh-key-import", optional = true }
 
 [dev-dependencies]
-http = "1"
 varlink-http-bridge = { path = ".", features = ["test-helpers"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 test-with = { version = "0.17", default-features = false, features = ["runtime", "executable"] }

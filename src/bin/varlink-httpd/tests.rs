@@ -1116,7 +1116,7 @@ async fn test_tls_basic_connection() {
     let pki = make_test_pki();
     let varlink_dir = tempfile::tempdir().unwrap();
 
-    let acceptor = load_tls_acceptor(
+    let acceptor = varlink_http_bridge::tls_acceptor(
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         None,
@@ -1147,7 +1147,7 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
     let pki = make_test_pki();
     let varlink_dir = tempfile::tempdir().unwrap();
 
-    let acceptor = load_tls_acceptor(
+    let acceptor = varlink_http_bridge::tls_acceptor(
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         Some(pki.ca_cert_path.to_str().unwrap()),
@@ -1238,7 +1238,7 @@ async fn test_tls_credentials_directory_fallback() {
 async fn test_varlinkctl_helper_mtls_hostname_describe() {
     let pki = make_test_pki();
 
-    let acceptor = load_tls_acceptor(
+    let acceptor = varlink_http_bridge::tls_acceptor(
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         Some(pki.ca_cert_path.to_str().unwrap()),
@@ -1276,7 +1276,7 @@ async fn test_varlinkctl_helper_mtls_hostname_describe() {
 async fn test_varlinkctl_helper_mtls_no_client_cert() {
     let pki = make_test_pki();
 
-    let acceptor = load_tls_acceptor(
+    let acceptor = varlink_http_bridge::tls_acceptor(
         pki.server_cert_path.to_str().unwrap(),
         pki.server_key_path.to_str().unwrap(),
         Some(pki.ca_cert_path.to_str().unwrap()),
@@ -2250,7 +2250,7 @@ mod sshauth_tests {
         let pki = make_test_pki();
         let (auth, key_path) = make_test_ssh_auth();
 
-        let acceptor = load_tls_acceptor(
+        let acceptor = varlink_http_bridge::tls_acceptor(
             pki.server_cert_path.to_str().unwrap(),
             pki.server_key_path.to_str().unwrap(),
             None,

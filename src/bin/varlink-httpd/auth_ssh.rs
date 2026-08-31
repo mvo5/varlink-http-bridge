@@ -451,7 +451,7 @@ impl Authenticator for SshKeyAuthenticator {
             .action(
                 "tls-channel-binding",
                 // Safe: when TLS is active the server always provides a real binding
-                // (TLS 1.3 enforced in load_tls_acceptor), so a token signed with ""
+                // (TLS 1.3 enforced in tls_acceptor), so a token signed with ""
                 // will fail verification. The "" default only applies to non-TLS
                 // connections where channel binding is not relevant.
                 request
