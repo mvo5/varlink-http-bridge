@@ -1220,6 +1220,7 @@ struct BridgeCli {
     key: Option<String>,
     trust: Option<String>,
     authorized_keys: Option<String>,
+    auth_none: bool,
     insecure: bool,
     relay: Option<String>,
     instance: Option<String>,
@@ -1244,12 +1245,17 @@ fn print_help() {
           --bind=ADDR                       address to bind to (repeatable;
                                             default: 0.0.0.0:{DEFAULT_PORT})
                                             use vsock::PORT for vsock (e.g. vsock::{DEFAULT_PORT})
+                                            use none to serve only via --relay
+                                            or socket activation
           --cert=PATH                       TLS certificate PEM file
                                             (default: self-signed, generated
                                             and persisted on first start)
           --key=PATH                        TLS private key PEM file
           --trust=PATH                      CA certificate PEM for client verification (mTLS)
           --authorized-keys=PATH            authorized SSH public keys file
+          --auth=none                       accept unauthenticated requests while
+                                            keeping TLS; only for instances that
+                                            expose harmless, rate-limited sockets
           --insecure                        run over plain HTTP without any
                                             authentication (DANGEROUS)
           --relay=URL                       additionally serve through a
@@ -1287,6 +1293,7 @@ fn parse_cli() -> anyhow::Result<Command> {
     let mut key = None;
     let mut trust = None;
     let mut authorized_keys = None;
+    let mut auth_none = false;
     let mut insecure = false;
     let mut relay = None;
     let mut instance = None;
@@ -1300,6 +1307,15 @@ fn parse_cli() -> anyhow::Result<Command> {
             Long("key") => key = Some(parser.value()?.parse()?),
             Long("trust") => trust = Some(parser.value()?.parse()?),
             Long("authorized-keys") => authorized_keys = Some(parser.value()?.parse()?),
+            Long("auth") => {
+                let mode: String = parser.value()?.parse()?;
+                // only an explicit opt-out for now; a full selector is
+                // coming upstream (varlink-http-bridge PR #106)
+                if mode != "none" {
+                    bail!("--auth only supports 'none', got {mode:?}");
+                }
+                auth_none = true;
+            }
             Long("insecure") => insecure = true,
             Long("relay") => relay = Some(parser.value()?.parse()?),
             Long("instance") => instance = Some(parser.value()?.parse()?),
@@ -1323,13 +1339,26 @@ fn parse_cli() -> anyhow::Result<Command> {
         }
     }
 
-    if bind_strs.is_empty() {
+    let bind_none = bind_strs.iter().any(|s| s == "none");
+    if bind_none && bind_strs.len() > 1 {
+        bail!("--bind=none cannot be combined with other --bind addresses");
+    }
+    if bind_none {
+        bind_strs.clear();
+    } else if bind_strs.is_empty() {
         bind_strs.push(format!("0.0.0.0:{DEFAULT_PORT}"));
     }
     let binds: Vec<BindAddr> = bind_strs
         .iter()
         .map(|s| s.parse())
         .collect::<Result<_, _>>()?;
+
+    if auth_none && insecure {
+        bail!("--auth=none makes no sense with --insecure, which already disables authentication");
+    }
+    if auth_none && authorized_keys.is_some() {
+        bail!("--auth=none would ignore --authorized-keys=");
+    }
 
     Ok(Command::Bridge(BridgeCli {
         binds,
@@ -1338,6 +1367,7 @@ fn parse_cli() -> anyhow::Result<Command> {
         key,
         trust,
         authorized_keys,
+        auth_none,
         insecure,
         relay,
         instance,
@@ -1411,7 +1441,7 @@ async fn main() -> anyhow::Result<()> {
     let mut authenticators: Vec<Box<dyn Authenticator>> = Vec::new();
 
     #[cfg(feature = "sshauth")]
-    {
+    if !cli.auth_none {
         let ssh_auth = create_ssh_authenticator(
             cli.authorized_keys,
             creds_dir.as_deref(),
@@ -1426,6 +1456,14 @@ async fn main() -> anyhow::Result<()> {
             reason: "--insecure",
         }));
         eprintln!("WARNING: running without authentication - all routes are open");
+    } else if cli.auth_none {
+        authenticators.push(Box::new(AllowAllAuthenticator {
+            reason: "--auth=none",
+        }));
+        eprintln!(
+            "WARNING: --auth=none - requests are not authenticated, \
+             expose only harmless sockets"
+        );
     } else if authenticators.is_empty() {
         if has_mtls {
             // mTLS verifies the client during the TLS handshake; no
@@ -1456,7 +1494,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if listeners.is_empty() {
-        // No socket activation: bind explicitly based on --bind (or default)
+        // No socket activation: bind explicitly based on --bind (or
+        // default); --bind=none leaves the list empty on purpose
+        if cli.binds.is_empty() && cli.relay.is_none() {
+            bail!("--bind=none without --relay= or socket activation leaves nothing to serve");
+        }
         for bind in cli.binds {
             let listener = listener_from_bind_addr(bind).await?;
             listeners.push((listener, tls_acceptor.clone()));
