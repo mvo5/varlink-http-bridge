@@ -1892,14 +1892,15 @@ fn test_unread_credentials_ignores_absent_files() {
 
 // --- --auth= mechanism selection tests ---
 
-/// Every `build_authenticators()` case, with `/` never touched.
+/// Every `build_authenticators()` case, with `/` never touched. The sockets
+/// are left unnamed (the default registry), which is the strict case.
 fn build_authenticators_in(
     auth: &[AuthMechanism],
     insecure: bool,
     require_mtls: bool,
     etc_root: &std::path::Path,
 ) -> anyhow::Result<Vec<Box<dyn Authenticator>>> {
-    crate::build_authenticators(auth, insecure, require_mtls, None, None, etc_root)
+    crate::build_authenticators(auth, insecure, require_mtls, false, None, None, etc_root)
 }
 
 #[test]
@@ -1923,7 +1924,7 @@ fn test_parse_auth_rejects_none_combined_with_mechanism() {
 }
 
 /// Without mTLS or --insecure nothing would authenticate the client, so
-/// refuse to start rather than serve every request.
+/// refuse to start rather than serve every socket systemd registers.
 #[test]
 fn test_build_authenticators_none_without_mtls_is_rejected() {
     let root = tempfile::tempdir().unwrap();
@@ -1932,6 +1933,25 @@ fn test_build_authenticators_none_without_mtls_is_rejected() {
         panic!("--auth=none without mTLS must not produce an authenticator");
     };
     assert!(err.to_string().contains("--auth=none needs mTLS"), "{err}");
+}
+
+/// Naming the sockets scopes the exposure, so it stands in for mTLS: this is
+/// how a relay-only node serves a harmless socket to anonymous callers.
+#[test]
+fn test_build_authenticators_none_with_named_sockets_accepts() {
+    let root = tempfile::tempdir().unwrap();
+    let auths = crate::build_authenticators(
+        &[AuthMechanism::None],
+        false,
+        false,
+        true,
+        None,
+        None,
+        root.path(),
+    )
+    .unwrap();
+    assert_eq!(auths.len(), 1);
+    check_request(auths[0].as_ref(), "GET", "/health", None, None, None).unwrap();
 }
 
 #[test]
