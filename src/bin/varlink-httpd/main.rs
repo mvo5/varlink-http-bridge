@@ -1246,6 +1246,10 @@ async fn send_ws_frames(
 // Time to wait for the close handshake to finish before giving up.
 const WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Every socket systemd registers, which is why serving it unauthenticated
+/// takes more than just `--auth=none` (see `build_authenticators`).
+const DEFAULT_SOCKETS_PATH: &str = "/run/varlink/registry";
+
 /// Finish the close handshake. Bounded so that a stuck peer cannot
 /// hold this task forever.
 async fn close_ws(ws: &mut WebSocket) {
@@ -1621,15 +1625,20 @@ fn print_help() {
 
         Bridge options:
           VARLINK_SOCKETS_PATH              directory of sockets or a single socket
-                                            (default: /run/varlink/registry)
+                                            (default: {DEFAULT_SOCKETS_PATH})
           --bind=ADDR                       address to bind to (repeatable;
                                             default: 0.0.0.0:{DEFAULT_PORT}, or
                                             127.0.0.1:{DEFAULT_PORT} with --insecure)
                                             use vsock::PORT for vsock (e.g. vsock::{DEFAULT_PORT})
+                                            use none to serve only via --relay
+                                            or socket activation
           --auth=MECHANISMS                 comma-separated per-request authentication
                                             ({auth}); required unless --insecure.
                                             mTLS is enabled separately and applies
-                                            on top of whatever is selected here
+                                            on top of whatever is selected here.
+                                            none additionally needs --require-mtls,
+                                            --insecure, or a VARLINK_SOCKETS_PATH
+                                            naming what to expose
           --cert=PATH                       TLS certificate PEM file
                                             (default: self-signed, generated
                                             and persisted on first start)
@@ -1712,7 +1721,7 @@ fn parse_cli() -> anyhow::Result<Command> {
     use lexopt::prelude::*;
 
     let mut bind_strs: Vec<String> = Vec::new();
-    let mut varlink_sockets_path = String::from("/run/varlink/registry");
+    let mut varlink_sockets_path = String::from(DEFAULT_SOCKETS_PATH);
     let mut cert = None;
     let mut key = None;
     let mut trust = None;
@@ -1762,7 +1771,13 @@ fn parse_cli() -> anyhow::Result<Command> {
         }
     }
 
-    if bind_strs.is_empty() {
+    let bind_none = bind_strs.iter().any(|s| s == "none");
+    if bind_none && bind_strs.len() > 1 {
+        bail!("--bind=none cannot be combined with other --bind addresses");
+    }
+    if bind_none {
+        bind_strs.clear();
+    } else if bind_strs.is_empty() {
         let (bind, note) = default_bind(insecure);
         if let Some(note) = note {
             warn!("{note}");
@@ -1995,6 +2010,9 @@ fn unread_credentials_warning(creds_dir: &std::path::Path, cli: &BridgeCli) -> O
 /// The middleware accepts a request as soon as one of these accepts it, so an
 /// empty list rejects everything.
 ///
+/// `sockets_named` says the operator named what to serve instead of taking
+/// the default registry, which is what lets `--auth=none` stand on its own.
+///
 /// `etc_root` is the filesystem root for the well-known `/etc/varlink-httpd`
 /// key discovery; only tests override it.
 #[cfg_attr(not(feature = "sshauth"), allow(unused_variables))]
@@ -2002,6 +2020,7 @@ fn build_authenticators(
     auth: &[AuthMechanism],
     insecure: bool,
     require_mtls: bool,
+    sockets_named: bool,
     authorized_keys: Option<&str>,
     api_keys: Option<&str>,
     creds_dir: Option<&std::path::Path>,
@@ -2033,16 +2052,27 @@ fn build_authenticators(
                     reason: "--insecure",
                 }));
             }
-            // Every other way of having no per-request mechanism needs mTLS to
-            // carry the authentication, so refuse to serve without it.
             AuthMechanism::None if require_mtls => {
                 authenticators.push(Box::new(AllowAllAuthenticator {
                     reason: "--auth=none, client verified at TLS layer",
                 }));
             }
+            // Naming the sockets is the deliberate step: it serves those and
+            // only those without authentication, for instances that expose
+            // harmless, rate-limited sockets (a relay-only node, say).
+            AuthMechanism::None if sockets_named => {
+                warn!("--auth=none: requests are not authenticated, expose only harmless sockets");
+                authenticators.push(Box::new(AllowAllAuthenticator {
+                    reason: "--auth=none",
+                }));
+            }
+            // Anything left would serve every socket systemd registers to
+            // anyone who can reach the port.
             AuthMechanism::None => {
                 bail!(
-                    "--auth=none needs mTLS (--require-mtls) to authenticate clients, or --insecure"
+                    "--auth=none needs mTLS (--require-mtls), or --insecure, or a \
+                     VARLINK_SOCKETS_PATH naming what to expose instead of the default \
+                     {DEFAULT_SOCKETS_PATH}"
                 );
             }
         }
@@ -2077,6 +2107,7 @@ async fn main() -> anyhow::Result<()> {
         &cli.auth,
         cli.insecure,
         cli.require_mtls,
+        cli.varlink_sockets_path != DEFAULT_SOCKETS_PATH,
         cli.authorized_keys.as_deref(),
         cli.api_keys.as_deref(),
         creds_dir.as_deref(),
@@ -2115,7 +2146,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if listeners.is_empty() {
-        // No socket activation: bind explicitly based on --bind (or default)
+        // No socket activation: bind explicitly based on --bind (or
+        // default); --bind=none leaves the list empty on purpose
+        if cli.binds.is_empty() && cli.relay.is_none() {
+            bail!("--bind=none without --relay= or socket activation leaves nothing to serve");
+        }
         for bind in cli.binds {
             let listener = listener_from_bind_addr(bind).await?;
             listeners.push((listener, tls_config.clone()));
