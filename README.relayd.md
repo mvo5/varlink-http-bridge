@@ -230,3 +230,54 @@ while the inner h2 stream has window capacity, and opens h2 window only
 as bytes drain to the other side, so backpressure propagates end to end
 in both directions. This lives in chunk 1's primitives and is tested
 there.
+
+That backpressure has to stay *per stream*, though. All callers of one
+node share a single h2 connection, and h2's default is one 64KiB window
+for the whole connection, i.e. shared by all of its streams: a single
+caller whose local service hangs -- or who stopped reading its socket --
+then holds the entire connection window and every other caller on that
+tunnel starves. Both tunnel ends therefore size the connection window as
+`MAX_TUNNEL_STREAMS` (256) stream windows of 32KiB each, i.e. 8MiB, and
+the node advertises that same stream limit, so no stream can hold more
+than its own share and a caller beyond the limit waits for a slot (and
+gets a `503` if none frees up in time) instead of slowing everybody
+down. The window is a promise, not an allocation: an idle tunnel costs
+the same with 8MiB as with h2's 64KiB default, and only a tunnel whose
+callers all wedge at once holds that much.
+
+The 32KiB stream window is what bounds a single caller's throughput over
+a long fat pipe (window/RTT, so ~650KB/s at 50ms, measured 0.60MB/s) --
+ample for varlink call and reply, and the price for serving 256 callers
+per node out of one connection window. Bulk data is what would suffer:
+256KiB gets 4.89MB/s and 1MiB gets 17.65MB/s over the same 50ms link, so
+carrying file transfers through the tunnel means revisiting the window
+(see the `TODO` on `STREAM_WINDOW`).
+
+## Logging
+
+Networks are weird, so the log is the only way to tell "the relay is
+down" from "this node is misconfigured" from "that caller is slow".
+What makes that work is not more lines, it is knowing which level a
+line belongs at -- `info` has to stay readable on a busy relay, or it
+stops being read at all:
+
+| level | what belongs there | volume |
+| ----- | ------------------ | ------ |
+| `error` | the process cannot do its job any more | never, in practice |
+| `warn` | someone has to act: a tunnel is down, a node id is claimed twice, a tunnel is out of stream slots, a stream is wedged, the listener is out of file descriptors | one per event, not per attempt |
+| `info` | lifecycle worth tracking: listeners bound, a node connected or disconnected (with how long it lasted and how many streams went with it), a tunnel established or recovered, a caller asking for a node nobody has | per node, per tunnel |
+| `debug` | one line per caller and per retry, with the numbers: bytes each way, how long, why it ended | per stream |
+
+Three rules keep the volume proportional to the trouble rather than to
+the retrying:
+
+- **A run of failures is one event.** A relay outage says so once, then
+  goes quiet, then reminds every 10 minutes while it lasts, and says how
+  long it took when it comes back. A cause that changes mid-outage is
+  loud again, because it is news.
+- **What a public port sees all day is `debug`.** Scanners, half-open
+  connections, TLS mismatches, malformed `CONNECT`s: routine, and it
+  must not bury the rest.
+- **Both ends name a caller by its h2 stream id.** It is the one
+  identifier the relay and the node both see, so a caller's line on the
+  relay leads to its lines on the node.

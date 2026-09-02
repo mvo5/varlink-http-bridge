@@ -20,7 +20,8 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::WebSocketStream;
 
 use varlink_http_bridge::tunnel::{
-    NodeId, STREAM_WINDOW, TUNNEL_PATH, WsByteStream, h2_server_builder, splice,
+    MAX_TUNNEL_STREAMS, NodeId, STREAM_WINDOW, StreamLoad, StreamSlot, TUNNEL_PATH, WsByteStream,
+    h2_server_builder, splice,
 };
 
 pub(crate) trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -434,6 +435,7 @@ where
         .handshake::<_, bytes::Bytes>(WsByteStream::new(ws))
         .await
         .context("h2 handshake with relay")?;
+    let load = std::sync::Arc::new(StreamLoad::default());
     let mut served: u64 = 0;
     // once per tunnel: a full queue means axum is not taking
     // connections as fast as callers arrive, which is worth knowing but
@@ -442,18 +444,35 @@ where
     while let Some(next) = conn.accept().await {
         let (request, mut respond) = next.context("tunnel connection failed")?;
         let body = request.into_body();
-        let send = respond
-            .send_response(http::Response::new(()), false)
-            .context("accepting tunnel stream")?;
+        // a caller gone before its stream is answered (hung up, or the
+        // relay gave up queueing it for a slot) is that caller's
+        // problem, not the tunnel's
+        let send = match respond.send_response(http::Response::new(()), false) {
+            Ok(send) => send,
+            Err(e) => {
+                debug!("tunnel stream was gone before it was accepted: {e}");
+                continue;
+            }
+        };
         let stream_id = u32::from(send.stream_id());
         let who = format!("relay stream {stream_id}");
         served += 1;
+        let (slot, report) = StreamSlot::open(&load);
+        if let Some(report) = report {
+            log::log!(
+                report.level(),
+                "this tunnel is carrying {}/{MAX_TUNNEL_STREAMS} streams ({}%)",
+                report.active,
+                report.tier
+            );
+        }
         // the hand-off to axum. A hung local service fills this buffer,
         // then the stream's h2 window, and then splice stops releasing
         // window and the relay stops sending: a wedged stream costs two
         // windows of memory, no more.
         let (io, ours) = tokio::io::duplex(STREAM_WINDOW as usize);
         tokio::spawn(async move {
+            let _busy = slot;
             let started = std::time::Instant::now();
             match splice(io, body, send, &who).await {
                 Ok(moved) => debug!(

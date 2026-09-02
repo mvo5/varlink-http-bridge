@@ -222,3 +222,46 @@ fn relay_only_instance_with_auth_none() {
         status.lines().next().unwrap_or_default()
     );
 }
+
+/// Callers share one tunnel per node, so many of them must be in flight
+/// at once -- more than the node queues internally.
+#[test]
+fn concurrent_callers_share_one_tunnel() {
+    // needs a usable machine id, same states test as machine-id(5)
+    let Ok(text) = std::fs::read_to_string("/etc/machine-id") else {
+        return;
+    };
+    let Ok(machine_id) = text.trim().parse::<MachineId>() else {
+        return;
+    };
+    let id = machine_id.node_id().unwrap().to_string();
+
+    let (_relayd, node_addr, connect_addr) = spawn_relayd();
+    let sockets = tempfile::tempdir().unwrap();
+    let _bridge = spawn_httpd(
+        &node_addr,
+        sockets.path(),
+        None,
+        &["--insecure", "--bind", "127.0.0.1:0"],
+    );
+
+    // all open at once, and more than the node's connection channel holds
+    let streams: Vec<TcpStream> = (0..24)
+        .map(|_| connect_via_relay(&connect_addr, &id))
+        .collect();
+
+    let responses: Vec<String> = std::thread::scope(|scope| {
+        let callers: Vec<_> = streams
+            .into_iter()
+            .map(|stream| scope.spawn(move || get_via(stream, "/health")))
+            .collect();
+        callers.into_iter().map(|c| c.join().unwrap()).collect()
+    });
+    for (i, response) in responses.iter().enumerate() {
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "caller {i}: {}",
+            response.lines().next().unwrap_or_default()
+        );
+    }
+}

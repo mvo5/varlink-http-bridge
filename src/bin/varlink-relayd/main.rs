@@ -33,6 +33,9 @@ const DEFAULT_CONNECT_BIND: &str = "127.0.0.1:8444";
 // bounds every prelude (TLS, upgrade, h2 handshake, CONNECT head), so a
 // silent or trickling peer cannot pin a task and fd forever
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+// how long a caller may queue for a stream slot on a full node before
+// it gets a 503
+const STREAM_SLOT_TIMEOUT: Duration = Duration::from_secs(10);
 const USAGE: &str = "\
 usage: varlink-relayd --insecure [options]
 
@@ -122,7 +125,7 @@ async fn main() -> Result<()> {
     let nodes = Arc::new(Nodes::default());
     tokio::try_join!(
         node::serve(node_listener, args.tls, Arc::clone(&nodes)),
-        caller::serve(connect_listener, nodes),
+        caller::serve(connect_listener, nodes, STREAM_SLOT_TIMEOUT),
     )?;
     Ok(())
 }
