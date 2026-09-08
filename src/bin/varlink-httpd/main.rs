@@ -160,10 +160,14 @@ impl From<DynReplyError<'_>> for AppError {
             Some(params) => format!("{}: {params:?}", e.error),
             None => e.error.to_string(),
         };
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message,
-        }
+        // the spec maps this standard error to 400 like ExpectedMore, but
+        // zlink does not know it, so it arrives here rather than as zlink::Error
+        let status = if e.error == "org.varlink.service.ExpectedUpgrade" {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        Self { status, message }
     }
 }
 
