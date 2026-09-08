@@ -1096,7 +1096,8 @@ async fn route_call_post(
     debug!("POST call for method: {method}, params: {params:#?}");
     let call_args = parse_call_args(&body)?;
 
-    let service = if let Some(service) = params.get("service") {
+    // `?socket=` is the pre-spec name of this parameter, kept for old clients
+    let service = if let Some(service) = params.get("service").or_else(|| params.get("socket")) {
         service.clone()
     } else {
         method
@@ -1294,6 +1295,8 @@ fn create_router(
         .route("/call/{method}", post(route_call_post))
         .route("/call/{service}/{method}", post(route_call_service_post))
         .route("/ws/services/{service}", get(route_ws))
+        // pre-spec path, kept so existing varlinkctl-http and websocat URLs work
+        .route("/ws/sockets/{service}", get(route_ws))
         .layer(axum::middleware::from_fn_with_state(
             shared_state.clone(),
             auth_middleware,
