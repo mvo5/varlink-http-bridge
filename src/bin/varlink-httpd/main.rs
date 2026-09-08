@@ -501,6 +501,15 @@ struct TrustCache {
     cas: Vec<openssl::x509::X509>,
 }
 
+/// Read the CA certificates in `path`. Errors carry no path context, callers
+/// name the file themselves.
+///
+/// An `Ok` empty vector means the file parsed but held no certificate.
+fn read_client_cas(path: &std::path::Path) -> anyhow::Result<Vec<openssl::x509::X509>> {
+    let pem = std::fs::read(path)?;
+    Ok(openssl::x509::X509::stack_from_pem(&pem)?)
+}
+
 impl ClientTrust {
     fn new(path: Option<&str>) -> Self {
         let trust = Self {
@@ -528,9 +537,9 @@ impl ClientTrust {
         trust
     }
 
-    /// Re-read the CA file when its mtime changed. A file that cannot be read
-    /// or parsed keeps the previous CAs and leaves the mtime alone, so the
-    /// next connection retries; a file that is gone drops them.
+    /// Re-read the CA file when its mtime changed. Removing the file drops the CAs.
+    /// An unparseable or empty file keeps the previous CAs and leaves the mtime untouched
+    /// so the next connection retries.
     fn maybe_reload(&self) {
         let Some(path) = self.path.as_deref() else {
             return;
@@ -563,28 +572,19 @@ impl ClientTrust {
             return;
         };
 
-        match std::fs::read(path)
-            .map_err(anyhow::Error::from)
-            .and_then(|pem| Ok(openssl::x509::X509::stack_from_pem(&pem)?))
-        {
-            Ok(cas) if cas.is_empty() => {
-                warn!(
-                    "no certificates in {}, mTLS will reject every client",
-                    path.display()
-                );
-                *cache = TrustCache {
-                    mtime: Some(mtime),
-                    cas,
-                };
-            }
-            Ok(cas) => {
+        match read_client_cas(path) {
+            Ok(cas) if !cas.is_empty() => {
                 info!("loaded {} client CA(s) from {}", cas.len(), path.display());
                 *cache = TrustCache {
                     mtime: Some(mtime),
                     cas,
                 };
             }
-            // Leave mtime untouched so the next connection tries again.
+            Ok(_) => warn!(
+                "empty or corrupt certificate file {}, keeping cached client CAs \
+                 (remove the file to withdraw trust)",
+                path.display()
+            ),
             Err(e) => warn!(
                 "cannot load {}: {e:#}, keeping cached client CAs",
                 path.display()
@@ -1627,6 +1627,14 @@ fn parse_cli() -> anyhow::Result<Command> {
             if set {
                 bail!("--insecure serves plain HTTP and can't be combined with {name}");
             }
+        }
+    }
+
+    if let Some(path) = trust.as_deref() {
+        let cas = read_client_cas(std::path::Path::new(path))
+            .with_context(|| format!("--trust={path}"))?;
+        if cas.is_empty() {
+            bail!("--trust={path} holds no certificate");
         }
     }
 

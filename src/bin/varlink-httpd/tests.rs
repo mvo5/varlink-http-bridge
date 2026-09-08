@@ -1221,6 +1221,74 @@ fn test_mtls_watches_trust_credential_before_it_exists() {
     );
 }
 
+/// A file that is still there but yields no CA is a mistake or a refresh
+/// caught mid-write, so the CAs already loaded stay. Removing the file is the
+/// way to withdraw trust, and `test_mtls_trust_reloads_when_ca_appears_and_vanishes`
+/// covers that.
+#[test_with::executable(openssl)]
+#[test]
+fn test_mtls_unusable_trust_file_keeps_the_previous_cas() {
+    let pki = make_test_pki();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trust");
+
+    std::fs::copy(&pki.ca_cert_path, &path).unwrap();
+    let trust = crate::ClientTrust::new(Some(path.to_str().unwrap()));
+    assert_eq!(trust.store().unwrap().all_certificates().len(), 1);
+
+    for (what, content) in [
+        ("empty", b"".as_slice()),
+        ("not PEM at all", b"nonsense\n"),
+        (
+            "a PEM block that fails to decode",
+            b"-----BEGIN CERTIFICATE-----\nnot base64!!\n-----END CERTIFICATE-----\n",
+        ),
+    ] {
+        std::fs::write(&path, content).unwrap();
+        assert_eq!(
+            trust.store().unwrap().all_certificates().len(),
+            1,
+            "a file that is {what} must keep the CA already loaded"
+        );
+    }
+}
+
+/// A refresh that truncates before writing can be read at zero bytes, and
+/// both halves can fall inside one mtime tick. Caching that read would keep
+/// the stale trust store in place after the real content landed.
+#[test_with::executable(openssl)]
+#[test]
+fn test_mtls_empty_trust_file_is_not_cached() {
+    let pki = make_test_pki();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trust");
+
+    std::fs::write(&path, b"").unwrap();
+    let trust = crate::ClientTrust::new(Some(path.to_str().unwrap()));
+    assert_eq!(
+        trust.store().unwrap().all_certificates().len(),
+        0,
+        "an empty file must trust nothing"
+    );
+
+    // Rewind the mtime to what the empty read saw, standing in for a write
+    // that lands within the same tick.
+    let mtime = path.metadata().unwrap().modified().unwrap();
+    std::fs::copy(&pki.ca_cert_path, &path).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(mtime))
+        .unwrap();
+
+    assert_eq!(
+        trust.store().unwrap().all_certificates().len(),
+        1,
+        "the CA that arrived must be picked up, not shadowed by the empty read"
+    );
+}
+
 /// The CA may show up after start, when systemd refreshes credentials on
 /// reload. It has to take effect without restarting the listener, and
 /// removing it again has to take effect just as immediately.
