@@ -138,6 +138,13 @@ $ curl -s 'http://localhost:1031/call/org.varlink.service.GetInfo?socket=io.syst
   "version": "259 (259-1)"
 }
 
+# '?oneway=true' sets the varlink 'oneway' flag for fire-and-forget calls.
+# The bridge answers '204 No Content' once the call is written to the
+# service; only a failure to reach the service is still reported (as 502)
+$ curl -s -o /dev/null -w '%{http_code}\n' \
+    'http://localhost:1031/call/io.systemd.Journal.Synchronize?oneway=true' --json '{}'
+204
+
 # streaming methods (varlink "more" flag) are requested with ?more=true;
 # the replies come back as a json-seq (RFC 7464).
 $ curl -s 'http://localhost:1031/call/io.systemd.UserDatabase.GetUserRecord?more=true' \

@@ -1035,18 +1035,29 @@ enum CallMode {
     Call,
     /// `more` set, replies streamed as a JSON text sequence (RFC 7464).
     More,
+    /// `oneway` set, no reply, answered with `204 No Content`.
+    Oneway,
 }
 
 impl CallMode {
-    /// `more` changes what the call does, so it is a call parameter and not
-    /// content negotiation: the `Accept` header is deliberately not consulted.
+    /// `more` and `oneway` change what the call does, so they are call
+    /// parameters and not content negotiation: the `Accept` header is
+    /// deliberately not consulted.
     fn from_params(params: &HashMap<String, String>) -> Result<Self, AppError> {
-        match params.get("more").map(String::as_str) {
-            None | Some("false") => Ok(Self::Call),
-            Some("true") => Ok(Self::More),
+        let flag = |name: &str| match params.get(name).map(String::as_str) {
+            None | Some("false") => Ok(false),
+            Some("true") => Ok(true),
             Some(other) => Err(AppError::bad_request(format!(
-                "invalid value '{other}' for ?more=, expected true or false"
+                "invalid value '{other}' for ?{name}=, expected true or false"
             ))),
+        };
+        match (flag("oneway")?, flag("more")?) {
+            (true, true) => Err(AppError::bad_request(
+                "?oneway=true cannot be combined with ?more=true",
+            )),
+            (true, false) => Ok(Self::Oneway),
+            (false, true) => Ok(Self::More),
+            (false, false) => Ok(Self::Call),
         }
     }
 }
@@ -1068,6 +1079,12 @@ async fn call_varlink_method(
     let conn_arc = get_varlink_connection(socket, state, conn_cache).await?;
     let mut connection = conn_arc.lock_owned().await;
     match mode {
+        CallMode::Oneway => {
+            connection
+                .send_call(&zlink::Call::new(&method_call).set_oneway(true), vec![])
+                .await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
         CallMode::More => {
             connection
                 .send_call(&zlink::Call::new(&method_call).set_more(true), vec![])
