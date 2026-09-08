@@ -1662,10 +1662,32 @@ fn unread_names(
     auth: &[AuthMechanism],
     authorized_keys: Option<&str>,
 ) -> Vec<String> {
-    crate::unread_credentials(creds_dir, insecure, require_mtls, auth, authorized_keys)
+    let cli = cli_looking_up_credentials(insecure, require_mtls, auth, authorized_keys);
+    crate::unread_credentials(creds_dir, &cli)
         .into_iter()
         .map(|(name, _)| name)
         .collect()
+}
+
+/// The configuration these tests vary: no path spelled out on the command
+/// line, so every credential is looked up.
+fn cli_looking_up_credentials(
+    insecure: bool,
+    require_mtls: bool,
+    auth: &[AuthMechanism],
+    authorized_keys: Option<&str>,
+) -> crate::BridgeCli {
+    crate::BridgeCli {
+        binds: Vec::new(),
+        varlink_sockets_path: String::new(),
+        cert: None,
+        key: None,
+        trust: None,
+        require_mtls,
+        authorized_keys: authorized_keys.map(String::from),
+        auth: auth.to_vec(),
+        insecure,
+    }
 }
 
 /// Every credential the daemon knows how to read, so each test only has to say
@@ -1703,16 +1725,41 @@ fn test_unread_credentials_reports_trust_without_mtls() {
     assert!(unread.contains(&"trust".to_string()), "{unread:?}");
 }
 
-/// --insecure never reads TLS material at all.
+/// An explicit path replaces credential lookup instead of adding to it, so the
+/// credential goes unread even though mTLS does read one.
 #[test]
-fn test_unread_credentials_reports_tls_material_under_insecure() {
+fn test_unread_credentials_reports_tls_material_hidden_by_explicit_paths() {
     let dir = creds_dir_with_everything();
-    let unread = unread_names(dir.path(), true, false, &[AuthMechanism::None], None);
+    let cli = crate::BridgeCli {
+        cert: Some("/etc/ssl/server.pem".to_string()),
+        key: Some("/etc/ssl/server.key".to_string()),
+        trust: Some("/etc/ssl/ca.pem".to_string()),
+        ..cli_looking_up_credentials(false, true, &[AuthMechanism::None], None)
+    };
+    let unread: Vec<String> = crate::unread_credentials(dir.path(), &cli)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
     for name in ["cert", "key", "trust"] {
         assert!(
             unread.contains(&name.to_string()),
             "{name} missing: {unread:?}"
         );
+    }
+}
+
+/// --insecure never reads TLS material at all.
+#[test]
+fn test_unread_credentials_reports_tls_material_under_insecure() {
+    let dir = creds_dir_with_everything();
+    let cli = cli_looking_up_credentials(true, false, &[AuthMechanism::None], None);
+    let unread = crate::unread_credentials(dir.path(), &cli);
+    for name in ["cert", "key", "trust"] {
+        let (_, why) = unread
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{name} missing: {unread:?}"));
+        assert!(why.contains("--insecure"), "{name} says: {why}");
     }
 }
 

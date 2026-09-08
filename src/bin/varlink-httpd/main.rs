@@ -1699,22 +1699,44 @@ fn parse_import_ssh_args(parser: &mut lexopt::Parser) -> anyhow::Result<Command>
 /// Enabling a mechanism from the mere presence of a credential would mean one
 /// that fails to show up silently drops it, so the flags decide and provisioned
 /// material can go unread. That is easy to mistake for having taken effect.
-#[cfg_attr(not(feature = "sshauth"), allow(unused_variables))]
-fn unread_credentials(
-    creds_dir: &std::path::Path,
-    insecure: bool,
-    require_mtls: bool,
-    auth: &[AuthMechanism],
-    authorized_keys: Option<&str>,
-) -> Vec<(String, &'static str)> {
+fn unread_credentials(creds_dir: &std::path::Path, cli: &BridgeCli) -> Vec<(String, &'static str)> {
     let mut unread = Vec::new();
 
-    for (name, read, why) in [
-        ("cert", !insecure, "--insecure serves plain HTTP"),
-        ("key", !insecure, "--insecure serves plain HTTP"),
-        ("trust", require_mtls, "pass --require-mtls to enable mTLS"),
+    for (name, read, why, explicit) in [
+        (
+            "cert",
+            !cli.insecure,
+            "--insecure serves plain HTTP",
+            cli.cert.is_some(),
+        ),
+        (
+            "key",
+            !cli.insecure,
+            "--insecure serves plain HTTP",
+            cli.key.is_some(),
+        ),
+        (
+            "trust",
+            cli.require_mtls,
+            if cli.insecure {
+                "--insecure serves plain HTTP"
+            } else {
+                "pass --require-mtls to enable mTLS"
+            },
+            cli.trust.is_some(),
+        ),
     ] {
-        if !read && creds_dir.join(name).exists() {
+        if !creds_dir.join(name).exists() {
+            continue;
+        }
+        let why = if !read {
+            Some(why)
+        } else if explicit {
+            Some("an explicit path takes priority")
+        } else {
+            None
+        };
+        if let Some(why) = why {
             unread.push((name.to_string(), why));
         }
     }
@@ -1723,9 +1745,9 @@ fn unread_credentials(
     {
         // An explicit --authorized-keys= replaces discovery rather than adding
         // to it, so it hides credentials even when ssh auth is selected.
-        let why = if authorized_keys.is_some() {
+        let why = if cli.authorized_keys.is_some() {
             Some("--authorized-keys= replaces credential discovery")
-        } else if !auth.contains(&AuthMechanism::Ssh) {
+        } else if !cli.auth.contains(&AuthMechanism::Ssh) {
             Some("pass --auth=ssh to use them")
         } else {
             None
@@ -1805,16 +1827,10 @@ async fn main() -> anyhow::Result<()> {
     let creds_dir = varlink_http_bridge::sysconf::CredentialsLoader::path_from_env();
 
     if let Some(dir) = creds_dir.as_deref() {
-        let unread: Vec<String> = unread_credentials(
-            dir,
-            cli.insecure,
-            cli.require_mtls,
-            &cli.auth,
-            cli.authorized_keys.as_deref(),
-        )
-        .iter()
-        .map(|(name, why)| format!("{name} ({why})"))
-        .collect();
+        let unread: Vec<String> = unread_credentials(dir, &cli)
+            .iter()
+            .map(|(name, why)| format!("{name} ({why})"))
+            .collect();
         if !unread.is_empty() {
             warn!(
                 "credential(s) present but unused by this configuration: {}",
