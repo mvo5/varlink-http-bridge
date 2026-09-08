@@ -2374,6 +2374,35 @@ fn test_idl_to_openapi() {
     assert!(required.contains(&"id"));
     assert!(!required.contains(&"options"));
 
+    // GetItem can be called oneway
+    assert_eq!(
+        post["parameters"],
+        json!([{"$ref": "#/components/parameters/oneway"}])
+    );
+    assert!(
+        post["responses"]["204"]["description"].is_string(),
+        "GetItem should have a 204 response for oneway calls"
+    );
+    let oneway_param = &doc["components"]["parameters"]["oneway"];
+    assert_eq!(oneway_param["in"], "query");
+    assert_eq!(oneway_param["schema"]["type"], "boolean");
+
+    // WatchItems requires 'more', so a oneway call could never do anything
+    let watch = &doc["paths"]["/call/com.example.test/com.example.test.WatchItems"]["post"];
+    assert!(
+        watch.get("parameters").is_none(),
+        "WatchItems should not advertise ?oneway="
+    );
+    assert!(
+        watch["responses"].get("204").is_none(),
+        "WatchItems should not have a 204 response"
+    );
+
+    // ListItems only supports 'more', a plain call works, so oneway does too
+    let list = &doc["paths"]["/call/com.example.test/com.example.test.ListItems"]["post"];
+    assert!(list["parameters"].is_array());
+    assert!(list["responses"]["204"].is_object());
+
     // response schema: GetItem does NOT support 'more', so no json-seq
     let resp_content = &post["responses"]["200"]["content"];
     assert!(
@@ -2577,6 +2606,108 @@ async fn test_integration_call_socket_rejects_query_param() {
     let res = client
         .post(format!(
             "http://{}/call/io.systemd.Hostname/io.systemd.Hostname.Describe",
+            server.addr,
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("failed to post to test server");
+    assert_eq!(res.status(), 200);
+}
+
+#[test_with::path(/run/varlink/registry/io.systemd.Journal)]
+#[tokio::test]
+async fn test_integration_call_oneway() {
+    let server = run_test_server("/run/varlink/registry").await;
+    let client = Client::new();
+
+    for url in [
+        "/call/io.systemd.Journal.Synchronize?oneway=true",
+        "/call/io.systemd.Journal/io.systemd.Journal.Synchronize?oneway=true",
+    ] {
+        let res = client
+            .post(format!("http://{}{url}", server.addr))
+            .json(&json!({"offline": false}))
+            .send()
+            .await
+            .expect("failed to post to test server");
+        assert_eq!(res.status(), 204, "{url}");
+        assert!(res.headers().get("content-type").is_none(), "{url}");
+        let body = res.bytes().await.expect("failed to read body");
+        assert!(body.is_empty(), "{url}: expected empty body, got {body:?}");
+    }
+
+    // Ensure the varlink connection is still usable immediately after
+    // oneway=true, i.e. that we are really not waiting for a reply in the
+    // bridge.
+    let res = client
+        .post(format!(
+            "http://{}/call/org.varlink.service.GetInfo?socket=io.systemd.Journal",
+            server.addr,
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("failed to post to test server");
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.expect("failed to parse body");
+    assert!(
+        body["interfaces"]
+            .as_array()
+            .is_some_and(|i| i.contains(&json!("io.systemd.Journal"))),
+        "unexpected GetInfo reply: {body}"
+    );
+}
+
+// rejected before anything reaches varlink, so any method will do
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_integration_call_oneway_rejects_more() {
+    let server = run_test_server("/run/systemd").await;
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "http://{}/call/io.systemd.Hostname.Describe?oneway=true",
+            server.addr,
+        ))
+        .header("Accept", "application/json-seq")
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("failed to post to test server");
+    assert_eq!(res.status(), 400);
+    let body: Value = res.json().await.expect("failed to parse body");
+    assert_eq!(
+        body["error"],
+        "?oneway=true cannot be combined with Accept: application/json-seq"
+    );
+}
+
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_integration_call_oneway_invalid_value() {
+    let server = run_test_server("/run/systemd").await;
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "http://{}/call/io.systemd.Hostname.Describe?oneway=yes",
+            server.addr,
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("failed to post to test server");
+    assert_eq!(res.status(), 400);
+    let body: Value = res.json().await.expect("failed to parse body");
+    assert_eq!(
+        body["error"],
+        "invalid value 'yes' for ?oneway=, expected 'true' or 'false'"
+    );
+
+    // an explicit false is a normal call
+    let res = client
+        .post(format!(
+            "http://{}/call/io.systemd.Hostname.Describe?oneway=false",
             server.addr,
         ))
         .json(&json!({}))

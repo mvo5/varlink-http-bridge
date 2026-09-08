@@ -806,24 +806,58 @@ fn varlink_call_to_jsonseq(
         .unwrap()
 }
 
-/// Call a varlink method on the given socket.
-///
-/// - Default: single JSON response via varlink `call`
-/// - `Accept: application/json-seq`: stream replies via varlink `more`
-///   as a JSON text sequence (RFC 7464)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallMode {
+    /// Regular call, one reply, returned as a JSON body.
+    Call,
+    /// `more` set, replies streamed as a JSON text sequence.
+    More,
+    /// `oneway` set, no reply, answered with `204 No Content`.
+    Oneway,
+}
+
+impl CallMode {
+    /// `?oneway=true` selects [`Self::Oneway`]
+    /// `Accept: application/json-seq` selects [`Self::More`]
+    /// They are mutally exclusive
+    fn from_request(
+        headers: &axum::http::HeaderMap,
+        params: &HashMap<String, String>,
+    ) -> Result<Self, AppError> {
+        let oneway = match params.get("oneway").map(String::as_str) {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(other) => {
+                return Err(AppError::bad_request(format!(
+                    "invalid value '{other}' for ?oneway=, expected 'true' or 'false'"
+                )));
+            }
+        };
+        let more = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|accept| accept.contains("application/json-seq"));
+
+        match (oneway, more) {
+            (true, true) => Err(AppError::bad_request(
+                "?oneway=true cannot be combined with Accept: application/json-seq",
+            )),
+            (true, false) => Ok(Self::Oneway),
+            (false, true) => Ok(Self::More),
+            (false, false) => Ok(Self::Call),
+        }
+    }
+}
+
+/// Call a varlink method on the given socket in the requested [`CallMode`].
 async fn call_varlink_method(
     socket: &str,
     method: &str,
     state: &AppState,
     conn_cache: &VarlinkConnCache,
-    headers: &axum::http::HeaderMap,
+    mode: CallMode,
     call_args: &HashMap<String, Value>,
 ) -> Result<Response, AppError> {
-    let accept = headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-
     let method_call = DynMethod {
         method,
         parameters: Some(call_args),
@@ -831,18 +865,25 @@ async fn call_varlink_method(
 
     let conn_arc = get_varlink_connection(socket, state, conn_cache).await?;
     let mut connection = conn_arc.lock_owned().await;
-    if accept.contains("application/json-seq") {
-        connection
-            .send_call(&zlink::Call::new(&method_call).set_more(true), vec![])
-            .await?;
-        Ok(varlink_call_to_jsonseq(connection))
-    } else {
-        connection
+    match mode {
+        CallMode::Oneway => {
+            connection
+                .send_call(&zlink::Call::new(&method_call).set_oneway(true), vec![])
+                .await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        CallMode::More => {
+            connection
+                .send_call(&zlink::Call::new(&method_call).set_more(true), vec![])
+                .await?;
+            Ok(varlink_call_to_jsonseq(connection))
+        }
+        CallMode::Call => connection
             .call_method::<_, DynReply, DynReplyError>(&method_call.into(), vec![])
             .await?
             .0
             .map(|r| r.into_parameters().unwrap_or_default().into_response())
-            .map_err(AppError::from)
+            .map_err(AppError::from),
     }
 }
 
@@ -871,8 +912,9 @@ async fn route_call_post(
             })?
             .to_string()
     };
+    let mode = CallMode::from_request(&headers, &params)?;
 
-    call_varlink_method(&socket, &method, &state, &conn_cache, &headers, &call_args).await
+    call_varlink_method(&socket, &method, &state, &conn_cache, mode, &call_args).await
 }
 
 /// Call a varlink method with the socket given explicitly in the path.
@@ -894,8 +936,9 @@ async fn route_call_socket_post(
             "?socket= is not supported here, the socket is already given in the path",
         ));
     }
+    let mode = CallMode::from_request(&headers, &params)?;
 
-    call_varlink_method(&socket, &method, &state, &conn_cache, &headers, &call_args).await
+    call_varlink_method(&socket, &method, &state, &conn_cache, mode, &call_args).await
 }
 
 async fn route_ws(

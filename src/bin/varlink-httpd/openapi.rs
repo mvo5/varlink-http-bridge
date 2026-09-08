@@ -141,6 +141,12 @@ const JSON_SEQ_NOTE: &str = "Streaming replies use the varlink 'more' flag: \
      request them with Accept: application/json-seq and each reply arrives as \
      an RFC 7464 JSON text sequence record (RS 0x1E + JSON + LF).";
 
+/// Description of the shared `?oneway=` query parameter.
+const ONEWAY_NOTE: &str = "Send the call with the varlink 'oneway' flag: the \
+     service suppresses its reply and the proxy answers 204 No Content as soon \
+     as the call is on the wire. Errors raised by the service, including an \
+     unknown method, are not reported.";
+
 pub fn idl_to_openapi(address: &str, iface: &Interface) -> Value {
     let mut paths = serde_json::Map::new();
 
@@ -157,6 +163,19 @@ pub fn idl_to_openapi(address: &str, iface: &Interface) -> Value {
         if let Some(desc) = comments_to_string(method.comments().filter(|c| !is_more_marker(c))) {
             operation.insert("description".to_string(), json!(desc));
         }
+        let output_schema = fields_to_schema(method.outputs());
+        let more_flag = method_more_flag(method);
+
+        // a oneway call to a method that requires `more` is rejected by the
+        // service with ExpectedMore, and oneway swallows that error, so the
+        // call can never do anything: do not advertise it
+        let oneway_possible = !matches!(more_flag, MoreFlag::Requires);
+        if oneway_possible {
+            operation.insert(
+                "parameters".to_string(),
+                json!([{"$ref": "#/components/parameters/oneway"}]),
+            );
+        }
         operation.insert(
             "requestBody".to_string(),
             json!({
@@ -168,9 +187,6 @@ pub fn idl_to_openapi(address: &str, iface: &Interface) -> Value {
                 }
             }),
         );
-        let output_schema = fields_to_schema(method.outputs());
-        let more_flag = method_more_flag(method);
-
         let mut content = serde_json::Map::new();
         if !matches!(more_flag, MoreFlag::Requires) {
             content.insert(
@@ -190,15 +206,18 @@ pub fn idl_to_openapi(address: &str, iface: &Interface) -> Value {
             _ => format!("Successful response\n\n{JSON_SEQ_NOTE}"),
         };
 
-        operation.insert(
-            "responses".to_string(),
-            json!({
-                "200": {
-                    "description": response_description,
-                    "content": Value::Object(content)
-                }
-            }),
-        );
+        let mut responses = json!({
+            "200": {
+                "description": response_description,
+                "content": Value::Object(content)
+            }
+        });
+        if oneway_possible {
+            responses["204"] = json!({
+                "description": "Call sent with the varlink 'oneway' flag, no reply is relayed"
+            });
+        }
+        operation.insert("responses".to_string(), responses);
 
         let path_item = json!({ "post": Value::Object(operation) });
         if paths.insert(path, path_item).is_some() {
@@ -255,9 +274,21 @@ pub fn idl_to_openapi(address: &str, iface: &Interface) -> Value {
 
     set_description(&mut doc["info"], comments_to_string(iface.comments()));
 
+    let mut components = json!({
+        "parameters": {
+            "oneway": {
+                "name": "oneway",
+                "in": "query",
+                "required": false,
+                "description": ONEWAY_NOTE,
+                "schema": {"type": "boolean", "default": false}
+            }
+        }
+    });
     if !schemas.is_empty() {
-        doc["components"] = json!({ "schemas": schemas });
+        components["schemas"] = Value::Object(schemas);
     }
+    doc["components"] = components;
 
     doc
 }

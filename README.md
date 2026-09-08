@@ -130,6 +130,12 @@ $ curl -s -X POST http://localhost:1031/call/org.varlink.service.GetInfo?socket=
   "version": "259 (259-1)"
 }
 
+# '?oneway=true' sets the varlink 'oneway' flag for fire-and-forget calls.
+# The bridge answers '204 No Content' as soon as the call is on the wire
+$ curl -s -o /dev/null -w '%{http_code}\n' -X POST -H "Content-Type: application/json" \
+    'http://localhost:1031/call/io.systemd.Journal.Synchronize?oneway=true' -d '{}'
+204
+
 # streaming methods use 'Accept: application/json-seq' (RFC 7464)
 $ curl -s -H "Accept: application/json-seq" -H "Content-Type: application/json" \
     http://localhost:1031/call/io.systemd.UserDatabase.GetUserRecord \
