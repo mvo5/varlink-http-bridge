@@ -2,7 +2,6 @@
 
 use super::*;
 use futures_util::{SinkExt, StreamExt};
-use gethostname::gethostname;
 use reqwest::Client;
 use std::os::fd::OwnedFd;
 use tokio::task::JoinSet;
@@ -133,7 +132,7 @@ async fn run_varlinkctl_call(
 }
 
 /// Assert a `varlinkctl` call succeeded and returned this hosts hostname.
-fn assert_hostname_reply(output: &std::process::Output) {
+fn assert_describe_reply(output: &std::process::Output) {
     let stderr = std::str::from_utf8(&output.stderr).unwrap();
     assert!(
         output.status.success(),
@@ -143,8 +142,14 @@ fn assert_hostname_reply(output: &std::process::Output) {
     let stdout = std::str::from_utf8(&output.stdout).unwrap();
     let line = stdout.trim_start_matches('\x1e');
     let body: Value = serde_json::from_str(line).expect("varlinkctl output not valid JSON");
-    let expected_hostname = gethostname().into_string().expect("failed to get hostname");
-    assert_eq!(body["Hostname"], expected_hostname);
+    assert_eq!(body["KernelRelease"], expected_kernel_release());
+}
+
+fn expected_kernel_release() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .expect("failed to read kernel release")
+        .trim()
+        .to_string()
 }
 
 async fn run_test_server(varlink_sockets_path: &str) -> TestServer<std::net::SocketAddr> {
@@ -270,7 +275,13 @@ async fn test_integration_real_systemd_socket_interface_get() {
         .expect("failed to get from test server");
     assert_eq!(res.status(), 200);
     let body: Value = res.json().await.expect("varlink body invalid");
-    assert_eq!(body.get("method_names").unwrap(), &json!(["Describe"]));
+    // the full list grows with systemd releases, Describe has always been there
+    assert!(
+        body["method_names"]
+            .as_array()
+            .is_some_and(|m| m.contains(&json!("Describe"))),
+        "unexpected methods: {body}"
+    );
 }
 
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
@@ -298,15 +309,18 @@ async fn test_integration_real_systemd_hostname_parallel() {
             assert_eq!(res.status(), 200);
             let body: Value = res.json().await.expect("varlink body invalid");
 
-            body["Hostname"].as_str().unwrap_or_default().to_string()
+            body["KernelRelease"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
         });
     }
-    let expected_hostname = gethostname().into_string().expect("failed to get hostname");
+    let expected = expected_kernel_release();
 
     let mut count = 0;
     while let Some(res) = set.join_next().await {
-        let hostname = res.expect("client task to collect results panicked");
-        assert_eq!(expected_hostname, hostname);
+        let kernel_release = res.expect("client task to collect results panicked");
+        assert_eq!(expected, kernel_release);
         count += 1;
     }
     assert_eq!(count, NUM_TASKS);
@@ -659,8 +673,10 @@ async fn test_ws_hostname_describe() {
     let body: Value = serde_json::from_slice(json_bytes).expect("response not valid JSON");
 
     // raw varlink protocol wraps responses in "parameters"
-    let expected_hostname = gethostname().into_string().expect("failed to get hostname");
-    assert_eq!(body["parameters"]["Hostname"], expected_hostname);
+    assert_eq!(
+        body["parameters"]["KernelRelease"],
+        expected_kernel_release()
+    );
 }
 
 /// A stub varlink socket, so that the close handshake tests do not
@@ -874,8 +890,7 @@ async fn test_jsonseq_hostname_describe() {
         1,
         "expected 1 json-seq record, got {records:#?}"
     );
-    let expected_hostname = gethostname().into_string().expect("failed to get hostname");
-    assert_eq!(records[0]["Hostname"], expected_hostname);
+    assert_eq!(records[0]["KernelRelease"], expected_kernel_release());
 }
 
 #[test_with::path(/run/systemd/userdb/io.systemd.Multiplexer)]
@@ -931,7 +946,7 @@ async fn test_varlinkctl_helper_hostname_describe() {
         &[],
     )
     .await;
-    assert_hostname_reply(&output);
+    assert_describe_reply(&output);
 
     // an incomplete close handshake still delivers the reply, it only
     // shows up as a warning from the helper
@@ -1386,7 +1401,7 @@ async fn test_varlinkctl_helper_mtls_hostname_describe() {
         &[("XDG_CONFIG_HOME", fake_xdg_home.path())],
     )
     .await;
-    assert_hostname_reply(&output);
+    assert_describe_reply(&output);
 }
 
 #[test_with::executable(openssl)]
@@ -1649,7 +1664,7 @@ async fn test_varlinkctl_helper_vsock_hostname_describe() {
         &[],
     )
     .await;
-    assert_hostname_reply(&output);
+    assert_describe_reply(&output);
 }
 
 // --- unused credential reporting tests ---
@@ -2577,7 +2592,7 @@ mod sshauth_tests {
             ],
         )
         .await;
-        assert_hostname_reply(&output);
+        assert_describe_reply(&output);
     }
 } // mod sshauth_tests
 
