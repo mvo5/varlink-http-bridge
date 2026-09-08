@@ -1701,12 +1701,11 @@ fn parse_import_ssh_args(parser: &mut lexopt::Parser) -> anyhow::Result<Command>
     Ok(Command::ImportSsh(import_ssh::ImportSsh { source, output }))
 }
 
-/// Credentials present in `creds_dir` that this configuration never reads,
-/// paired with what would make them count.
+/// Credentials present in `creds_dir` that are unused due to flag usage.
 ///
-/// Enabling a mechanism from the mere presence of a credential would mean one
-/// that fails to show up silently drops it, so the flags decide and provisioned
-/// material can go unread. That is easy to mistake for having taken effect.
+/// Credentials don't enable mechanisms implicitly, and concrete flag values
+/// take precedence over credentials. The returned list contains unused credentials
+/// and why they aren't used so we can warn about potential misconfiguration.
 fn unread_credentials(creds_dir: &std::path::Path, cli: &BridgeCli) -> Vec<(String, &'static str)> {
     let mut unread = Vec::new();
 
