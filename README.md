@@ -12,30 +12,32 @@ in the dir as needed.
 ## URL Schema
 
 ```
-POST /call/{method}                    → invoke method (c.f. varlink call, supports ?socket=)
-POST /call/{socket}/{method}           → invoke method on an explicitly given socket
-GET  /sockets                          → list available sockets (c.f. valinkctl list-registry)
-GET  /sockets/{socket}                 → socket info (c.f. varlinkctl info)
-GET  /sockets/{socket}/{interface}     → interface details, including method names (c.f. varlinkctl list-methods)
-GET  /openapi/{socket}/{interface}     → OpenAPI 3.1 description generated from varlink IDL
+POST /call/{method}                    → invoke method (c.f. varlink call, supports ?service=)
+POST /call/{service}/{method}          → invoke method on an explicitly given service
+GET  /services                         → list available services (c.f. valinkctl list-registry)
+GET  /services/{service}               → service info (c.f. varlinkctl info)
+GET  /services/{service}/{interface}   → interface details, including method names (c.f. varlinkctl list-methods)
+GET  /openapi/{service}/{interface}    → OpenAPI 3.1 description generated from varlink IDL
+                                         (bridge-specific extension, not part of the spec)
 
 GET  /health                           → health check
 ```
 
-For `/call/{method}`, the socket is derived from the method name by
+For `/call/{method}`, the service is derived from the method name by
 stripping the last `.Component` (e.g. `io.systemd.Hostname.Describe`
-connects to socket `io.systemd.Hostname`). The `?socket=` query
+connects to service `io.systemd.Hostname`). The `?service=` query
 parameter overrides this for cross-interface calls, e.g. to call
-`io.systemd.service.SetLogLevel` on the `io.systemd.Hostname` socket.
-The `/call/{socket}/{method}` form makes the socket explicit instead;
+`io.systemd.service.SetLogLevel` on the `io.systemd.Hostname` service.
+The `/call/{service}/{method}` form makes the service explicit instead;
 this is the form the generated OpenAPI descriptions use.
 
-For `/call` the parameters are POSTed as regular JSON.
+For `/call` the parameters are POSTed as regular JSON; an empty body is
+accepted as `{}`.
 
 ### Websocket support
 
 ```
-GET  /ws/sockets/{socket}              → transparent varlink-over-websocket proxy
+GET  /ws/services/{service}            → transparent varlink-over-websocket bridge
 ```
 
 The websocket endpoint is a transparent proxy that forwards raw bytes
@@ -63,9 +65,9 @@ This mode is NOT SECURE! See below how to set up authentication.
 ```console
 $ systemd-run --user ./target/debug/varlink-httpd --insecure
 
-$ curl -s http://localhost:1031/sockets | jq
+$ curl -s http://localhost:1031/services | jq
 {
-  "sockets": [
+  "services": [
     "io.systemd.AskPassword",
     "io.systemd.BootControl",
     "io.systemd.Credentials",
@@ -92,7 +94,7 @@ $ curl -s http://localhost:1031/sockets | jq
   ]
 }
 
-$ curl -s http://localhost:1031/sockets/io.systemd.Hostname | jq
+$ curl -s http://localhost:1031/services/io.systemd.Hostname | jq
 {
   "interfaces": [
     "io.systemd",
@@ -106,9 +108,9 @@ $ curl -s http://localhost:1031/sockets/io.systemd.Hostname | jq
   "version": "259 (259-1)"
 }
 
-$ curl -s http://localhost:1031/sockets/io.systemd.Hostname/io.systemd.Hostname | jq
+$ curl -s http://localhost:1031/services/io.systemd.Hostname/io.systemd.Hostname | jq
 {
-  "method_names": [
+  "methods": [
     "Describe"
   ]
 }
@@ -116,7 +118,7 @@ $ curl -s http://localhost:1031/sockets/io.systemd.Hostname/io.systemd.Hostname 
 $ curl -s -X POST http://localhost:1031/call/io.systemd.Hostname.Describe -d '{}' -H "Content-Type: application/json" | jq .StaticHostname
 "myhost"
 
-$ curl -s -X POST http://localhost:1031/call/org.varlink.service.GetInfo?socket=io.systemd.Hostname -d '{}' -H "Content-Type: application/json" | jq
+$ curl -s -X POST http://localhost:1031/call/org.varlink.service.GetInfo?service=io.systemd.Hostname -d '{}' -H "Content-Type: application/json" | jq
 {
   "interfaces": [
     "io.systemd",
@@ -160,11 +162,11 @@ This can be done automatically by `just install_client`.
 Alternatively, `$SYSTEMD_VARLINK_BRIDGES_DIR` can be set if permanent installation is not desired.
 
 ```console
-$ varlinkctl introspect http://localhost:1031/ws/sockets/io.systemd.Hostname
+$ varlinkctl introspect http://localhost:1031/ws/services/io.systemd.Hostname
 interface io.systemd
 ...
 
-$ varlinkctl call http://localhost:1031/ws/sockets/io.systemd.Hostname io.systemd.Hostname.Describe {}
+$ varlinkctl call http://localhost:1031/ws/services/io.systemd.Hostname io.systemd.Hostname.Describe {}
 {
         "Hostname" : "myhost",
 ...
@@ -182,7 +184,7 @@ $ cargo install websocat
 # call via websocat: note that this is the raw procotol so the result is wrapped in "parameters"
 # note that the reply also contains the raw \0 so we filter them
 $ printf '{"method":"io.systemd.Hostname.Describe","parameters":{}}\0' | \
-    websocat ws://localhost:1031/ws/sockets/io.systemd.Hostname | tr -d '\0' | jq
+    websocat ws://localhost:1031/ws/services/io.systemd.Hostname | tr -d '\0' | jq
 {
   "parameters": {
     "Hostname": "myhost",
@@ -190,7 +192,7 @@ $ printf '{"method":"io.systemd.Hostname.Describe","parameters":{}}\0' | \
 
 # io.systemd.Unit.List streams the output
 $ printf '{"method":"io.systemd.Unit.List","parameters":{}, "more": true}\0' | \
-    websocat  --no-close  ws://localhost:1031/ws/sockets/io.systemd.Manager | tr -d '\0' | jq
+    websocat  --no-close  ws://localhost:1031/ws/services/io.systemd.Manager | tr -d '\0' | jq
 {
   "parameters": {
     "context": {
@@ -199,7 +201,7 @@ $ printf '{"method":"io.systemd.Unit.List","parameters":{}, "more": true}\0' | \
 
 # and user records come via "continues": true
 $ printf '{"method":"io.systemd.UserDatabase.GetUserRecord", "parameters": {"service":"io.systemd.Multiplexer"}, "more": true}\0' | \
-    websocat --no-close ws://localhost:1031/ws/sockets/io.systemd.UserDatabase | tr '\0' '\n' | jq
+    websocat --no-close ws://localhost:1031/ws/services/io.systemd.UserDatabase | tr '\0' '\n' | jq
 {
   "parameters": {
     "record": {
@@ -209,17 +211,17 @@ $ printf '{"method":"io.systemd.UserDatabase.GetUserRecord", "parameters": {"ser
 ...
 
 # varlinkctl is supported via our varlinkctl-http
-$ VARLINK_BRIDGE_URL=http://localhost:1031/ws/sockets/io.systemd.UserDatabase \
+$ VARLINK_BRIDGE_URL=http://localhost:1031/ws/services/io.systemd.UserDatabase \
     varlinkctl call --more /usr/libexec/varlinkctl-http \
 	io.systemd.UserDatabase.GetUserRecord '{"service":"io.systemd.Multiplexer"}'
 
 # libvarlink bridge mode gives full varlink CLI support over the network
-$ varlink --bridge "websocat --binary ws://localhost:1031/ws/sockets/io.systemd.Hostname" info
+$ varlink --bridge "websocat --binary ws://localhost:1031/ws/services/io.systemd.Hostname" info
 Vendor: The systemd Project
 Product: systemd (systemd-hostnamed)
 ...
 
-$ varlink --bridge "websocat --binary ws://localhost:1031/ws/sockets/io.systemd.Hostname" \
+$ varlink --bridge "websocat --binary ws://localhost:1031/ws/services/io.systemd.Hostname" \
     call io.systemd.Hostname.Describe
 {
   "Hostname": "myhost",
@@ -372,7 +374,7 @@ $ cp client-cert.pem ~/.config/varlinkctl-http/client-cert-file
 $ cp client-key.pem  ~/.config/varlinkctl-http/client-key-file
 $ cp ca.pem          ~/.config/varlinkctl-http/server-ca-file
 
-$ VARLINK_BRIDGE_URL=https://myhost:1031/ws/sockets/io.systemd.Hostname \
+$ VARLINK_BRIDGE_URL=https://myhost:1031/ws/services/io.systemd.Hostname \
     varlinkctl call exec:/usr/libexec/varlinkctl-http \
     io.systemd.Hostname.Describe '{}'
 ```
@@ -503,7 +505,7 @@ only an `--insecure` server.
 $ varlink-httpd --auth=ssh --bind=vsock --authorized-keys ~/.ssh/authorized_keys
 
 # Client (on the host):
-$ varlinkctl call vsock+tls://3/ws/sockets/io.systemd.Hostname \
+$ varlinkctl call vsock+tls://3/ws/services/io.systemd.Hostname \
     io.systemd.Hostname.Describe '{}'
 ```
 
@@ -523,7 +525,7 @@ $ varlink-httpd --auth=none --bind=vsock \
 Client (on the host), using `vsock+tls://`:
 
 ```console
-$ varlinkctl call vsock+tls://3/ws/sockets/io.systemd.Hostname \
+$ varlinkctl call vsock+tls://3/ws/services/io.systemd.Hostname \
     io.systemd.Hostname.Describe '{}'
 ```
 

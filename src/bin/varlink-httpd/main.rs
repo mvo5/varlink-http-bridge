@@ -937,11 +937,11 @@ impl InterfaceIdl {
 
 async fn route_openapi_get(
     ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
-    Path((socket, interface)): Path<(String, String)>,
+    Path((service, interface)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
-    debug!("GET openapi for socket: {socket}, interface: {interface}");
-    let idl = InterfaceIdl::fetch(&socket, &interface, &state, &conn_cache).await?;
+    debug!("GET openapi for service: {service}, interface: {interface}");
+    let idl = InterfaceIdl::fetch(&service, &interface, &state, &conn_cache).await?;
     let iface = idl.parse()?;
 
     // the title and every generated path come from the returned description,
@@ -954,22 +954,22 @@ async fn route_openapi_get(
         )));
     }
 
-    Ok(axum::Json(openapi::idl_to_openapi(&socket, &iface)))
+    Ok(axum::Json(openapi::idl_to_openapi(&service, &iface)))
 }
 
-async fn route_sockets_get(State(state): State<AppState>) -> Result<axum::Json<Value>, AppError> {
-    debug!("GET sockets");
-    let all_sockets = state.varlink_sockets.list_sockets().await?;
-    Ok(axum::Json(json!({"sockets": all_sockets})))
+async fn route_services_get(State(state): State<AppState>) -> Result<axum::Json<Value>, AppError> {
+    debug!("GET services");
+    let services = state.varlink_sockets.list_sockets().await?;
+    Ok(axum::Json(json!({"services": services})))
 }
 
-async fn route_socket_get(
+async fn route_service_get(
     ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
-    Path(socket): Path<String>,
+    Path(service): Path<String>,
     State(state): State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
-    debug!("GET socket: {socket}");
-    let conn_arc = get_varlink_connection(&socket, &state, &conn_cache).await?;
+    debug!("GET service: {service}");
+    let conn_arc = get_varlink_connection(&service, &state, &conn_cache).await?;
     let mut connection = conn_arc.lock().await;
 
     let info = connection
@@ -979,17 +979,17 @@ async fn route_socket_get(
     Ok(axum::Json(serde_json::to_value(info)?))
 }
 
-async fn route_socket_interface_get(
+async fn route_service_interface_get(
     ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
-    Path((socket, interface)): Path<(String, String)>,
+    Path((service, interface)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
-    debug!("GET socket: {socket}, interface: {interface}");
-    let idl = InterfaceIdl::fetch(&socket, &interface, &state, &conn_cache).await?;
+    debug!("GET service: {service}, interface: {interface}");
+    let idl = InterfaceIdl::fetch(&service, &interface, &state, &conn_cache).await?;
     let iface = idl.parse()?;
 
-    let method_names: Vec<&str> = iface.methods().map(zlink::idl::Method::name).collect();
-    Ok(axum::Json(json!({"method_names": method_names})))
+    let methods: Vec<&str> = iface.methods().map(zlink::idl::Method::name).collect();
+    Ok(axum::Json(json!({"methods": methods})))
 }
 
 /// Stream varlink `more` replies as a JSON text sequence (RFC 7464).
@@ -1069,56 +1069,68 @@ async fn call_varlink_method(
     }
 }
 
-/// Call a varlink method, deriving the socket from the method's
-/// interface prefix unless overridden via `?socket=`.
+/// The request body is the call's parameter object; the spec asks bridges
+/// to accept an empty body as `{}`.
+fn parse_call_args(body: &[u8]) -> Result<HashMap<String, Value>, AppError> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(HashMap::new());
+    }
+    serde_json::from_slice(body)
+        .map_err(|e| AppError::bad_request(format!("invalid JSON request body: {e}")))
+}
+
+/// Call a varlink method, deriving the service from the method's
+/// interface prefix unless overridden via `?service=`.
 async fn route_call_post(
     ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
     Path(method): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    axum::Json(call_args): axum::Json<HashMap<String, Value>>,
+    body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
     debug!("POST call for method: {method}, params: {params:#?}");
+    let call_args = parse_call_args(&body)?;
 
-    let socket = if let Some(socket) = params.get("socket") {
-        socket.clone()
+    let service = if let Some(service) = params.get("service") {
+        service.clone()
     } else {
         method
             .rsplit_once('.')
             .map(|x| x.0)
             .ok_or_else(|| {
                 AppError::bad_request(format!(
-                    "cannot derive socket from method '{method}': no dots in name"
+                    "cannot derive service from method '{method}': no dots in name"
                 ))
             })?
             .to_string()
     };
 
-    call_varlink_method(&socket, &method, &state, &conn_cache, &headers, &call_args).await
+    call_varlink_method(&service, &method, &state, &conn_cache, &headers, &call_args).await
 }
 
-/// Call a varlink method with the socket given explicitly in the path.
+/// Call a varlink method with the service given explicitly in the path.
 /// This is the form the generated `OpenAPI` documents use.
-async fn route_call_socket_post(
+async fn route_call_service_post(
     ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
-    Path((socket, method)): Path<(String, String)>,
+    Path((service, method)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    axum::Json(call_args): axum::Json<HashMap<String, Value>>,
+    body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
-    debug!("POST call for socket: {socket}, method: {method}");
+    debug!("POST call for service: {service}, method: {method}");
+    let call_args = parse_call_args(&body)?;
 
-    // `?socket=` is the override for the other /call route and has no meaning
+    // `?service=` is the override for the other /call route and has no meaning
     // here; accepting it would suggest it does something
-    if params.contains_key("socket") {
+    if params.contains_key("service") {
         return Err(AppError::bad_request(
-            "?socket= is not supported here, the socket is already given in the path",
+            "?service= is not supported here, the service is already given in the path",
         ));
     }
 
-    call_varlink_method(&socket, &method, &state, &conn_cache, &headers, &call_args).await
+    call_varlink_method(&service, &method, &state, &conn_cache, &headers, &call_args).await
 }
 
 async fn route_ws(
@@ -1267,16 +1279,17 @@ fn create_router(
 
     // API routes behind auth middleware
     let api = Router::new()
-        .route("/sockets", get(route_sockets_get))
-        .route("/sockets/{socket}", get(route_socket_get))
+        .route("/services", get(route_services_get))
+        .route("/services/{service}", get(route_service_get))
         .route(
-            "/sockets/{socket}/{interface}",
-            get(route_socket_interface_get),
+            "/services/{service}/{interface}",
+            get(route_service_interface_get),
         )
-        .route("/openapi/{socket}/{interface}", get(route_openapi_get))
+        // not part of the UAPI spec, a bridge-specific extension
+        .route("/openapi/{service}/{interface}", get(route_openapi_get))
         .route("/call/{method}", post(route_call_post))
-        .route("/call/{socket}/{method}", post(route_call_socket_post))
-        .route("/ws/sockets/{socket}", get(route_ws))
+        .route("/call/{service}/{method}", post(route_call_service_post))
+        .route("/ws/services/{service}", get(route_ws))
         .layer(axum::middleware::from_fn_with_state(
             shared_state.clone(),
             auth_middleware,

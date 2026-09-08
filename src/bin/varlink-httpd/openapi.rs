@@ -150,7 +150,7 @@ pub fn idl_to_openapi(address: &str, iface: &Interface) -> Value {
 
         let mut operation = serde_json::Map::new();
         // the fully qualified name stays unique when documents for several
-        // interfaces of one socket are fed to a single codegen run
+        // interfaces of one service are fed to a single codegen run
         operation.insert("operationId".to_string(), json!(full_method));
         // the marker lines are a varlink-side convention; over HTTP the same
         // information is already carried by the response content types
