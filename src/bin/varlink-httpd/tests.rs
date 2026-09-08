@@ -699,6 +699,148 @@ fn run_stub_varlink_socket(keep_open: bool) -> StubVarlinkSocket {
     }
 }
 
+/// A scripted varlink service: records every call it receives and answers
+/// each with the next batch of raw replies, so both directions of the wire
+/// encoding can be checked without a real service.
+struct ScriptedVarlinkSocket {
+    stub: StubVarlinkSocket,
+    received: Arc<std::sync::Mutex<Vec<Value>>>,
+}
+
+fn run_scripted_varlink_socket(reply_batches: Vec<Vec<&'static str>>) -> ScriptedVarlinkSocket {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
+    let path = tmpdir.path().join("io.test.Stub");
+    let listener = tokio::net::UnixListener::bind(&path).expect("failed to bind stub socket");
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let batches = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+        reply_batches,
+    )));
+
+    let handle = tokio::spawn({
+        let received = Arc::clone(&received);
+        async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let received = Arc::clone(&received);
+                let batches = Arc::clone(&batches);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = match conn.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                        while let Some(pos) = buf.iter().position(|&b| b == 0) {
+                            let msg: Vec<u8> = buf.drain(..=pos).collect();
+                            let call: Value = serde_json::from_slice(&msg[..msg.len() - 1])
+                                .expect("stub received invalid JSON");
+                            received.lock().unwrap().push(call);
+                            let batch = batches.lock().unwrap().pop_front().unwrap_or_default();
+                            for reply in batch {
+                                conn.write_all(reply.as_bytes()).await.unwrap();
+                                conn.write_all(b"\0").await.unwrap();
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    ScriptedVarlinkSocket {
+        stub: StubVarlinkSocket {
+            _tmpdir: tmpdir,
+            path,
+            handle,
+        },
+        received,
+    }
+}
+
+async fn stub_call(
+    server: &TestServer<std::net::SocketAddr>,
+    body: Value,
+    json_seq: bool,
+) -> reqwest::Response {
+    let mut req = Client::new()
+        .post(format!("http://{}/call/io.test.Stub.Ping", server.addr))
+        .json(&body);
+    if json_seq {
+        req = req.header("Accept", "application/json-seq");
+    }
+    req.send().await.expect("failed to post to test server")
+}
+
+// The spec allows a service to encode "no parameters" as an absent member,
+// null or {}; over HTTP the body is always {}.
+#[tokio::test]
+async fn test_call_reply_without_parameters_is_empty_object() {
+    let stub = run_scripted_varlink_socket(vec![
+        vec![r#"{}"#],
+        vec![r#"{"parameters":null}"#],
+        vec![r#"{"parameters":{}}"#],
+    ]);
+    let server = run_test_server(stub.stub.path.to_str().unwrap()).await;
+
+    for _ in 0..3 {
+        let res = stub_call(&server, json!({}), false).await;
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.text().await.unwrap(), "{}");
+    }
+}
+
+#[tokio::test]
+async fn test_jsonseq_reply_without_parameters_is_empty_object() {
+    let stub = run_scripted_varlink_socket(vec![vec![
+        r#"{"parameters":{"n":1},"continues":true}"#,
+        r#"{"parameters":null,"continues":true}"#,
+        r#"{}"#,
+    ]]);
+    let server = run_test_server(stub.stub.path.to_str().unwrap()).await;
+
+    let res = stub_call(&server, json!({}), true).await;
+    assert_eq!(res.status(), 200);
+    let body = res.bytes().await.unwrap();
+    assert_eq!(
+        parse_json_seq(&body),
+        vec![json!({"n": 1}), json!({}), json!({})]
+    );
+}
+
+#[tokio::test]
+async fn test_jsonseq_error_without_parameters_is_empty_object() {
+    let stub = run_scripted_varlink_socket(vec![vec![r#"{"error":"io.test.Stub.Failed"}"#]]);
+    let server = run_test_server(stub.stub.path.to_str().unwrap()).await;
+
+    let res = stub_call(&server, json!({}), true).await;
+    assert_eq!(res.status(), 200);
+    let body = res.bytes().await.unwrap();
+    assert_eq!(
+        parse_json_seq(&body),
+        vec![json!({"error": "io.test.Stub.Failed", "parameters": {}})]
+    );
+}
+
+// The spec asks senders to omit `parameters` rather than send {} or null.
+#[tokio::test]
+async fn test_call_omits_empty_parameters() {
+    let stub = run_scripted_varlink_socket(vec![vec![r#"{}"#], vec![r#"{}"#]]);
+    let server = run_test_server(stub.stub.path.to_str().unwrap()).await;
+
+    stub_call(&server, json!({}), false).await;
+    stub_call(&server, json!({"a": 1}), false).await;
+
+    let received = stub.received.lock().unwrap();
+    assert_eq!(received[0], json!({"method": "io.test.Stub.Ping"}));
+    assert_eq!(
+        received[1],
+        json!({"method": "io.test.Stub.Ping", "parameters": {"a": 1}})
+    );
+}
+
 async fn connect_stub_ws(stub: &StubVarlinkSocket) -> (TestServer<std::net::SocketAddr>, WsStream) {
     let server = run_test_server(stub.path.to_str().expect("stub path not utf8")).await;
     let url = format!("ws://{}/ws/sockets/io.test.Stub", server.addr);

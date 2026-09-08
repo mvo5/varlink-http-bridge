@@ -132,6 +132,8 @@ impl From<serde_json::Error> for AppError {
 #[derive(Debug, Serialize)]
 struct DynMethod<'m> {
     method: &'m str,
+    // the spec asks senders to omit `parameters` rather than send `{}` or null
+    #[serde(skip_serializing_if = "Option::is_none")]
     parameters: Option<&'m HashMap<String, Value>>,
 }
 
@@ -139,9 +141,19 @@ struct DynMethod<'m> {
 #[derive(Debug, Default, Deserialize)]
 struct DynReply<'r>(#[serde(borrow)] Option<HashMap<&'r str, Value>>);
 
+impl<'r> DynReply<'r> {
+    /// A service may encode "no parameters" as an absent member, `null` or
+    /// `{}`. The HTTP body is the unwrapped parameters object itself, so
+    /// there is no member to omit and `{}` is the only representation that
+    /// is still an object (see the spec's HTTP section).
+    fn into_parameters(self) -> HashMap<&'r str, Value> {
+        self.0.unwrap_or_default()
+    }
+}
+
 impl IntoResponse for DynReply<'_> {
     fn into_response(self) -> Response {
-        axum::Json(self.0).into_response()
+        axum::Json(self.into_parameters()).into_response()
     }
 }
 
@@ -1004,9 +1016,14 @@ fn varlink_call_to_jsonseq(
             match conn.receive_reply::<Value, DynReplyError>().await {
                 Ok((reply, _fds)) => {
                     let continues = reply.as_ref().is_ok_and(|r| r.continues().unwrap_or(false));
+                    // same normalisation as DynReply: no parameters is `{}`
                     let json_str = match reply {
-                        Ok(r) => serde_json::to_string(&r.into_parameters()).unwrap_or_default(),
-                        Err(e) => json!({"error": e.error, "parameters": e.parameters}).to_string(),
+                        Ok(r) => r.into_parameters().unwrap_or_else(|| json!({})).to_string(),
+                        Err(e) => json!({
+                            "error": e.error,
+                            "parameters": e.parameters.unwrap_or_default(),
+                        })
+                        .to_string(),
                     };
                     yield Ok::<_, std::convert::Infallible>(
                         format!("\x1e{json_str}\n"),
@@ -1049,7 +1066,7 @@ async fn call_varlink_method(
 
     let method_call = DynMethod {
         method,
-        parameters: Some(call_args),
+        parameters: (!call_args.is_empty()).then_some(call_args),
     };
 
     let conn_arc = get_varlink_connection(socket, state, conn_cache).await?;
