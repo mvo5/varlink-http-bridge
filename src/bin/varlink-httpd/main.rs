@@ -1029,6 +1029,14 @@ fn varlink_call_to_jsonseq(
         .unwrap()
 }
 
+fn wants_json_seq(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get_all(axum::http::header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.contains("application/json-seq"))
+}
+
 /// Call a varlink method on the given socket.
 ///
 /// - Default: single JSON response via varlink `call`
@@ -1042,11 +1050,6 @@ async fn call_varlink_method(
     headers: &axum::http::HeaderMap,
     call_args: &HashMap<String, Value>,
 ) -> Result<Response, AppError> {
-    let accept = headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-
     let method_call = DynMethod {
         method,
         parameters: Some(call_args),
@@ -1054,7 +1057,7 @@ async fn call_varlink_method(
 
     let conn_arc = get_varlink_connection(socket, state, conn_cache).await?;
     let mut connection = conn_arc.lock_owned().await;
-    if accept.contains("application/json-seq") {
+    if wants_json_seq(headers) {
         connection
             .send_call(&zlink::Call::new(&method_call).set_more(true), vec![])
             .await?;
