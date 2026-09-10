@@ -501,6 +501,15 @@ struct TrustCache {
     cas: Vec<openssl::x509::X509>,
 }
 
+/// Read the CA certificates in `path`. Errors carry no path context, callers
+/// name the file themselves.
+///
+/// An `Ok` empty vector means the file parsed but held no certificate.
+fn read_client_cas(path: &std::path::Path) -> anyhow::Result<Vec<openssl::x509::X509>> {
+    let pem = std::fs::read(path)?;
+    Ok(openssl::x509::X509::stack_from_pem(&pem)?)
+}
+
 impl ClientTrust {
     fn new(path: Option<&str>) -> Self {
         let trust = Self {
@@ -528,9 +537,9 @@ impl ClientTrust {
         trust
     }
 
-    /// Re-read the CA file when its mtime changed. A file that cannot be read
-    /// or parsed keeps the previous CAs and leaves the mtime alone, so the
-    /// next connection retries; a file that is gone drops them.
+    /// Re-read the CA file when its mtime changed. Removing the file drops the CAs.
+    /// An unparseable or empty file keeps the previous CAs and leaves the mtime untouched
+    /// so the next connection retries.
     fn maybe_reload(&self) {
         let Some(path) = self.path.as_deref() else {
             return;
@@ -563,28 +572,19 @@ impl ClientTrust {
             return;
         };
 
-        match std::fs::read(path)
-            .map_err(anyhow::Error::from)
-            .and_then(|pem| Ok(openssl::x509::X509::stack_from_pem(&pem)?))
-        {
-            Ok(cas) if cas.is_empty() => {
-                warn!(
-                    "no certificates in {}, mTLS will reject every client",
-                    path.display()
-                );
-                *cache = TrustCache {
-                    mtime: Some(mtime),
-                    cas,
-                };
-            }
-            Ok(cas) => {
+        match read_client_cas(path) {
+            Ok(cas) if !cas.is_empty() => {
                 info!("loaded {} client CA(s) from {}", cas.len(), path.display());
                 *cache = TrustCache {
                     mtime: Some(mtime),
                     cas,
                 };
             }
-            // Leave mtime untouched so the next connection tries again.
+            Ok(_) => warn!(
+                "empty or corrupt certificate file {}, keeping cached client CAs \
+                 (remove the file to withdraw trust)",
+                path.display()
+            ),
             Err(e) => warn!(
                 "cannot load {}: {e:#}, keeping cached client CAs",
                 path.display()
@@ -1630,6 +1630,14 @@ fn parse_cli() -> anyhow::Result<Command> {
         }
     }
 
+    if let Some(path) = trust.as_deref() {
+        let cas = read_client_cas(std::path::Path::new(path))
+            .with_context(|| format!("--trust={path}"))?;
+        if cas.is_empty() {
+            bail!("--trust={path} holds no certificate");
+        }
+    }
+
     let auth = match auth {
         Some(auth) if insecure && auth != [AuthMechanism::None] => bail!(
             "--insecure runs without authentication and can't be combined with --auth={}",
@@ -1693,29 +1701,51 @@ fn parse_import_ssh_args(parser: &mut lexopt::Parser) -> anyhow::Result<Command>
     Ok(Command::ImportSsh(import_ssh::ImportSsh { source, output }))
 }
 
-/// Credentials present in `creds_dir` that this configuration never reads,
-/// paired with what would make them count.
+/// Warns about credentials present in `creds_dir` that are unused due to flag
+/// usage, or `None` when every credential present is read.
 ///
-/// Enabling a mechanism from the mere presence of a credential would mean one
-/// that fails to show up silently drops it, so the flags decide and provisioned
-/// material can go unread. That is easy to mistake for having taken effect.
-#[cfg_attr(not(feature = "sshauth"), allow(unused_variables))]
-fn unread_credentials(
-    creds_dir: &std::path::Path,
-    insecure: bool,
-    require_mtls: bool,
-    auth: &[AuthMechanism],
-    authorized_keys: Option<&str>,
-) -> Vec<(String, &'static str)> {
-    let mut unread = Vec::new();
+/// Credentials don't enable mechanisms implicitly, and concrete flag values
+/// take precedence over credentials. The warning names the unused credentials
+/// and why they aren't used so we can point at potential misconfiguration.
+fn unread_credentials_warning(creds_dir: &std::path::Path, cli: &BridgeCli) -> Option<String> {
+    let mut unread: Vec<String> = Vec::new();
 
-    for (name, read, why) in [
-        ("cert", !insecure, "--insecure serves plain HTTP"),
-        ("key", !insecure, "--insecure serves plain HTTP"),
-        ("trust", require_mtls, "pass --require-mtls to enable mTLS"),
+    for (name, read, why, explicit) in [
+        (
+            "cert",
+            !cli.insecure,
+            "--insecure serves plain HTTP",
+            cli.cert.is_some(),
+        ),
+        (
+            "key",
+            !cli.insecure,
+            "--insecure serves plain HTTP",
+            cli.key.is_some(),
+        ),
+        (
+            "trust",
+            cli.require_mtls,
+            if cli.insecure {
+                "--insecure serves plain HTTP"
+            } else {
+                "pass --require-mtls to enable mTLS"
+            },
+            cli.trust.is_some(),
+        ),
     ] {
-        if !read && creds_dir.join(name).exists() {
-            unread.push((name.to_string(), why));
+        if !creds_dir.join(name).exists() {
+            continue;
+        }
+        let why = if !read {
+            Some(why)
+        } else if explicit {
+            Some("an explicit path takes priority")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            unread.push(format!("{name} ({why})"));
         }
     }
 
@@ -1723,9 +1753,9 @@ fn unread_credentials(
     {
         // An explicit --authorized-keys= replaces discovery rather than adding
         // to it, so it hides credentials even when ssh auth is selected.
-        let why = if authorized_keys.is_some() {
+        let why = if cli.authorized_keys.is_some() {
             Some("--authorized-keys= replaces credential discovery")
-        } else if !auth.contains(&AuthMechanism::Ssh) {
+        } else if !cli.auth.contains(&AuthMechanism::Ssh) {
             Some("pass --auth=ssh to use them")
         } else {
             None
@@ -1734,12 +1764,18 @@ fn unread_credentials(
             unread.extend(
                 auth_ssh::authorized_keys_credentials(creds_dir)
                     .into_iter()
-                    .map(|name| (name, why)),
+                    .map(|name| format!("{name} ({why})")),
             );
         }
     }
 
-    unread
+    if unread.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "credential(s) present but unused by this configuration: {}",
+        unread.join("; ")
+    ))
 }
 
 /// The middleware accepts a request as soon as one of these accepts it, so an
@@ -1804,23 +1840,10 @@ async fn main() -> anyhow::Result<()> {
 
     let creds_dir = varlink_http_bridge::sysconf::CredentialsLoader::path_from_env();
 
-    if let Some(dir) = creds_dir.as_deref() {
-        let unread: Vec<String> = unread_credentials(
-            dir,
-            cli.insecure,
-            cli.require_mtls,
-            &cli.auth,
-            cli.authorized_keys.as_deref(),
-        )
-        .iter()
-        .map(|(name, why)| format!("{name} ({why})"))
-        .collect();
-        if !unread.is_empty() {
-            warn!(
-                "credential(s) present but unused by this configuration: {}",
-                unread.join("; ")
-            );
-        }
+    if let Some(dir) = creds_dir.as_deref()
+        && let Some(warning) = unread_credentials_warning(dir, &cli)
+    {
+        warn!("{warning}");
     }
 
     let authenticators = build_authenticators(

@@ -1221,6 +1221,74 @@ fn test_mtls_watches_trust_credential_before_it_exists() {
     );
 }
 
+/// A file that is still there but yields no CA is a mistake or a refresh
+/// caught mid-write, so the CAs already loaded stay. Removing the file is the
+/// way to withdraw trust, and `test_mtls_trust_reloads_when_ca_appears_and_vanishes`
+/// covers that.
+#[test_with::executable(openssl)]
+#[test]
+fn test_mtls_unusable_trust_file_keeps_the_previous_cas() {
+    let pki = make_test_pki();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trust");
+
+    std::fs::copy(&pki.ca_cert_path, &path).unwrap();
+    let trust = crate::ClientTrust::new(Some(path.to_str().unwrap()));
+    assert_eq!(trust.store().unwrap().all_certificates().len(), 1);
+
+    for (what, content) in [
+        ("empty", b"".as_slice()),
+        ("not PEM at all", b"nonsense\n"),
+        (
+            "a PEM block that fails to decode",
+            b"-----BEGIN CERTIFICATE-----\nnot base64!!\n-----END CERTIFICATE-----\n",
+        ),
+    ] {
+        std::fs::write(&path, content).unwrap();
+        assert_eq!(
+            trust.store().unwrap().all_certificates().len(),
+            1,
+            "a file that is {what} must keep the CA already loaded"
+        );
+    }
+}
+
+/// A refresh that truncates before writing can be read at zero bytes, and
+/// both halves can fall inside one mtime tick. Caching that read would keep
+/// the stale trust store in place after the real content landed.
+#[test_with::executable(openssl)]
+#[test]
+fn test_mtls_empty_trust_file_is_not_cached() {
+    let pki = make_test_pki();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trust");
+
+    std::fs::write(&path, b"").unwrap();
+    let trust = crate::ClientTrust::new(Some(path.to_str().unwrap()));
+    assert_eq!(
+        trust.store().unwrap().all_certificates().len(),
+        0,
+        "an empty file must trust nothing"
+    );
+
+    // Rewind the mtime to what the empty read saw, standing in for a write
+    // that lands within the same tick.
+    let mtime = path.metadata().unwrap().modified().unwrap();
+    std::fs::copy(&pki.ca_cert_path, &path).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(mtime))
+        .unwrap();
+
+    assert_eq!(
+        trust.store().unwrap().all_certificates().len(),
+        1,
+        "the CA that arrived must be picked up, not shadowed by the empty read"
+    );
+}
+
 /// The CA may show up after start, when systemd refreshes credentials on
 /// reload. It has to take effect without restarting the listener, and
 /// removing it again has to take effect just as immediately.
@@ -1654,18 +1722,46 @@ async fn test_varlinkctl_helper_vsock_hostname_describe() {
 
 // --- unused credential reporting tests ---
 
-/// Just the names, so assertions read as "which credentials go unread".
-fn unread_names(
+/// The warning verbatim, so every assertion below reads like the line a user
+/// finds in the journal.
+fn unread_warning(
     creds_dir: &std::path::Path,
     insecure: bool,
     require_mtls: bool,
     auth: &[AuthMechanism],
     authorized_keys: Option<&str>,
-) -> Vec<String> {
-    crate::unread_credentials(creds_dir, insecure, require_mtls, auth, authorized_keys)
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect()
+) -> Option<String> {
+    let cli = cli_looking_up_credentials(insecure, require_mtls, auth, authorized_keys);
+    crate::unread_credentials_warning(creds_dir, &cli)
+}
+
+/// `creds_dir_with_everything()` writes ssh credentials too, so a configuration
+/// that doesn't select ssh auth trails them behind whatever else went unread.
+#[cfg(feature = "sshauth")]
+const AND_SSH_KEYS: &str = "; ssh.authorized_keys.root (pass --auth=ssh to use them)\
+     ; varlink-httpd.ssh.authorized-keys.example (pass --auth=ssh to use them)";
+#[cfg(not(feature = "sshauth"))]
+const AND_SSH_KEYS: &str = "";
+
+/// The configuration these tests vary: no path spelled out on the command
+/// line, so every credential is looked up.
+fn cli_looking_up_credentials(
+    insecure: bool,
+    require_mtls: bool,
+    auth: &[AuthMechanism],
+    authorized_keys: Option<&str>,
+) -> crate::BridgeCli {
+    crate::BridgeCli {
+        binds: Vec::new(),
+        varlink_sockets_path: String::new(),
+        cert: None,
+        key: None,
+        trust: None,
+        require_mtls,
+        authorized_keys: authorized_keys.map(String::from),
+        auth: auth.to_vec(),
+        insecure,
+    }
 }
 
 /// Every credential the daemon knows how to read, so each test only has to say
@@ -1693,43 +1789,70 @@ fn test_unread_credentials_none_when_all_are_used() {
         #[cfg(not(feature = "sshauth"))]
         AuthMechanism::None,
     ];
-    assert!(unread_names(dir.path(), false, true, &auth, None).is_empty());
+    assert_eq!(unread_warning(dir.path(), false, true, &auth, None), None);
 }
 
 #[test]
 fn test_unread_credentials_reports_trust_without_mtls() {
     let dir = creds_dir_with_everything();
-    let unread = unread_names(dir.path(), false, false, &[AuthMechanism::None], None);
-    assert!(unread.contains(&"trust".to_string()), "{unread:?}");
+    assert_eq!(
+        unread_warning(dir.path(), false, false, &[AuthMechanism::None], None),
+        Some(format!(
+            "credential(s) present but unused by this configuration: \
+             trust (pass --require-mtls to enable mTLS){AND_SSH_KEYS}"
+        ))
+    );
+}
+
+/// An explicit path replaces credential lookup instead of adding to it, so the
+/// credential goes unread even though mTLS does read one.
+#[test]
+fn test_unread_credentials_reports_tls_material_hidden_by_explicit_paths() {
+    let dir = creds_dir_with_everything();
+    let cli = crate::BridgeCli {
+        cert: Some("/etc/ssl/server.pem".to_string()),
+        key: Some("/etc/ssl/server.key".to_string()),
+        trust: Some("/etc/ssl/ca.pem".to_string()),
+        ..cli_looking_up_credentials(false, true, &[AuthMechanism::None], None)
+    };
+    assert_eq!(
+        crate::unread_credentials_warning(dir.path(), &cli),
+        Some(format!(
+            "credential(s) present but unused by this configuration: \
+             cert (an explicit path takes priority)\
+             ; key (an explicit path takes priority)\
+             ; trust (an explicit path takes priority){AND_SSH_KEYS}"
+        ))
+    );
 }
 
 /// --insecure never reads TLS material at all.
 #[test]
 fn test_unread_credentials_reports_tls_material_under_insecure() {
     let dir = creds_dir_with_everything();
-    let unread = unread_names(dir.path(), true, false, &[AuthMechanism::None], None);
-    for name in ["cert", "key", "trust"] {
-        assert!(
-            unread.contains(&name.to_string()),
-            "{name} missing: {unread:?}"
-        );
-    }
+    assert_eq!(
+        unread_warning(dir.path(), true, false, &[AuthMechanism::None], None),
+        Some(format!(
+            "credential(s) present but unused by this configuration: \
+             cert (--insecure serves plain HTTP)\
+             ; key (--insecure serves plain HTTP)\
+             ; trust (--insecure serves plain HTTP){AND_SSH_KEYS}"
+        ))
+    );
 }
 
 #[cfg(feature = "sshauth")]
 #[test]
 fn test_unread_credentials_reports_ssh_keys_without_ssh_auth() {
     let dir = creds_dir_with_everything();
-    let unread = unread_names(dir.path(), false, true, &[AuthMechanism::None], None);
-    for name in [
-        "ssh.authorized_keys.root",
-        "varlink-httpd.ssh.authorized-keys.example",
-    ] {
-        assert!(
-            unread.contains(&name.to_string()),
-            "{name} missing: {unread:?}"
-        );
-    }
+    assert_eq!(
+        unread_warning(dir.path(), false, true, &[AuthMechanism::None], None).as_deref(),
+        Some(
+            "credential(s) present but unused by this configuration: \
+             ssh.authorized_keys.root (pass --auth=ssh to use them)\
+             ; varlink-httpd.ssh.authorized-keys.example (pass --auth=ssh to use them)"
+        )
+    );
 }
 
 /// An explicit path replaces credential discovery instead of adding to it, so
@@ -1738,23 +1861,31 @@ fn test_unread_credentials_reports_ssh_keys_without_ssh_auth() {
 #[test]
 fn test_unread_credentials_reports_ssh_keys_hidden_by_explicit_path() {
     let dir = creds_dir_with_everything();
-    let unread = unread_names(
+    let unread = unread_warning(
         dir.path(),
         false,
         true,
         &[AuthMechanism::Ssh],
         Some("/etc/varlink-httpd/authorized_keys"),
     );
-    assert!(
-        unread.contains(&"ssh.authorized_keys.root".to_string()),
-        "{unread:?}"
+    assert_eq!(
+        unread.as_deref(),
+        Some(
+            "credential(s) present but unused by this configuration: \
+             ssh.authorized_keys.root (--authorized-keys= replaces credential discovery)\
+             ; varlink-httpd.ssh.authorized-keys.example \
+             (--authorized-keys= replaces credential discovery)"
+        )
     );
 }
 
 #[test]
 fn test_unread_credentials_ignores_absent_files() {
     let dir = tempfile::tempdir().unwrap();
-    assert!(unread_names(dir.path(), true, false, &[AuthMechanism::None], None).is_empty());
+    assert_eq!(
+        unread_warning(dir.path(), true, false, &[AuthMechanism::None], None),
+        None
+    );
 }
 
 // --- --auth= mechanism selection tests ---
