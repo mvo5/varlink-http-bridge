@@ -6,7 +6,10 @@ use anyhow::{Context, Result, bail};
 use futures_util::future::LocalBoxFuture;
 use log::{debug, warn};
 use tokio_tungstenite::tungstenite;
-use varlink_http_bridge::{SSHAUTH_MAGIC_PREFIX, TlsChannelBinding, sshauth_accept_value};
+use varlink_http_bridge::TlsChannelBinding;
+use varlink_http_bridge::sshauth_token::{
+    SSHAUTH_NONCE_HEADER, SignedParts, signer_from_agent, signer_from_private_key,
+};
 
 use crate::client_auth::ClientAuth;
 
@@ -68,26 +71,26 @@ async fn add_auth_headers(
         .path_and_query()
         .map_or(request.uri().path(), |pq| pq.as_str())
         .to_string();
+    let nonce = generate_nonce();
 
-    let accept = sshauth_accept_value(
-        request
-            .headers()
-            .get_all(tungstenite::http::header::ACCEPT)
-            .iter()
-            .map(tungstenite::http::HeaderValue::as_bytes),
+    let signer = signer_for_key(key).context(SigningFailed)?;
+    let signed_parts = SignedParts::new(
+        "GET",
+        &path_and_query,
+        &nonce,
+        request.headers(),
+        tls_channel_binding,
     );
-
-    let (auth_header, nonce) =
-        sign_with_key(key, "GET", &path_and_query, &accept, tls_channel_binding)
-            .await
-            .context(SigningFailed)?;
+    let token = signed_parts.sign(&signer).await.context(SigningFailed)?;
 
     request.headers_mut().insert(
         "Authorization",
-        auth_header.parse().context("invalid auth header value")?,
+        format!("Bearer {token}")
+            .parse()
+            .context("invalid auth header value")?,
     );
     request.headers_mut().insert(
-        varlink_http_bridge::SSHAUTH_NONCE_HEADER,
+        SSHAUTH_NONCE_HEADER,
         nonce.parse().context("invalid nonce header value")?,
     );
     Ok(())
@@ -261,47 +264,14 @@ async fn list_ssh_keys() -> Result<Vec<SshKey>> {
     Ok(vec![])
 }
 
-/// Sign the request parameters (method, path, accept, nonce, TLS channel
-/// binding) with the given key.  Returns the `Authorization` header value
-/// carrying the signed sshauth token, and the nonce.
-async fn sign_with_key(
-    key: &SshKey,
-    method: &str,
-    path_and_query: &str,
-    accept: &str,
-    tls_channel_binding: Option<&TlsChannelBinding>,
-) -> Result<(String, String)> {
-    let nonce = generate_nonce();
-
-    let mut signer_builder = match key {
-        SshKey::PrivateKey { key, .. } => {
-            sshauth::TokenSigner::using_private_key(key.as_ref().clone())?
-        }
-        SshKey::AgentKey { auth_sock, key } => {
-            let mut sb = sshauth::TokenSigner::using_authsock(auth_sock)?;
-            sb.key(key.clone());
-            sb
-        }
-    };
+/// A token signer for `key`, either from the private key on disk or via
+/// the ssh-agent.
+fn signer_for_key(key: &SshKey) -> Result<sshauth::TokenSigner> {
     debug!("SSH auth: using {key}");
-
-    signer_builder
-        .include_fingerprint(true)
-        .magic_prefix(SSHAUTH_MAGIC_PREFIX);
-    let signer = signer_builder.build()?;
-
-    let mut tb = signer.sign_for();
-    tb.action("method", method)
-        .action("path", path_and_query)
-        .action("accept", accept)
-        .action("nonce", &nonce)
-        .action(
-            "tls-channel-binding",
-            tls_channel_binding.map_or("", TlsChannelBinding::as_str),
-        );
-    let token: sshauth::token::Token = tb.sign().await?;
-
-    Ok((format!("Bearer {}", token.encode()), nonce))
+    match key {
+        SshKey::PrivateKey { key, .. } => signer_from_private_key(key.as_ref().clone()),
+        SshKey::AgentKey { auth_sock, key } => signer_from_agent(auth_sock, key.clone()),
+    }
 }
 
 fn generate_nonce() -> String {

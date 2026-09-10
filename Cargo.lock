@@ -2720,6 +2720,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "gethostname",
+ "http",
  "indoc",
  "lexopt",
  "listenfd",

@@ -8,9 +8,7 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
 use crate::{AuthRequest, Authenticator};
-use varlink_http_bridge::{
-    SSHAUTH_MAGIC_PREFIX, SSHAUTH_NONCE_HEADER, TlsChannelBinding, sshauth_accept_value,
-};
+use varlink_http_bridge::sshauth_token::{SSHAUTH_NONCE_HEADER, SignedParts, UnverifiedToken};
 
 /// One tracked `authorized_keys` file: its mtime when last read and the
 /// (fingerprint -> key) map of supported keys it contained. Bundling
@@ -455,44 +453,24 @@ impl Authenticator for SshKeyAuthenticator {
         let nonce =
             extract_nonce(request.headers).context("missing nonce header (x-auth-nonce)")?;
         let nonce = nonce.as_str();
-        let accept = sshauth_accept_value(
-            request
-                .headers
-                .get_all(axum::http::header::ACCEPT)
-                .iter()
-                .map(axum::http::HeaderValue::as_bytes),
+        let signed_parts = SignedParts::new(
+            method,
+            path,
+            nonce,
+            request.headers,
+            request.tls_channel_binding,
         );
 
-        let unverified_token =
-            sshauth::UnverifiedToken::try_from(token_str).context("invalid token")?;
+        let unverified_token = UnverifiedToken::try_from(token_str).context("invalid token")?;
 
         // clone the keys to drop the authorized_keys.lock() ASAP and avoid it being
-        // held during the (slow) verify_for()
+        // held during the (slow) verify()
         let authorized_keys: Vec<ssh_key::PublicKey> = {
             let ak = self.authorized_keys.lock().unwrap();
             ak.all_keys()
         };
 
-        let verified = unverified_token
-            .verify_for()
-            .magic_prefix(SSHAUTH_MAGIC_PREFIX)
-            .max_skew_seconds(self.max_skew)
-            .action("method", method)
-            .action("path", path)
-            .action("accept", &accept)
-            .action("nonce", nonce)
-            .action(
-                "tls-channel-binding",
-                // Safe: when TLS is active the server always provides a real binding
-                // (TLS 1.3 enforced in load_tls_acceptor), so a token signed with ""
-                // will fail verification. The "" default only applies to non-TLS
-                // connections where channel binding is not relevant.
-                request
-                    .tls_channel_binding
-                    .map_or("", TlsChannelBinding::as_str),
-            )
-            .with_keys(&authorized_keys)
-            .context("token verification failed")?;
+        let verified = signed_parts.verify(&unverified_token, self.max_skew, &authorized_keys)?;
 
         // good signature, check that nonce is unique
         self.nonces

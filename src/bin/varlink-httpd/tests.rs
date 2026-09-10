@@ -2285,7 +2285,7 @@ mod sshauth_tests {
                 Request::get("/sockets")
                     .header("Authorization", "Bearer bogus-token")
                     .header(
-                        varlink_http_bridge::SSHAUTH_NONCE_HEADER,
+                        varlink_http_bridge::sshauth_token::SSHAUTH_NONCE_HEADER,
                         "a-nonce-long-enough-1234",
                     )
                     .body(Body::empty())
