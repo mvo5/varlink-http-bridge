@@ -2136,18 +2136,27 @@ mod sshauth_tests {
         let signer = make_test_token_signer(&key_path);
 
         let nonce = "test-nonce-expired12345";
+        let cb = TlsChannelBinding::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
             .action("path", "/sockets")
             .action("accept", "")
-            .action("nonce", nonce);
+            .action("nonce", nonce)
+            .action("tls-channel-binding", cb.as_str());
         let token = tb.sign().await.unwrap();
 
         // Wait for the token to become stale (max_skew is 0)
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let header = format!("Bearer {}", token.encode());
-        let result = check_request(&auth, "GET", "/sockets", Some(&header), Some(nonce), None);
+        let result = check_request(
+            &auth,
+            "GET",
+            "/sockets",
+            Some(&header),
+            Some(nonce),
+            Some(&cb),
+        );
         assert!(result.is_err(), "expired token should be rejected");
     }
 
@@ -2162,15 +2171,24 @@ mod sshauth_tests {
         let signer = make_test_token_signer(&key_path_b);
 
         let nonce = "test-nonce-unknown-fp12345";
+        let cb = TlsChannelBinding::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
         let mut tb = signer.sign_for();
         tb.action("method", "GET")
             .action("path", "/sockets")
             .action("accept", "")
-            .action("nonce", nonce);
+            .action("nonce", nonce)
+            .action("tls-channel-binding", cb.as_str());
         let token = tb.sign().await.unwrap();
 
         let header = format!("Bearer {}", token.encode());
-        let result = check_request(&auth, "GET", "/sockets", Some(&header), Some(nonce), None);
+        let result = check_request(
+            &auth,
+            "GET",
+            "/sockets",
+            Some(&header),
+            Some(nonce),
+            Some(&cb),
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -2254,6 +2272,33 @@ mod sshauth_tests {
         assert!(
             check(&header, nonce, Some("application/json-seq")).is_err(),
             "an added Accept header must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssh_auth_rejects_without_tls() {
+        let (auth, key_path) = make_test_ssh_auth();
+        let signer = make_test_token_signer(&key_path);
+
+        let nonce = "no-tls-binding-test-1234";
+        let mut tb = signer.sign_for();
+        tb.action("method", "GET")
+            .action("path", "/sockets")
+            .action("accept", "")
+            .action("nonce", nonce)
+            .action("tls-channel-binding", "");
+        let token = tb.sign().await.unwrap();
+        let header = format!("Bearer {}", token.encode());
+
+        // a request without a channel binding can only come in over plain
+        // HTTP, which --auth=ssh refuses at startup: fail closed
+        let result = check_request(&auth, "GET", "/sockets", Some(&header), Some(nonce), None);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("SSH auth requires TLS"),
+            "request without TLS binding must be rejected"
         );
     }
 

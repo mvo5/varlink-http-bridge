@@ -61,7 +61,7 @@ pub struct SignedParts<'a> {
     path_and_query: &'a str,
     accept: String,
     nonce: &'a str,
-    tls_channel_binding: Option<&'a TlsChannelBinding>,
+    tls_channel_binding: &'a TlsChannelBinding,
 }
 
 impl<'a> SignedParts<'a> {
@@ -71,7 +71,7 @@ impl<'a> SignedParts<'a> {
         path_and_query: &'a str,
         nonce: &'a str,
         headers: &HeaderMap,
-        tls_channel_binding: Option<&'a TlsChannelBinding>,
+        tls_channel_binding: &'a TlsChannelBinding,
     ) -> Self {
         Self {
             method,
@@ -118,12 +118,7 @@ impl<'a> SignedParts<'a> {
             ("path", self.path_and_query),
             ("accept", &self.accept),
             ("nonce", self.nonce),
-            (
-                "tls-channel-binding",
-                // only non-TLS can be "", with TLS this is always set
-                self.tls_channel_binding
-                    .map_or("", TlsChannelBinding::as_str),
-            ),
+            ("tls-channel-binding", self.tls_channel_binding.as_str()),
         ]
     }
 }

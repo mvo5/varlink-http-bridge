@@ -409,6 +409,19 @@ fn resp_body_text(resp: &tungstenite::http::Response<Option<Vec<u8>>>) -> Option
         .map(|b| String::from_utf8_lossy(b).into_owned())
 }
 
+/// Whether `url` selects a TLS transport, mirroring the scheme handling
+/// in [`connect_transport`] and [`connect_tcp`].
+///
+/// Schemes are case-insensitive (RFC 3986 section 3.1), so `HTTPS://` has
+/// to count as TLS here too.
+/// <https://www.rfc-editor.org/rfc/rfc3986#section-3.1>
+fn url_is_tls(url: &str) -> bool {
+    let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
+    ["https", "wss", "vsock+tls"]
+        .iter()
+        .any(|tls_scheme| scheme.eq_ignore_ascii_case(tls_scheme))
+}
+
 /// The TLS channel binding is returned so auth headers can be signed
 /// over it before the WebSocket upgrade.
 async fn connect_transport(
@@ -1003,6 +1016,27 @@ mod tests {
     #[cfg(feature = "sshauth")]
     mod sshauth {
         use super::*;
+
+        #[test]
+        fn test_url_is_tls_ignores_scheme_case() {
+            for url in [
+                "https://h/",
+                "HTTPS://h/",
+                "WsS://h/",
+                "VSOCK+TLS://2:1031/",
+            ] {
+                assert!(url_is_tls(url), "{url}");
+            }
+            for url in [
+                "http://h/",
+                "HTTP://h/",
+                "ws://h/",
+                "vsock://2:1031/",
+                "h:1031",
+            ] {
+                assert!(!url_is_tls(url), "{url}");
+            }
+        }
 
         /// Wraps the handshake error the same way `ws_upgrade` does.
         async fn handshake_error(response: &'static str) -> anyhow::Error {

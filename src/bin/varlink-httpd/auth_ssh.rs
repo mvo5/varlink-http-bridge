@@ -453,15 +453,14 @@ impl Authenticator for SshKeyAuthenticator {
         let nonce =
             extract_nonce(request.headers).context("missing nonce header (x-auth-nonce)")?;
         let nonce = nonce.as_str();
-        let signed_parts = SignedParts::new(
-            method,
-            path,
-            nonce,
-            request.headers,
-            request.tls_channel_binding,
-        );
-
         let unverified_token = UnverifiedToken::try_from(token_str).context("invalid token")?;
+
+        // sshauth over non-TLS is not secure so refuse it
+        let tls_channel_binding = request
+            .tls_channel_binding
+            .context("SSH auth requires TLS (no channel binding)")?;
+        let signed_parts =
+            SignedParts::new(method, path, nonce, request.headers, tls_channel_binding);
 
         // clone the keys to drop the authorized_keys.lock() ASAP and avoid it being
         // held during the (slow) verify()

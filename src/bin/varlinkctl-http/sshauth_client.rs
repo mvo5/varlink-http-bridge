@@ -63,7 +63,7 @@ impl fmt::Display for SshKey {
 async fn add_auth_headers(
     request: &mut tungstenite::http::Request<()>,
     key: &SshKey,
-    tls_channel_binding: Option<&TlsChannelBinding>,
+    tls_channel_binding: &TlsChannelBinding,
 ) -> Result<()> {
     // to_string: ends the borrow of `request` before headers_mut() below
     let path_and_query = request
@@ -119,6 +119,14 @@ impl ClientAuth for SshSignature {
 /// failed to sign), one unauthenticated attempt is made and the
 /// server decides whether to allow that.
 async fn connect_with_ssh_retry(url: &str) -> Result<Option<crate::Ws>> {
+    if !crate::url_is_tls(url) {
+        if SshSignature.configured() {
+            bail!("VARLINK_SSH_KEY is set but {url} is not TLS, SSH auth needs TLS");
+        }
+        debug!("plain transport, not offering SSH auth");
+        return Ok(None);
+    }
+
     let keys = list_ssh_keys().await?;
     if keys.is_empty() {
         return Ok(None);
@@ -126,9 +134,12 @@ async fn connect_with_ssh_retry(url: &str) -> Result<Option<crate::Ws>> {
     let ws = try_each_key(&keys, async |key| {
         let (stream, mut request, tcb) = crate::connect_transport(url).await?;
         if let Some(key) = key {
-            add_auth_headers(&mut request, key, tcb.as_ref()).await?;
+            let tcb = tcb
+                .as_ref()
+                .context("TLS connection without channel binding")?;
+            add_auth_headers(&mut request, key, tcb).await?;
         }
-        crate::ws_upgrade(request, stream, tcb.is_some()).await
+        crate::ws_upgrade(request, stream, true).await
     })
     .await?;
     Ok(Some(ws))
