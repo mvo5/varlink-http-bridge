@@ -1701,13 +1701,14 @@ fn parse_import_ssh_args(parser: &mut lexopt::Parser) -> anyhow::Result<Command>
     Ok(Command::ImportSsh(import_ssh::ImportSsh { source, output }))
 }
 
-/// Credentials present in `creds_dir` that are unused due to flag usage.
+/// Warns about credentials present in `creds_dir` that are unused due to flag
+/// usage, or `None` when every credential present is read.
 ///
 /// Credentials don't enable mechanisms implicitly, and concrete flag values
-/// take precedence over credentials. The returned list contains unused credentials
-/// and why they aren't used so we can warn about potential misconfiguration.
-fn unread_credentials(creds_dir: &std::path::Path, cli: &BridgeCli) -> Vec<(String, &'static str)> {
-    let mut unread = Vec::new();
+/// take precedence over credentials. The warning names the unused credentials
+/// and why they aren't used so we can point at potential misconfiguration.
+fn unread_credentials_warning(creds_dir: &std::path::Path, cli: &BridgeCli) -> Option<String> {
+    let mut unread: Vec<String> = Vec::new();
 
     for (name, read, why, explicit) in [
         (
@@ -1744,7 +1745,7 @@ fn unread_credentials(creds_dir: &std::path::Path, cli: &BridgeCli) -> Vec<(Stri
             None
         };
         if let Some(why) = why {
-            unread.push((name.to_string(), why));
+            unread.push(format!("{name} ({why})"));
         }
     }
 
@@ -1763,12 +1764,18 @@ fn unread_credentials(creds_dir: &std::path::Path, cli: &BridgeCli) -> Vec<(Stri
             unread.extend(
                 auth_ssh::authorized_keys_credentials(creds_dir)
                     .into_iter()
-                    .map(|name| (name, why)),
+                    .map(|name| format!("{name} ({why})")),
             );
         }
     }
 
-    unread
+    if unread.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "credential(s) present but unused by this configuration: {}",
+        unread.join("; ")
+    ))
 }
 
 /// The middleware accepts a request as soon as one of these accepts it, so an
@@ -1833,17 +1840,10 @@ async fn main() -> anyhow::Result<()> {
 
     let creds_dir = varlink_http_bridge::sysconf::CredentialsLoader::path_from_env();
 
-    if let Some(dir) = creds_dir.as_deref() {
-        let unread: Vec<String> = unread_credentials(dir, &cli)
-            .iter()
-            .map(|(name, why)| format!("{name} ({why})"))
-            .collect();
-        if !unread.is_empty() {
-            warn!(
-                "credential(s) present but unused by this configuration: {}",
-                unread.join("; ")
-            );
-        }
+    if let Some(dir) = creds_dir.as_deref()
+        && let Some(warning) = unread_credentials_warning(dir, &cli)
+    {
+        warn!("{warning}");
     }
 
     let authenticators = build_authenticators(

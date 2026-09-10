@@ -1722,20 +1722,26 @@ async fn test_varlinkctl_helper_vsock_hostname_describe() {
 
 // --- unused credential reporting tests ---
 
-/// Just the names, so assertions read as "which credentials go unread".
-fn unread_names(
+/// The warning verbatim, so every assertion below reads like the line a user
+/// finds in the journal.
+fn unread_warning(
     creds_dir: &std::path::Path,
     insecure: bool,
     require_mtls: bool,
     auth: &[AuthMechanism],
     authorized_keys: Option<&str>,
-) -> Vec<String> {
+) -> Option<String> {
     let cli = cli_looking_up_credentials(insecure, require_mtls, auth, authorized_keys);
-    crate::unread_credentials(creds_dir, &cli)
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect()
+    crate::unread_credentials_warning(creds_dir, &cli)
 }
+
+/// `creds_dir_with_everything()` writes ssh credentials too, so a configuration
+/// that doesn't select ssh auth trails them behind whatever else went unread.
+#[cfg(feature = "sshauth")]
+const AND_SSH_KEYS: &str = "; ssh.authorized_keys.root (pass --auth=ssh to use them)\
+     ; varlink-httpd.ssh.authorized-keys.example (pass --auth=ssh to use them)";
+#[cfg(not(feature = "sshauth"))]
+const AND_SSH_KEYS: &str = "";
 
 /// The configuration these tests vary: no path spelled out on the command
 /// line, so every credential is looked up.
@@ -1783,14 +1789,19 @@ fn test_unread_credentials_none_when_all_are_used() {
         #[cfg(not(feature = "sshauth"))]
         AuthMechanism::None,
     ];
-    assert!(unread_names(dir.path(), false, true, &auth, None).is_empty());
+    assert_eq!(unread_warning(dir.path(), false, true, &auth, None), None);
 }
 
 #[test]
 fn test_unread_credentials_reports_trust_without_mtls() {
     let dir = creds_dir_with_everything();
-    let unread = unread_names(dir.path(), false, false, &[AuthMechanism::None], None);
-    assert!(unread.contains(&"trust".to_string()), "{unread:?}");
+    assert_eq!(
+        unread_warning(dir.path(), false, false, &[AuthMechanism::None], None),
+        Some(format!(
+            "credential(s) present but unused by this configuration: \
+             trust (pass --require-mtls to enable mTLS){AND_SSH_KEYS}"
+        ))
+    );
 }
 
 /// An explicit path replaces credential lookup instead of adding to it, so the
@@ -1804,47 +1815,44 @@ fn test_unread_credentials_reports_tls_material_hidden_by_explicit_paths() {
         trust: Some("/etc/ssl/ca.pem".to_string()),
         ..cli_looking_up_credentials(false, true, &[AuthMechanism::None], None)
     };
-    let unread: Vec<String> = crate::unread_credentials(dir.path(), &cli)
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    for name in ["cert", "key", "trust"] {
-        assert!(
-            unread.contains(&name.to_string()),
-            "{name} missing: {unread:?}"
-        );
-    }
+    assert_eq!(
+        crate::unread_credentials_warning(dir.path(), &cli),
+        Some(format!(
+            "credential(s) present but unused by this configuration: \
+             cert (an explicit path takes priority)\
+             ; key (an explicit path takes priority)\
+             ; trust (an explicit path takes priority){AND_SSH_KEYS}"
+        ))
+    );
 }
 
 /// --insecure never reads TLS material at all.
 #[test]
 fn test_unread_credentials_reports_tls_material_under_insecure() {
     let dir = creds_dir_with_everything();
-    let cli = cli_looking_up_credentials(true, false, &[AuthMechanism::None], None);
-    let unread = crate::unread_credentials(dir.path(), &cli);
-    for name in ["cert", "key", "trust"] {
-        let (_, why) = unread
-            .iter()
-            .find(|(n, _)| n == name)
-            .unwrap_or_else(|| panic!("{name} missing: {unread:?}"));
-        assert!(why.contains("--insecure"), "{name} says: {why}");
-    }
+    assert_eq!(
+        unread_warning(dir.path(), true, false, &[AuthMechanism::None], None),
+        Some(format!(
+            "credential(s) present but unused by this configuration: \
+             cert (--insecure serves plain HTTP)\
+             ; key (--insecure serves plain HTTP)\
+             ; trust (--insecure serves plain HTTP){AND_SSH_KEYS}"
+        ))
+    );
 }
 
 #[cfg(feature = "sshauth")]
 #[test]
 fn test_unread_credentials_reports_ssh_keys_without_ssh_auth() {
     let dir = creds_dir_with_everything();
-    let unread = unread_names(dir.path(), false, true, &[AuthMechanism::None], None);
-    for name in [
-        "ssh.authorized_keys.root",
-        "varlink-httpd.ssh.authorized-keys.example",
-    ] {
-        assert!(
-            unread.contains(&name.to_string()),
-            "{name} missing: {unread:?}"
-        );
-    }
+    assert_eq!(
+        unread_warning(dir.path(), false, true, &[AuthMechanism::None], None).as_deref(),
+        Some(
+            "credential(s) present but unused by this configuration: \
+             ssh.authorized_keys.root (pass --auth=ssh to use them)\
+             ; varlink-httpd.ssh.authorized-keys.example (pass --auth=ssh to use them)"
+        )
+    );
 }
 
 /// An explicit path replaces credential discovery instead of adding to it, so
@@ -1853,23 +1861,31 @@ fn test_unread_credentials_reports_ssh_keys_without_ssh_auth() {
 #[test]
 fn test_unread_credentials_reports_ssh_keys_hidden_by_explicit_path() {
     let dir = creds_dir_with_everything();
-    let unread = unread_names(
+    let unread = unread_warning(
         dir.path(),
         false,
         true,
         &[AuthMechanism::Ssh],
         Some("/etc/varlink-httpd/authorized_keys"),
     );
-    assert!(
-        unread.contains(&"ssh.authorized_keys.root".to_string()),
-        "{unread:?}"
+    assert_eq!(
+        unread.as_deref(),
+        Some(
+            "credential(s) present but unused by this configuration: \
+             ssh.authorized_keys.root (--authorized-keys= replaces credential discovery)\
+             ; varlink-httpd.ssh.authorized-keys.example \
+             (--authorized-keys= replaces credential discovery)"
+        )
     );
 }
 
 #[test]
 fn test_unread_credentials_ignores_absent_files() {
     let dir = tempfile::tempdir().unwrap();
-    assert!(unread_names(dir.path(), true, false, &[AuthMechanism::None], None).is_empty());
+    assert_eq!(
+        unread_warning(dir.path(), true, false, &[AuthMechanism::None], None),
+        None
+    );
 }
 
 // --- --auth= mechanism selection tests ---
