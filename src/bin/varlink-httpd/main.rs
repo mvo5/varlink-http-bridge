@@ -1009,7 +1009,17 @@ async fn route_socket_interface_get(
     let iface = idl.parse()?;
 
     let method_names: Vec<&str> = iface.methods().map(zlink::idl::Method::name).collect();
-    Ok(axum::Json(json!({"method_names": method_names})))
+    let type_names: Vec<&str> = iface.custom_types().map(|t| t.name()).collect();
+    let error_names: Vec<&str> = iface.errors().map(|e| e.name()).collect();
+    Ok(axum::Json(json!({
+        "method_names": method_names,
+        "type_names": type_names,
+        "error_names": error_names,
+        // point to the full idl/openapi specs with the details, this view here
+        // is really just to get a quick overview
+        "idl": format!("/idl/{socket}/{interface}"),
+        "openapi": format!("/openapi/{socket}/{interface}"),
+    })))
 }
 
 /// Stream varlink `more` replies as a JSON text sequence (RFC 7464).

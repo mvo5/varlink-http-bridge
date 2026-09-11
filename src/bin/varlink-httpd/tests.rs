@@ -273,6 +273,61 @@ async fn test_integration_real_systemd_socket_interface_get() {
     assert_eq!(body.get("method_names").unwrap(), &json!(["Describe"]));
 }
 
+/// The structured view names what a caller would otherwise parse the IDL for,
+/// and links to the fuller views for what it cannot express. Both links are
+/// followed here so they cannot drift from the routes that serve them.
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_integration_real_systemd_interface_names_and_links() {
+    let server = run_test_server("/run/systemd").await;
+    let client = Client::new();
+
+    let body: Value = client
+        .get(format!(
+            "http://{}/sockets/io.systemd.Hostname/io.systemd.Hostname",
+            server.addr,
+        ))
+        .send()
+        .await
+        .expect("failed to get interface details")
+        .json()
+        .await
+        .expect("interface details are not JSON");
+
+    for key in ["method_names", "type_names", "error_names"] {
+        assert!(
+            body.get(key).is_some_and(Value::is_array),
+            "{key} must be an array: {body}"
+        );
+    }
+    assert!(
+        body["method_names"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("Describe")),
+        "hostnamed must expose Describe: {body}"
+    );
+
+    for (key, expected) in [
+        ("idl", "/idl/io.systemd.Hostname/io.systemd.Hostname"),
+        ("openapi", "/openapi/io.systemd.Hostname/io.systemd.Hostname"),
+    ] {
+        let link = body[key].as_str().expect("link must be a string");
+        assert_eq!(link, expected);
+        let res = client
+            .get(format!("http://{}{link}", server.addr))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("failed to follow the {key} link: {e}"));
+        assert_eq!(res.status(), 200, "the {key} link must be routable");
+        let text = res.text().await.expect("link body is not text");
+        assert!(
+            text.contains("io.systemd.Hostname"),
+            "the linked {key} must describe the interface: {text}"
+        );
+    }
+}
+
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_hostname_parallel() {
