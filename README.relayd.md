@@ -231,7 +231,7 @@ existing auth paths apply untouched. No local TCP listener is exposed.
 | 1 | [x] | `varlink-relayd`: `--bind`, `--connect-bind`, CONNECT demux, node registry, h2 PING heartbeat, TLS, `--insecure` guard rails, tested against a stub node |
 | 2 | [x] | `varlink-httpd --relay <url>`: dial-out with redial and backoff, `--instance <label>`, end-to-end test against `varlink-relayd` |
 | 3 | [x] | fairness: a connection window sized for `MAX_TUNNEL_STREAMS`, a slot timeout and a `503` rather than one caller starving a tunnel |
-| 4 | [ ] | operations: per-tunnel load tiers, one `debug` line per caller, `--auth=none` for a relay-only instance serving named sockets |
+| 4 | [x] | operations: per-tunnel load tiers, one `debug` line per caller, `--auth=none` for a relay-only instance serving named sockets |
 | 5 | [ ] | `varlinkctl-http` as a caller through the relay (`VARLINK_RELAY_URL`) |
 | 6 | [ ] | signed node ids: dial-out signature bound to the channel binding, signer trait + software key, pinned-keys dir, first-use store, key generation |
 | 7 | [ ] | packaging: `varlink-relayd.service`/`.socket`, spec file |
@@ -309,3 +309,32 @@ per node out of one connection window. Bulk data is what would suffer:
 256KiB gets 4.89MB/s and 1MiB gets 17.65MB/s over the same 50ms link, so
 carrying file transfers through the tunnel means revisiting the window
 (see the `TODO` on `STREAM_WINDOW`).
+
+## Logging
+
+Networks are weird, so the log is the only way to tell "the relay is
+down" from "this node is misconfigured" from "that caller is slow".
+What makes that work is not more lines, it is knowing which level a
+line belongs at -- `info` has to stay readable on a busy relay, or it
+stops being read at all:
+
+| level | what belongs there | volume |
+| ----- | ------------------ | ------ |
+| `error` | the process cannot do its job any more | never, in practice |
+| `warn` | someone has to act: a tunnel is down, a node id is claimed twice, a tunnel is out of stream slots, a stream is wedged, the listener is out of file descriptors | one per event, not per attempt |
+| `info` | lifecycle worth tracking: listeners bound, a node connected or disconnected (with how long it lasted and how many streams went with it), a tunnel established or recovered, a caller asking for a node nobody has | per node, per tunnel |
+| `debug` | one line per caller and per retry, with the numbers: bytes each way, how long, why it ended | per stream |
+
+Three rules keep the volume proportional to the trouble rather than to
+the retrying:
+
+- **A run of failures is one event.** A relay outage says so once, then
+  goes quiet, then reminds every 10 minutes while it lasts, and says how
+  long it took when it comes back. A cause that changes mid-outage is
+  loud again, because it is news.
+- **What a public port sees all day is `debug`.** Scanners, half-open
+  connections, TLS mismatches, malformed `CONNECT`s: routine, and it
+  must not bury the rest.
+- **Both ends name a caller by its h2 stream id.** It is the one
+  identifier the relay and the node both see, so a caller's line on the
+  relay leads to its lines on the node.

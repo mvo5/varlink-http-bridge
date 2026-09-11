@@ -14,7 +14,7 @@ use bytes::Bytes;
 use h2::client::SendRequest;
 use tokio::sync::Notify;
 
-use varlink_http_bridge::tunnel::NodeId;
+use varlink_http_bridge::tunnel::{NodeId, StreamLoad};
 
 /// The connected nodes. First-wins among live connections: a claim on
 /// an occupied id is rejected and triggers an immediate liveness probe
@@ -33,6 +33,7 @@ struct Node {
     generation: u64,
     // pokes the holder's heartbeat out of cycle on a colliding claim
     probe: Arc<Notify>,
+    load: Arc<StreamLoad>,
     // when a colliding claim on this id was last reported: a
     // misconfigured node retries forever, and one relay serves a whole
     // fleet of them, so the same complaint must not repeat per attempt
@@ -56,6 +57,7 @@ pub(crate) struct Reservation {
     pub(crate) id: NodeId,
     generation: u64,
     pub(crate) probe: Arc<Notify>,
+    pub(crate) load: Arc<StreamLoad>,
 }
 
 /// Releases the reserved id when dropped, so no exit path of the node
@@ -86,12 +88,14 @@ impl Nodes {
         }
         let generation = self.generation.fetch_add(1, Ordering::Relaxed);
         let probe = Arc::new(Notify::new());
+        let load = Arc::new(StreamLoad::default());
         map.insert(
             id,
             Node {
                 h2: None,
                 generation,
                 probe: Arc::clone(&probe),
+                load: Arc::clone(&load),
                 // a fresh holder reports the first collision at once
                 claim_reported: Instant::now() - CLAIM_REPORT_INTERVAL,
             },
@@ -102,6 +106,7 @@ impl Nodes {
                 id,
                 generation,
                 probe,
+                load,
             },
         })
     }
@@ -115,12 +120,12 @@ impl Nodes {
         }
     }
 
-    pub(crate) fn get(&self, id: NodeId) -> Option<SendRequest<Bytes>> {
+    pub(crate) fn get(&self, id: NodeId) -> Option<(SendRequest<Bytes>, Arc<StreamLoad>)> {
         self.map
             .lock()
             .expect("nodes lock")
             .get(&id)
-            .and_then(|node| node.h2.clone())
+            .and_then(|node| Some((node.h2.clone()?, Arc::clone(&node.load))))
     }
 
     fn release(&self, reservation: &Reservation) {

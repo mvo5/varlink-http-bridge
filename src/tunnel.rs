@@ -15,6 +15,8 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
@@ -370,6 +372,90 @@ pub const MAX_TUNNEL_STREAMS: u32 = 256;
 /// not an allocation: only a tunnel whose callers all wedge at once
 /// holds this much.
 pub const CONNECTION_WINDOW: u32 = STREAM_WINDOW * MAX_TUNNEL_STREAMS;
+
+/// Stream count of one tunnel, reported when it crosses a tier: running
+/// into [`MAX_TUNNEL_STREAMS`] is silent by itself, callers just queue.
+/// A tier is reported once per crossing and re-armed only once usage
+/// drops clear of it, so a tunnel hovering at a tier stays quiet.
+#[derive(Debug, Default)]
+pub struct StreamLoad {
+    active: AtomicU32,
+    // in percent, 0 for none
+    reported: AtomicU32,
+}
+
+/// In percent of [`MAX_TUNNEL_STREAMS`], ascending.
+const TIERS: [u32; 4] = [50, 75, 90, 100];
+
+/// Percentage points usage must drop below a tier before crossing it is
+/// news again; without it a hovering tunnel reports on every stream.
+const TIER_HYSTERESIS: u32 = 10;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct LoadReport {
+    pub active: u32,
+    /// in percent of [`MAX_TUNNEL_STREAMS`]
+    pub tier: u32,
+}
+
+impl LoadReport {
+    /// From 90% on an operator is needed: the tunnel is nearly out of
+    /// slots, or callers are already queueing.
+    #[must_use]
+    pub fn level(&self) -> log::Level {
+        if self.tier >= 90 {
+            log::Level::Warn
+        } else {
+            log::Level::Info
+        }
+    }
+}
+
+impl StreamLoad {
+    pub fn active(&self) -> u32 {
+        self.active.load(Relaxed)
+    }
+
+    fn opened(&self) -> Option<LoadReport> {
+        let active = self.active.fetch_add(1, Relaxed) + 1;
+        let tier = tier_reached(active, 0);
+        // fetch_max, so two streams opening at once report once
+        (tier > self.reported.fetch_max(tier, Relaxed)).then_some(LoadReport { active, tier })
+    }
+
+    fn closed(&self) {
+        let active = self.active.fetch_sub(1, Relaxed) - 1;
+        self.reported
+            .fetch_min(tier_reached(active, TIER_HYSTERESIS), Relaxed);
+    }
+}
+
+fn tier_reached(active: u32, margin: u32) -> u32 {
+    let percent = active * 100 / MAX_TUNNEL_STREAMS + margin;
+    TIERS
+        .into_iter()
+        .rev()
+        .find(|tier| percent >= *tier)
+        .unwrap_or(0)
+}
+
+/// A stream counted in a [`StreamLoad`] until dropped, so that no exit
+/// path can leak the count.
+#[derive(Debug)]
+pub struct StreamSlot(Arc<StreamLoad>);
+
+impl StreamSlot {
+    pub fn open(load: &Arc<StreamLoad>) -> (Self, Option<LoadReport>) {
+        let report = load.opened();
+        (Self(Arc::clone(load)), report)
+    }
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        self.0.closed();
+    }
+}
 
 /// h2 settings for the node end (the server, roles being reversed). Only
 /// the accepting side can advertise the stream limit.
@@ -803,6 +889,62 @@ mod tests {
         })
         .await
         .expect("draining must unblock the sender");
+    }
+
+    #[test]
+    fn stream_load_reports_every_tier_once() {
+        use log::Level;
+        let load = StreamLoad::default();
+        let cap = MAX_TUNNEL_STREAMS;
+        let mut reports = Vec::new();
+        for _ in 0..cap {
+            if let Some(report) = load.opened() {
+                reports.push(report);
+            }
+        }
+        assert_eq!(load.active(), cap);
+
+        assert_eq!(
+            reports.iter().map(|r| r.tier).collect::<Vec<_>>(),
+            vec![50, 75, 90, 100]
+        );
+        for report in &reports {
+            // reported at the first stream that reaches the tier
+            assert!(report.active * 100 / cap >= report.tier);
+            assert!((report.active - 1) * 100 / cap < report.tier);
+        }
+        assert_eq!(
+            reports.iter().map(|r| r.level()).collect::<Vec<_>>(),
+            vec![Level::Info, Level::Info, Level::Warn, Level::Warn],
+            "only the last two tiers are worth a warning"
+        );
+    }
+
+    #[test]
+    fn stream_load_rearms_a_tier_only_after_dropping_clear_of_it() {
+        let load = StreamLoad::default();
+        let cap = MAX_TUNNEL_STREAMS;
+        // just onto the first tier
+        while load.opened().is_none() {}
+        let at_tier = load.active();
+
+        // hovering there must stay quiet
+        for _ in 0..5 {
+            load.closed();
+            assert_eq!(load.opened(), None, "no repeat while hovering at a tier");
+        }
+
+        // dropping clear of it (by the hysteresis margin) arms it again
+        while load.active() * 100 / cap >= 50 - TIER_HYSTERESIS {
+            load.closed();
+        }
+        let mut crossings = 0;
+        while load.active() < at_tier {
+            if load.opened().is_some() {
+                crossings += 1;
+            }
+        }
+        assert_eq!(crossings, 1, "the tier must be armed again");
     }
 
     #[test]
