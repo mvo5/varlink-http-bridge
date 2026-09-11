@@ -83,7 +83,9 @@ fn fields_to_schema<'a>(fields: impl Iterator<Item = &'a Field<'a>>) -> Value {
     Value::Object(schema)
 }
 
-fn comments_to_string<'a>(comments: impl Iterator<Item = &'a Comment<'a>>) -> Option<String> {
+pub(crate) fn comments_to_string<'a>(
+    comments: impl Iterator<Item = &'a Comment<'a>>,
+) -> Option<String> {
     let parts: Vec<&str> = comments.map(Comment::content).collect();
     (!parts.is_empty()).then(|| parts.join("\n"))
 }
@@ -120,6 +122,13 @@ fn is_more_marker(comment: &Comment) -> bool {
         comment.content().trim(),
         SUPPORTS_MORE_MARKER | REQUIRES_MORE_MARKER
     )
+}
+
+/// The marker lines are a varlink-side convention rather than documentation;
+/// over HTTP the same information is already carried by the response content
+/// types.
+pub(crate) fn method_description(method: &zlink::idl::Method) -> Option<String> {
+    comments_to_string(method.comments().filter(|c| !is_more_marker(c)))
 }
 
 fn method_more_flag(method: &zlink::idl::Method) -> MoreFlag {
@@ -159,9 +168,7 @@ pub fn idl_to_openapi(address: &str, iface: &Interface) -> Value {
         // the fully qualified name stays unique when documents for several
         // interfaces of one service are fed to a single codegen run
         operation.insert("operationId".to_string(), json!(full_method));
-        // the marker lines are a varlink-side convention; over HTTP the same
-        // information is already carried by the response content types
-        if let Some(desc) = comments_to_string(method.comments().filter(|c| !is_more_marker(c))) {
+        if let Some(desc) = method_description(method) {
             operation.insert("description".to_string(), json!(desc));
         }
         let output_schema = fields_to_schema(method.outputs());

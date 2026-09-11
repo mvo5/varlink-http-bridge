@@ -16,7 +16,7 @@ POST /call/{method}                    → invoke method (c.f. varlink call, sup
 POST /call/{service}/{method}          → invoke method on an explicitly given service
 GET  /services                         → list available services (c.f. valinkctl list-registry)
 GET  /services/{service}               → service info (c.f. varlinkctl info)
-GET  /services/{service}/{interface}   → interface details, including method names (c.f. varlinkctl list-methods)
+GET  /services/{service}/{interface}   → documented method, type and error names (c.f. varlinkctl list-methods)
 GET  /idl/{service}/{interface}        → the varlink IDL itself (c.f. varlinkctl introspect)
 GET  /openapi/{service}/{interface}    → OpenAPI 3.1 description generated from varlink IDL
                                          (bridge-specific extension, not part of the spec)
@@ -120,8 +120,15 @@ $ curl -s http://localhost:1031/services/io.systemd.Hostname | jq
 $ curl -s http://localhost:1031/services/io.systemd.Hostname/io.systemd.Hostname | jq
 {
   "methods": [
-    "Describe"
-  ]
+    {
+      "name": "Describe",
+      "description": "Returns hostname, kernel, OS, hardware, firmware and other machine metadata in one call."
+    }
+  ],
+  "types": [],
+  "errors": [],
+  "idl": "/idl/io.systemd.Hostname/io.systemd.Hostname",
+  "openapi": "/openapi/io.systemd.Hostname/io.systemd.Hostname"
 }
 
 $ curl -s http://localhost:1031/call/io.systemd.Hostname.Describe --json '{}' | jq .StaticHostname

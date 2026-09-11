@@ -260,6 +260,7 @@ async fn test_integration_real_systemd_services_get() {
     );
 }
 
+/// The links are followed so they cannot drift from the routes that serve them.
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_real_systemd_service_interface_get() {
@@ -275,13 +276,46 @@ async fn test_integration_real_systemd_service_interface_get() {
         .expect("failed to get from test server");
     assert_eq!(res.status(), 200);
     let body: Value = res.json().await.expect("varlink body invalid");
+
+    for key in ["methods", "types", "errors"] {
+        assert!(
+            body.get(key).is_some_and(Value::is_array),
+            "{key} must be an array: {body}"
+        );
+    }
     // the full list grows with systemd releases, Describe has always been there
+    let describe = body["methods"]
+        .as_array()
+        .and_then(|methods| methods.iter().find(|m| m["name"] == json!("Describe")))
+        .unwrap_or_else(|| panic!("unexpected methods: {body}"));
     assert!(
-        body["methods"]
-            .as_array()
-            .is_some_and(|m| m.contains(&json!("Describe"))),
-        "unexpected methods: {body}"
+        describe["description"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "hostnamed documents Describe, so its IDL comment must be carried over: {describe}"
     );
+
+    for (key, expected) in [
+        ("idl", "/idl/io.systemd.Hostname/io.systemd.Hostname"),
+        (
+            "openapi",
+            "/openapi/io.systemd.Hostname/io.systemd.Hostname",
+        ),
+    ] {
+        let link = body[key].as_str().expect("link must be a string");
+        assert_eq!(link, expected);
+        let res = client
+            .get(format!("http://{}{link}", server.addr))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("failed to follow the {key} link: {e}"));
+        assert_eq!(res.status(), 200, "the {key} link must be routable");
+        let text = res.text().await.expect("link body is not text");
+        assert!(
+            text.contains("io.systemd.Hostname"),
+            "the linked {key} must describe the interface: {text}"
+        );
+    }
 }
 
 #[test_with::path(/run/systemd/io.systemd.Hostname)]

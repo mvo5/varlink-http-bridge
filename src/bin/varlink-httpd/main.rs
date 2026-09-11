@@ -1003,6 +1003,15 @@ async fn route_service_get(
     Ok(axum::Json(serde_json::to_value(info)?))
 }
 
+/// `description` is omitted rather than null so that an undocumented name can
+/// be told apart from one documented as nothing.
+fn described(name: &str, description: Option<String>) -> Value {
+    match description {
+        Some(description) => json!({"name": name, "description": description}),
+        None => json!({"name": name}),
+    }
+}
+
 async fn route_service_interface_get(
     ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
     Path((service, interface)): Path<(String, String)>,
@@ -1012,8 +1021,33 @@ async fn route_service_interface_get(
     let idl = InterfaceIdl::fetch(&service, &interface, &state, &conn_cache).await?;
     let iface = idl.parse()?;
 
-    let methods: Vec<&str> = iface.methods().map(zlink::idl::Method::name).collect();
-    Ok(axum::Json(json!({"methods": methods})))
+    let methods: Vec<Value> = iface
+        .methods()
+        .map(|m| described(m.name(), openapi::method_description(m)))
+        .collect();
+    let types: Vec<Value> = iface
+        .custom_types()
+        .map(|t| {
+            let comments = match t {
+                zlink::idl::CustomType::Object(o) => openapi::comments_to_string(o.comments()),
+                zlink::idl::CustomType::Enum(e) => openapi::comments_to_string(e.comments()),
+            };
+            described(t.name(), comments)
+        })
+        .collect();
+    let errors: Vec<Value> = iface
+        .errors()
+        .map(|e| described(e.name(), openapi::comments_to_string(e.comments())))
+        .collect();
+    Ok(axum::Json(json!({
+        "methods": methods,
+        "types": types,
+        "errors": errors,
+        // point to the full idl/openapi specs with the details, this view here
+        // is really just to get a quick overview
+        "idl": format!("/idl/{service}/{interface}"),
+        "openapi": format!("/openapi/{service}/{interface}"),
+    })))
 }
 
 /// Stream varlink `more` replies as a JSON text sequence (RFC 7464).
