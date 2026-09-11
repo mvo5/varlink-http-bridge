@@ -114,6 +114,7 @@ where
     .context("h2 handshake with node")?;
     let mut ping_pong = conn.ping_pong().expect("first ping_pong handle");
     nodes.attach(reservation, h2);
+    let load = std::sync::Arc::clone(&reservation.load);
     let connected = std::time::Instant::now();
     info!("node {id} connected from {peer}");
 
@@ -131,9 +132,15 @@ where
             }
         }
     };
-    // The lifetime is what tells a redial storm (short lives) apart
-    // from a middlebox reaping an idle tunnel.
-    let lived = || format!("after {:?}", connected.elapsed());
+    // the lifetime tells a redial storm from a middlebox reaping an idle
+    // tunnel, the stream count says how many callers went with it
+    let lived = || {
+        format!(
+            "after {:?} with {} streams open",
+            connected.elapsed(),
+            load.active()
+        )
+    };
     // select tears the connection down when the heartbeat gives up
     tokio::select! {
         result = conn => match result {

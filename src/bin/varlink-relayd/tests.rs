@@ -91,6 +91,28 @@ async fn stub_node_hanging_streams(
     }))
 }
 
+/// A node that keeps the tunnel up but never answers a stream: the
+/// path to it is black-holed, or its accept loop is wedged. The unanswered
+/// streams are kept so h2 does not reset them.
+async fn stub_node_never_answering(
+    node_addr: SocketAddr,
+    id: &str,
+) -> Result<tokio::task::JoinHandle<()>, tokio_tungstenite::tungstenite::Error> {
+    let tcp = TcpStream::connect(node_addr).await.unwrap();
+    let url = format!("ws://{node_addr}{TUNNEL_PATH}?node_id={id}");
+    let (ws, _response) = tokio_tungstenite::client_async(url, tcp).await?;
+    Ok(tokio::spawn(async move {
+        let mut conn = h2_server_builder()
+            .handshake::<_, bytes::Bytes>(WsByteStream::new(ws))
+            .await
+            .unwrap();
+        let mut unanswered = Vec::new();
+        while let Some(Ok(stream)) = conn.accept().await {
+            unanswered.push(stream);
+        }
+    }))
+}
+
 /// The relay attaches a node's h2 handle only after the h2 handshake,
 /// which runs in the stub's task; tests must not race it.
 async fn wait_registered(nodes: &Nodes, id: &str) {
@@ -442,4 +464,20 @@ async fn a_caller_gets_503_when_the_node_stays_full() {
         .expect("the tunnel must have survived the rejected callers")
         .unwrap();
     assert_eq!(&got, b"ping");
+}
+
+/// The same wait, but with the node's slots free: that is not the relay
+/// out of capacity, that is a node not answering, and the caller and the
+/// log must not be told otherwise.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_that_does_not_answer_is_not_reported_as_full() {
+    let (node_addr, connect_addr, nodes) = start_relay().await;
+    let _node = stub_node_never_answering(node_addr, TEST_ID).await.unwrap();
+    wait_registered(&nodes, TEST_ID).await;
+
+    let (_stream, status) = send_connect(connect_addr, TEST_ID, b"").await;
+    assert_eq!(status, "HTTP/1.1 502 Bad Gateway");
+
+    // the tunnel itself is fine as far as the relay can tell
+    assert!(nodes.get(TEST_ID.parse().unwrap()).is_some());
 }

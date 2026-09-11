@@ -13,7 +13,7 @@ use log::debug;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use varlink_http_bridge::tunnel::{MAX_TUNNEL_STREAMS, NodeId, send_all, splice};
+use varlink_http_bridge::tunnel::{MAX_TUNNEL_STREAMS, NodeId, StreamSlot, send_all, splice};
 
 use crate::HANDSHAKE_TIMEOUT;
 use crate::registry::Nodes;
@@ -94,11 +94,18 @@ async fn handle(
                 )));
             }
         };
-    let Some(h2) = nodes.get(id) else {
+    let Some((h2, load)) = nodes.get(id) else {
         deny(&mut stream, "502 Bad Gateway").await;
         return Err(Denied::Node(anyhow!("no connected node {id}")));
     };
 
+    // before the wait: a caller sitting in the queue otherwise looks
+    // like a network problem
+    if load.active() >= MAX_TUNNEL_STREAMS {
+        debug!(
+            "caller waiting for a free stream on node {id}, all {MAX_TUNNEL_STREAMS} are in use"
+        );
+    }
     let stream_to_node = async {
         let mut h2 = h2.ready().await.context("h2 stream slot")?;
         let request = http::Request::builder()
@@ -122,6 +129,16 @@ async fn handle(
             return Err(Denied::Node(e));
         }
         Err(_) => {
+            // the count tells a full tunnel from a node that has stopped
+            // answering; only the first is the relay's own capacity
+            let active = load.active();
+            if active < MAX_TUNNEL_STREAMS {
+                deny(&mut stream, "502 Bad Gateway").await;
+                return Err(Denied::Node(anyhow!(
+                    "node {id} did not accept the stream within {slot_timeout:?} \
+                     with {active}/{MAX_TUNNEL_STREAMS} streams in use"
+                )));
+            }
             deny(&mut stream, "503 Service Unavailable").await;
             return Err(Denied::Overload(anyhow!(
                 "gave up after {slot_timeout:?}: node {id} kept all \
@@ -133,6 +150,15 @@ async fn handle(
     // the h2 stream id is the one name both ends of the tunnel see, so
     // the node's lines for this caller can be found from the relay's
     let who = format!("node {id} stream {}", u32::from(send.stream_id()));
+    let (_busy, report) = StreamSlot::open(&load);
+    if let Some(report) = report {
+        log::log!(
+            report.level(),
+            "node {id} is using {}/{MAX_TUNNEL_STREAMS} tunnel streams ({}%)",
+            report.active,
+            report.tier
+        );
+    }
 
     stream
         .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
@@ -145,7 +171,10 @@ async fn handle(
             .await
             .map_err(Denied::Node)?;
     }
-    debug!("{who}: spliced");
+    debug!(
+        "{who}: spliced, tunnel now at {}/{MAX_TUNNEL_STREAMS} streams",
+        load.active()
+    );
 
     let started = std::time::Instant::now();
     let result = splice(stream, recv, send, &who).await;
