@@ -17,6 +17,7 @@ POST /call/{service}/{method}          → invoke method on an explicitly given 
 GET  /services                         → list available services (c.f. valinkctl list-registry)
 GET  /services/{service}               → service info (c.f. varlinkctl info)
 GET  /services/{service}/{interface}   → interface details, including method names (c.f. varlinkctl list-methods)
+GET  /idl/{service}/{interface}        → the varlink IDL itself (c.f. varlinkctl introspect)
 GET  /openapi/{service}/{interface}    → OpenAPI 3.1 description generated from varlink IDL
                                          (bridge-specific extension, not part of the spec)
 

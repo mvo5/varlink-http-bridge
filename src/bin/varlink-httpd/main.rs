@@ -937,6 +937,12 @@ impl InterfaceIdl {
             .parse()
             .map_err(|e| AppError::bad_gateway(format!("upstream IDL parse error: {e}")))
     }
+
+    fn raw(&self) -> Result<&str, AppError> {
+        self.0
+            .as_raw()
+            .ok_or_else(|| AppError::bad_gateway("upstream description carries no IDL"))
+    }
 }
 
 async fn route_openapi_get(
@@ -959,6 +965,20 @@ async fn route_openapi_get(
     }
 
     Ok(axum::Json(openapi::idl_to_openapi(&service, &iface)))
+}
+
+/// TODO: consider defining an IDL content type
+const IDL_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+
+/// The interface description verbatim, as the service returned it.
+async fn route_idl_get(
+    ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
+    Path((service, interface)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    debug!("GET idl for service: {service}, interface: {interface}");
+    let idl = InterfaceIdl::fetch(&service, &interface, &state, &conn_cache).await?;
+    Ok(([("Content-Type", IDL_CONTENT_TYPE)], idl.raw()?.to_string()))
 }
 
 async fn route_services_get(State(state): State<AppState>) -> Result<axum::Json<Value>, AppError> {
@@ -1321,6 +1341,7 @@ fn create_router(
             "/services/{service}/{interface}",
             get(route_service_interface_get),
         )
+        .route("/idl/{service}/{interface}", get(route_idl_get))
         // not part of the UAPI spec, a bridge-specific extension
         .route("/openapi/{service}/{interface}", get(route_openapi_get))
         .route("/call/{method}", post(route_call_post))
