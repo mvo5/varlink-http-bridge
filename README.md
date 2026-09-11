@@ -17,6 +17,7 @@ POST /call/{socket}/{method}           → invoke method on an explicitly given 
 GET  /sockets                          → list available sockets (c.f. valinkctl list-registry)
 GET  /sockets/{socket}                 → socket info (c.f. varlinkctl info)
 GET  /sockets/{socket}/{interface}     → interface details, including method names (c.f. varlinkctl list-methods)
+GET  /idl/{socket}/{interface}         → the varlink IDL itself (c.f. varlinkctl introspect)
 GET  /openapi/{socket}/{interface}     → OpenAPI 3.1 description generated from varlink IDL
 
 GET  /health                           → health check

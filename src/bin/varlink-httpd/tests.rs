@@ -585,6 +585,63 @@ async fn test_varlink_unix_sockets_in_skips_dangling_symlinks() {
 
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
+async fn test_integration_real_systemd_idl_get() {
+    let server = run_test_server("/run/systemd").await;
+
+    let res = Client::new()
+        .get(format!(
+            "http://{}/idl/io.systemd.Hostname/io.systemd.Hostname",
+            server.addr,
+        ))
+        .send()
+        .await
+        .expect("failed to get idl");
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        res.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain; charset=utf-8"),
+    );
+
+    let body = res.text().await.expect("idl body is not text");
+    assert!(
+        body.contains("interface io.systemd.Hostname"),
+        "the IDL must name the interface it describes: {body}"
+    );
+    assert!(
+        body.contains("method Describe"),
+        "the IDL must carry the methods: {body}"
+    );
+}
+
+/// The IDL is handed back unparsed, so it must stay parseable by the same
+/// code `/openapi/` uses; otherwise the two endpoints describe different
+/// things for the same interface.
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
+async fn test_integration_idl_matches_openapi_title() {
+    let server = run_test_server("/run/systemd").await;
+
+    let body = Client::new()
+        .get(format!(
+            "http://{}/idl/io.systemd.Hostname/io.systemd.Hostname",
+            server.addr,
+        ))
+        .send()
+        .await
+        .expect("failed to get idl")
+        .text()
+        .await
+        .expect("idl body is not text");
+    let iface: zlink::idl::Interface<'_> = body.as_str().try_into().expect("unparseable IDL");
+
+    let doc = fetch_openapi(server.addr, "io.systemd.Hostname", "io.systemd.Hostname").await;
+    assert_eq!(doc["info"]["title"], iface.name());
+}
+
+#[test_with::path(/run/systemd/io.systemd.Hostname)]
+#[tokio::test]
 async fn test_integration_real_systemd_openapi_get() {
     let server = run_test_server("/run/systemd").await;
 

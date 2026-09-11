@@ -933,6 +933,12 @@ impl InterfaceIdl {
             .parse()
             .map_err(|e| AppError::bad_gateway(format!("upstream IDL parse error: {e}")))
     }
+
+    fn raw(&self) -> Result<&str, AppError> {
+        self.0
+            .as_raw()
+            .ok_or_else(|| AppError::bad_gateway("upstream description carries no IDL"))
+    }
 }
 
 async fn route_openapi_get(
@@ -955,6 +961,20 @@ async fn route_openapi_get(
     }
 
     Ok(axum::Json(openapi::idl_to_openapi(&socket, &iface)))
+}
+
+/// TODO: consider defining an IDL content type
+const IDL_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+
+/// The interface description verbatim, as the service returned it.
+async fn route_idl_get(
+    ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
+    Path((socket, interface)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    debug!("GET idl for socket: {socket}, interface: {interface}");
+    let idl = InterfaceIdl::fetch(&socket, &interface, &state, &conn_cache).await?;
+    Ok(([("Content-Type", IDL_CONTENT_TYPE)], idl.raw()?.to_string()))
 }
 
 async fn route_sockets_get(State(state): State<AppState>) -> Result<axum::Json<Value>, AppError> {
@@ -1274,6 +1294,7 @@ fn create_router(
             get(route_socket_interface_get),
         )
         .route("/openapi/{socket}/{interface}", get(route_openapi_get))
+        .route("/idl/{socket}/{interface}", get(route_idl_get))
         .route("/call/{method}", post(route_call_post))
         .route("/call/{socket}/{method}", post(route_call_socket_post))
         .route("/ws/sockets/{socket}", get(route_ws))
