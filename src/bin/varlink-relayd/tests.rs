@@ -113,6 +113,42 @@ async fn stub_node_never_answering(
     }))
 }
 
+/// A node that registers and then dies without closing its socket: a
+/// machine that lost power, as the relay sees it until a PING goes
+/// unanswered. Driving the connection is what answers PINGs, so the
+/// stub stops doing that once the test awaits the returned future, and
+/// the socket stays open but mute.
+async fn stub_node_that_goes_silent(
+    node_addr: SocketAddr,
+    id: &str,
+) -> Result<
+    (tokio::task::JoinHandle<()>, impl Future<Output = ()>),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    let tcp = TcpStream::connect(node_addr).await.unwrap();
+    let url = format!("ws://{node_addr}{TUNNEL_PATH}?node_id={id}");
+    let (ws, _response) = tokio_tungstenite::client_async(url, tcp).await?;
+    let (silence, silenced) = tokio::sync::oneshot::channel::<()>();
+    let (muted, mute) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let mut conn = h2_server_builder()
+            .handshake::<_, bytes::Bytes>(WsByteStream::new(ws))
+            .await
+            .unwrap();
+        tokio::select! {
+            _ = conn.accept() => {}
+            _ = silenced => {}
+        }
+        let _ = muted.send(());
+        let _open = conn;
+        std::future::pending::<()>().await;
+    });
+    Ok((task, async move {
+        let _ = silence.send(());
+        mute.await.expect("the stub must confirm it went mute");
+    }))
+}
+
 /// The relay attaches a node's h2 handle only once the node answered
 /// its first PING, which the stub's task does by driving its
 /// connection; tests must not race it.
@@ -231,23 +267,42 @@ async fn malformed_connect_gets_400() {
     assert_eq!(status, "HTTP/1.1 400 Bad Request");
 }
 
-/// A node that claims a taken id retries forever, and one relay serves
-/// a fleet of them, so the complaint must not repeat per attempt.
+/// A colliding claim is not a collision until the holder proves it is
+/// alive, so what the registry does at claim time is wake the holder's
+/// probe; the holder then reports the first collision and, since a
+/// misconfigured node retries forever and one relay serves a fleet of
+/// them, stays quiet about the retries.
 #[test]
 fn repeated_duplicate_claims_are_only_reported_once() {
+    use futures_util::FutureExt as _;
+
     let nodes = Nodes::default();
     let id = TEST_ID.parse::<NodeId>().unwrap();
-    let _holder = nodes.reserve(id).expect("first claim wins");
+    let holder = nodes.reserve(id).expect("first claim wins");
+    assert!(
+        holder.reservation.probe.notified().now_or_never().is_none(),
+        "nothing to probe before anyone claims the id"
+    );
 
-    let Err(first) = nodes.reserve(id) else {
-        panic!("the second claim must be refused");
-    };
-    assert!(first.loud, "the first collision is worth a warning");
+    assert!(
+        nodes.reserve(id).is_err(),
+        "the second claim must be refused"
+    );
+    assert!(
+        holder.reservation.probe.notified().now_or_never().is_some(),
+        "the claim must wake the holder's probe"
+    );
+    // the probe was answered: this is a live duplicate
+    assert!(
+        nodes.claim_is_news(&holder.reservation),
+        "the first collision on a live holder is worth a warning"
+    );
     for attempt in 0..5 {
-        let Err(again) = nodes.reserve(id) else {
-            panic!("the claim must stay refused");
-        };
-        assert!(!again.loud, "retry {attempt} must stay quiet");
+        assert!(nodes.reserve(id).is_err(), "the claim must stay refused");
+        assert!(
+            !nodes.claim_is_news(&holder.reservation),
+            "retry {attempt} must stay quiet"
+        );
     }
 }
 
@@ -264,6 +319,49 @@ async fn duplicate_claim_is_rejected_first_wins() {
         panic!("expected an HTTP rejection, got {err:?}");
     };
     assert_eq!(resp.status(), 409);
+
+    // the claim probed the holder; a live one answers and stays
+    tokio::time::sleep(node::HEARTBEAT_TIMEOUT).await;
+    assert!(
+        nodes.get(TEST_ID.parse().unwrap()).is_some(),
+        "a live holder must survive being probed"
+    );
+}
+
+/// README.relayd.md: a node back after an abrupt reboot claims an id
+/// its dead old connection still holds. The 409 it gets triggers a
+/// probe of that holder, which goes unanswered, so the id frees within
+/// one PING timeout rather than a whole heartbeat cycle and the redial
+/// succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_holder_is_reaped_when_its_id_is_reclaimed() {
+    let (node_addr, connect_addr, nodes) = start_relay().await;
+    let (_dead, mute) = stub_node_that_goes_silent(node_addr, TEST_ID)
+        .await
+        .unwrap();
+    wait_registered(&nodes, TEST_ID).await;
+    mute.await;
+
+    // the reboot's first redial: refused, but it wakes the probe
+    let err = stub_node(node_addr, TEST_ID)
+        .await
+        .expect_err("the dead holder still holds the id");
+    let tokio_tungstenite::tungstenite::Error::Http(resp) = err else {
+        panic!("expected an HTTP rejection, got {err:?}");
+    };
+    assert_eq!(resp.status(), 409);
+    wait_released(
+        &nodes,
+        TEST_ID,
+        node::HEARTBEAT_TIMEOUT + STEP,
+        "the probe must reap the dead holder well before the next heartbeat",
+    )
+    .await;
+
+    let _node = stub_node(node_addr, TEST_ID).await.unwrap();
+    wait_registered(&nodes, TEST_ID).await;
+    let (_stream, status) = send_connect(connect_addr, TEST_ID, b"").await;
+    assert_eq!(status, "HTTP/1.1 200 Connection established");
 }
 
 #[tokio::test(flavor = "multi_thread")]

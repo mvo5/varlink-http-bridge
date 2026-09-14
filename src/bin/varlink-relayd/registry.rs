@@ -18,7 +18,8 @@ use varlink_http_bridge::tunnel::{NodeId, StreamLoad};
 /// The connected nodes. First-wins among live connections: a claim on
 /// an occupied id is rejected and triggers an immediate liveness probe
 /// of the holder, so a dead holder is reaped within seconds instead of
-/// a full heartbeat cycle.
+/// a full heartbeat cycle. Only a holder that answers the probe makes
+/// the claim a collision worth reporting ([`Nodes::claim_is_news`]).
 #[derive(Default)]
 pub(crate) struct Nodes {
     map: Mutex<HashMap<NodeId, Node>>,
@@ -30,22 +31,20 @@ struct Node {
     // pokes the holder's heartbeat out of cycle on a colliding claim
     probe: Arc<Notify>,
     load: Arc<StreamLoad>,
-    // when a colliding claim on this id was last reported: a
+    // when a colliding claim on this live holder was last reported: a
     // misconfigured node retries forever, and one relay serves a whole
     // fleet of them, so the same complaint must not repeat per attempt
-    claim_reported: Instant,
+    claim_reported: Option<Instant>,
 }
 
 /// How often one node id repeats its "already connected" complaint.
 const CLAIM_REPORT_INTERVAL: Duration = Duration::from_secs(600);
 
-/// A claim on an id another live connection holds. `loud` is false
-/// while the same collision is still being retried, so the caller can
-/// keep the log proportional to the problem rather than to the retries.
+/// A claim on an id another connection holds. Whether that is worth a
+/// warning is not known yet: the holder may be dead, and the probe this
+/// claim triggered is what finds out.
 #[derive(Debug)]
-pub(crate) struct Collision {
-    pub(crate) loud: bool,
-}
+pub(crate) struct Collision;
 
 /// A successful reservation; everything the node face needs to attach,
 /// heartbeat, and release its entry.
@@ -73,13 +72,9 @@ impl Nodes {
     /// and refuse.
     pub(crate) fn reserve(&self, id: NodeId) -> Result<ReservationGuard<'_>, Collision> {
         let mut map = self.map.lock().expect("nodes lock");
-        if let Some(holder) = map.get_mut(&id) {
+        if let Some(holder) = map.get(&id) {
             holder.probe.notify_one();
-            let loud = holder.claim_reported.elapsed() >= CLAIM_REPORT_INTERVAL;
-            if loud {
-                holder.claim_reported = Instant::now();
-            }
-            return Err(Collision { loud });
+            return Err(Collision);
         }
         let probe = Arc::new(Notify::new());
         let load = Arc::new(StreamLoad::default());
@@ -89,8 +84,7 @@ impl Nodes {
                 h2: None,
                 probe: Arc::clone(&probe),
                 load: Arc::clone(&load),
-                // a fresh holder reports the first collision at once
-                claim_reported: Instant::now() - CLAIM_REPORT_INTERVAL,
+                claim_reported: None,
             },
         );
         Ok(ReservationGuard {
@@ -105,6 +99,22 @@ impl Nodes {
         let mut map = self.map.lock().expect("nodes lock");
         let node = map.get_mut(&reservation.id).expect("reserved id is held");
         node.h2 = Some(h2);
+    }
+
+    /// Whether the holder of `reservation`, having just answered the
+    /// probe a colliding claim triggered, should report that claim:
+    /// yes for the first one and then once per [`CLAIM_REPORT_INTERVAL`],
+    /// so the log stays proportional to the problem, not to the retries.
+    pub(crate) fn claim_is_news(&self, reservation: &Reservation) -> bool {
+        let mut map = self.map.lock().expect("nodes lock");
+        let node = map.get_mut(&reservation.id).expect("reserved id is held");
+        let news = node
+            .claim_reported
+            .is_none_or(|at| at.elapsed() >= CLAIM_REPORT_INTERVAL);
+        if news {
+            node.claim_reported = Some(Instant::now());
+        }
+        news
     }
 
     pub(crate) fn get(&self, id: NodeId) -> Option<(SendRequest<Bytes>, Arc<StreamLoad>)> {

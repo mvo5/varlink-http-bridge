@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 use varlink_http_bridge::tunnel::{NodeId, TUNNEL_PATH, WsByteStream, h2_client_builder};
 
 use crate::HANDSHAKE_TIMEOUT;
-use crate::registry::{Nodes, ReservationGuard};
+use crate::registry::{Collision, Nodes, ReservationGuard};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
@@ -54,17 +54,14 @@ pub(crate) async fn serve(
                 None => handle(stream, &nodes, peer).await,
             };
             if let Err(e) = result {
-                // A node that claims a taken id is a real
-                // misconfiguration and stays visible; everything else
-                // here is a peer that failed to become a tunnel (a
-                // scanner, a TLS mismatch, a half-open connection),
-                // which a public port sees all day.
-                match e.downcast_ref::<DuplicateClaim>() {
-                    // the same node retries forever, so it says this
-                    // once and then only as an occasional reminder
-                    Some(claim) if claim.loud => warn!("node connection from {peer}: {e:#}"),
-                    _ => debug!("node connection from {peer}: {e:#}"),
-                }
+                // everything here is a peer that failed to become a
+                // tunnel (a scanner, a TLS mismatch, a half-open
+                // connection), which a public port sees all day. That
+                // includes a claim on a taken id: it is usually the same
+                // node back after an abrupt death, and the holder's
+                // heartbeat says so at warn if the probe finds it alive
+                // instead
+                debug!("node connection from {peer}: {e:#}");
             }
         });
     }
@@ -100,7 +97,7 @@ where
             // the rejection this side chose is more use than
             // tungstenite's "HTTP error response" wrapper around it
             return Err(match duplicate {
-                Some((id, loud)) => anyhow::Error::new(DuplicateClaim { id, loud }),
+                Some(id) => anyhow!("claimed node id {id}, which another connection holds"),
                 None => anyhow::Error::new(e).context("node WebSocket upgrade"),
             });
         }
@@ -140,15 +137,28 @@ where
     let connected = std::time::Instant::now();
     info!("node {id} connected from {peer}");
 
+    // resolves with whether the PING that failed was a probe
     let heartbeat = async {
         loop {
-            tokio::select! {
-                () = tokio::time::sleep(HEARTBEAT_INTERVAL) => {}
+            let probed = tokio::select! {
+                () = tokio::time::sleep(HEARTBEAT_INTERVAL) => false,
                 // a colliding claim asked whether this holder is alive
-                () = reservation.probe.notified() => {}
-            }
+                () = reservation.probe.notified() => true,
+            };
             if !ping(&mut ping_pong).await {
-                return;
+                return probed;
+            }
+            // alive, so the claim was not this node back from an abrupt
+            // death: two machines share an id, or two bridges on one
+            if probed {
+                if nodes.claim_is_news(reservation) {
+                    warn!(
+                        "node {id} is live, but another connection claimed its id; if this is \
+                         a second bridge on the same machine, give it --instance"
+                    );
+                } else {
+                    debug!("node {id} is live, another connection claimed its id again");
+                }
             }
         }
     };
@@ -167,11 +177,19 @@ where
             Ok(()) => info!("node {id} disconnected {}", lived()),
             Err(e) => info!("node {id} connection failed {}: {e}", lived()),
         },
-        // it is reachable but not answering: a wedged node, a black
-        // hole in the path, something an operator wants to see
-        () = heartbeat => warn!(
-            "node {id} stopped answering PINGs {}, dropping it", lived()
-        ),
+        // the connection that claimed the id is right that this one is
+        // dead: a node back after an abrupt reboot, and the redial it
+        // is about to make is the recovery
+        probed = heartbeat => if probed {
+            info!(
+                "node {id} did not answer a probe {}, dropping it for the connection claiming its id",
+                lived()
+            );
+        } else {
+            // it is reachable but not answering: a wedged node, a black
+            // hole in the path, something an operator wants to see
+            warn!("node {id} stopped answering PINGs {}, dropping it", lived());
+        },
     }
     Ok(())
 }
@@ -197,7 +215,7 @@ fn reserve_from_upgrade<'a>(
     nodes: &'a Nodes,
     // set on the 409 path: the rejection travels to the node as a
     // status, and this tells our own log which one it was
-    duplicate: &mut Option<(NodeId, bool)>,
+    duplicate: &mut Option<NodeId>,
 ) -> Result<ReservationGuard<'a>, ErrorResponse> {
     let reject = |status: u16, msg: &str| {
         let mut resp = ErrorResponse::new(Some(msg.to_string()));
@@ -215,33 +233,8 @@ fn reserve_from_upgrade<'a>(
     let id = id
         .parse::<NodeId>()
         .map_err(|_| reject(400, "malformed id"))?;
-    nodes.reserve(id).map_err(|collision| {
-        *duplicate = Some((id, collision.loud));
+    nodes.reserve(id).map_err(|_: Collision| {
+        *duplicate = Some(id);
         reject(409, "id already connected")
     })
 }
-
-/// A node claimed an id another live connection already holds. It has
-/// its own type so the accept loop can be loud about it: unlike the
-/// rest of what a public port sees, this one needs an operator, and it
-/// usually means two bridge instances on one host without `--instance`.
-#[derive(Debug)]
-struct DuplicateClaim {
-    id: NodeId,
-    /// whether this collision is worth a warning, see
-    /// [`crate::registry::Collision`]
-    loud: bool,
-}
-
-impl std::fmt::Display for DuplicateClaim {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "claimed node id {}, which another live connection holds; if this is a second \
-             bridge on the same machine, give it --instance",
-            self.id
-        )
-    }
-}
-
-impl std::error::Error for DuplicateClaim {}
