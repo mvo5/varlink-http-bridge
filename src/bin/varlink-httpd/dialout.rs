@@ -10,7 +10,6 @@
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use axum::Router;
 use axum::extract::connect_info::Connected;
 use axum::serve::IncomingStream;
 use log::{debug, error, info, warn};
@@ -19,24 +18,19 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::WebSocketStream;
 
-// one erased stream type so the whole tunnel path costs a single
-// instantiation of the axum/hyper serving stack, TLS or not
-use varlink_http_bridge::BoxedStream;
 use varlink_http_bridge::tunnel::{
     MAX_TUNNEL_STREAMS, NodeId, STREAM_WINDOW, StreamLoad, StreamSlot, TUNNEL_PATH, WsByteStream,
     h2_server_builder, splice,
 };
 
 /// What [`DialOutListener::accept`] reports as the peer: there is no
-/// real address, and the TLS channel binding must travel here because
-/// the boxed stream hides the TLS layer from `connect_info`.
-#[derive(Clone)]
+/// real address, only the tunnel and the stream on it.
+#[derive(Clone, Debug)]
 pub(crate) struct TunnelPeer {
     describe: std::sync::Arc<str>,
     // the h2 stream this connection came in on: the only name the relay
     // and this bridge both see, so their log lines can be matched up
     stream: Option<u32>,
-    binding: Option<varlink_http_bridge::TlsChannelBinding>,
 }
 
 impl std::fmt::Display for TunnelPeer {
@@ -49,35 +43,27 @@ impl std::fmt::Display for TunnelPeer {
     }
 }
 
-impl std::fmt::Debug for TunnelPeer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // never the binding: it feeds the auth token computation
-        write!(f, "TunnelPeer({})", self.describe)
-    }
-}
-
 /// An `axum::serve::Listener` fed by the relay tunnel instead of a
 /// socket: a background task dials the relay, keeps redialing with
 /// backoff and jitter, and forwards each h2 stream as one connection.
+/// Plaintext: the caller's TLS terminates in the
+/// [`crate::AsyncTlsListener`] wrapped around this, per stream, so the
+/// relay never sees it.
 pub(crate) struct DialOutListener {
-    conns: mpsc::Receiver<(BoxedStream, TunnelPeer)>,
+    conns: mpsc::Receiver<(DuplexStream, TunnelPeer)>,
     describe: std::sync::Arc<str>,
 }
 
 impl DialOutListener {
-    /// The caller's TLS terminates here, per accepted tunnel stream,
-    /// when an acceptor is configured (the relay never sees plaintext).
-    pub(crate) fn start(url: &str, node_id: NodeId, tls: Option<crate::TlsConfig>) -> Result<Self> {
+    pub(crate) fn start(url: &str, node_id: NodeId) -> Result<Self> {
         let target = TunnelUrl::parse(url)?;
         let (tx, rx) = mpsc::channel(16);
-        let describe: std::sync::Arc<str> = format!("{url} as {node_id}").into();
+        let describe: std::sync::Arc<str> = format!("{url} as node {node_id}").into();
         tokio::spawn(dial_loop(
             target,
             node_id,
             StreamSink {
                 conns: tx,
-                tls,
-                tls_timeout: STREAM_TLS_TIMEOUT,
                 describe: std::sync::Arc::clone(&describe),
             },
         ));
@@ -89,7 +75,7 @@ impl DialOutListener {
 }
 
 impl axum::serve::Listener for DialOutListener {
-    type Io = BoxedStream;
+    type Io = DuplexStream;
     type Addr = TunnelPeer;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
@@ -106,91 +92,50 @@ impl axum::serve::Listener for DialOutListener {
         Ok(TunnelPeer {
             describe: std::sync::Arc::clone(&self.describe),
             stream: None,
-            binding: None,
         })
     }
 }
 
+// one line per caller, so debug: at info the tunnel's own lifecycle has
+// to stay findable among them
 impl Connected<IncomingStream<'_, DialOutListener>> for crate::VarlinkConnCache {
     fn connect_info(target: IncomingStream<'_, DialOutListener>) -> Self {
-        let peer = target.remote_addr();
-        // one line per caller, so debug: at info the tunnel's own
-        // lifecycle has to stay findable among them
-        debug!("new tunnel connection via {peer}");
-        Self::new(peer.binding.clone())
+        debug!("new tunnel connection via {}", target.remote_addr());
+        Self::new(None)
     }
 }
 
-// Bounds the caller's TLS handshake on a tunnel stream. The relay only
-// bounds the CONNECT before it, and until the handshake is done the
-// stream holds one of this node's MAX_TUNNEL_STREAMS slots: without a
-// limit, that many silent callers take the node off the relay.
-const STREAM_TLS_TIMEOUT: Duration = Duration::from_secs(10);
+impl Connected<IncomingStream<'_, crate::AsyncTlsListener<DialOutListener>>>
+    for crate::VarlinkConnCache
+{
+    fn connect_info(target: IncomingStream<'_, crate::AsyncTlsListener<DialOutListener>>) -> Self {
+        let ssl = target.io().ssl();
+        debug!("new TLS tunnel connection via {}", target.remote_addr());
+        Self::new(Some(varlink_http_bridge::export_tls_channel_binding(ssl)))
+    }
+}
 
-/// Where accepted tunnel streams go: TLS-handshaken when configured,
-/// erased, and handed to the axum listener.
+/// Where accepted tunnel streams go: the queue [`DialOutListener`]
+/// accepts from.
 #[derive(Clone)]
 struct StreamSink {
-    conns: mpsc::Sender<(BoxedStream, TunnelPeer)>,
-    tls: Option<crate::TlsConfig>,
-    tls_timeout: Duration,
+    conns: mpsc::Sender<(DuplexStream, TunnelPeer)>,
     describe: std::sync::Arc<str>,
 }
 
 impl StreamSink {
-    /// Runs the per-stream TLS handshake in its own task so a stalling
-    /// caller cannot block the tunnel accept loop.
     fn deliver(&self, io: DuplexStream, stream: u32) {
-        let sink = self.clone();
+        let conns = self.conns.clone();
+        let peer = TunnelPeer {
+            describe: std::sync::Arc::clone(&self.describe),
+            stream: Some(stream),
+        };
+        // off the accept loop: a full queue has to stall this caller, not
+        // the h2 connection that carries every other one (and the pings)
         tokio::spawn(async move {
-            let peer = TunnelPeer {
-                describe: std::sync::Arc::clone(&sink.describe),
-                stream: Some(stream),
-                binding: None,
-            };
-            let conn: (BoxedStream, TunnelPeer) = match &sink.tls {
-                Some(config) => {
-                    let handshake = crate::tls_accept(config, io);
-                    // either way one caller's problem, and a caller that
-                    // speaks no TLS can repeat it at will: debug. Dropping
-                    // the stream frees the slot.
-                    let tls = match tokio::time::timeout(sink.tls_timeout, handshake).await {
-                        Ok(Ok(tls)) => tls,
-                        Ok(Err(e)) => {
-                            debug!("TLS handshake on {peer}: {e:#}");
-                            return;
-                        }
-                        Err(_) => {
-                            debug!(
-                                "TLS handshake on {peer}: nothing in {:?}, dropping the stream",
-                                sink.tls_timeout
-                            );
-                            return;
-                        }
-                    };
-                    let binding = varlink_http_bridge::export_tls_channel_binding(tls.ssl());
-                    (
-                        Box::new(tls),
-                        TunnelPeer {
-                            binding: Some(binding),
-                            ..peer
-                        },
-                    )
-                }
-                None => (Box::new(io), peer),
-            };
-            let _ = sink.conns.send(conn).await;
+            let _ = conns.send((io, peer)).await;
         });
     }
-}
-
-/// Serve `app` over the tunnel.
-pub(crate) async fn serve(listener: DialOutListener, app: Router) -> Result<()> {
-    let make_svc = app.into_make_service_with_connect_info::<crate::VarlinkConnCache>();
-    axum::serve(listener, make_svc)
-        .with_graceful_shutdown(crate::shutdown_signal())
-        .await?;
-    Ok(())
 }
 
 struct TunnelUrl {
@@ -568,18 +513,25 @@ mod tests {
     /// by then: the node has to hang up on it.
     #[tokio::test]
     async fn a_silent_caller_does_not_keep_its_tunnel_stream() {
+        use axum::serve::Listener as _;
+
         let dir = tempfile::tempdir().unwrap();
         let (cert, key) = crate::tls_cert::load_or_generate(dir.path()).unwrap();
-        let tls =
+        let mut tls =
             crate::load_tls_config(cert.to_str().unwrap(), key.to_str().unwrap(), None, false)
                 .unwrap();
-        let (tx, mut rx) = mpsc::channel(1);
+        tls.handshake_timeout = Duration::from_millis(100);
+        let describe: std::sync::Arc<str> = "test relay".into();
+        let (tx, rx) = mpsc::channel(1);
         let sink = StreamSink {
             conns: tx,
-            tls: Some(tls),
-            tls_timeout: Duration::from_millis(100),
-            describe: "test relay".into(),
+            describe: std::sync::Arc::clone(&describe),
         };
+        let plain = DialOutListener {
+            conns: rx,
+            describe,
+        };
+        let mut listener = crate::AsyncTlsListener::new(plain, tls, log::Level::Debug).unwrap();
 
         let (io, mut caller) = tokio::io::duplex(1024);
         sink.deliver(io, 1);
@@ -591,7 +543,9 @@ mod tests {
             .expect("the stream must be closed on a silent caller");
         assert_eq!(read.unwrap(), 0);
         assert!(
-            rx.try_recv().is_err(),
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
             "nothing must have been handed to axum"
         );
     }

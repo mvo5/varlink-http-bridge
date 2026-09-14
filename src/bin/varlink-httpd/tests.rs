@@ -3634,7 +3634,8 @@ async fn test_tls_handshake_timeout_drops_a_silent_client() {
 
     let inner = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = inner.local_addr().unwrap();
-    let mut listener = AsyncTlsListener::new(PlainListener { inner }, tls).unwrap();
+    let mut listener =
+        AsyncTlsListener::new(PlainListener { inner }, tls, log::Level::Warn).unwrap();
 
     let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
     let mut buf = [0u8; 1];
