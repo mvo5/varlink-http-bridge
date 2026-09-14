@@ -141,9 +141,12 @@ where
     let heartbeat = async {
         loop {
             let probed = tokio::select! {
-                () = tokio::time::sleep(HEARTBEAT_INTERVAL) => false,
+                // a claim decides how this PING's outcome is reported,
+                // so it must not lose a tie against the timer
+                biased;
                 // a colliding claim asked whether this holder is alive
                 () = reservation.probe.notified() => true,
+                () = tokio::time::sleep(HEARTBEAT_INTERVAL) => false,
             };
             if !ping(&mut ping_pong).await {
                 return probed;
