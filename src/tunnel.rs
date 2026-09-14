@@ -182,6 +182,61 @@ const STALL_WARN: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const STALL_WARN: Duration = Duration::from_millis(100);
 
+/// Why [`splice`] (or [`send_all`]) gave up, by which side failed. The
+/// same code runs on both tunnel ends, so the sides are named relative
+/// to it: `Local` is the byte stream it was handed (the caller's TCP on
+/// the relay, the hand-off to the server on the node), `Peer` is the h2
+/// stream to the other tunnel end. That is what decides how loud the
+/// end of a stream is: a caller hanging up is routine, a failing tunnel
+/// is news.
+#[derive(Debug)]
+pub enum SpliceError {
+    Local(anyhow::Error),
+    Peer(anyhow::Error),
+}
+
+impl SpliceError {
+    /// True if the local byte stream failed rather than the h2 peer.
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
+
+    /// The failure itself, whichever side it is from.
+    #[must_use]
+    pub fn cause(&self) -> &anyhow::Error {
+        match self {
+            Self::Local(e) | Self::Peer(e) => e,
+        }
+    }
+
+    /// Add context to the cause, keeping the side.
+    #[must_use]
+    pub fn context<C>(self, context: C) -> Self
+    where
+        C: std::fmt::Display + Send + Sync + 'static,
+    {
+        match self {
+            Self::Local(e) => Self::Local(e.context(context)),
+            Self::Peer(e) => Self::Peer(e.context(context)),
+        }
+    }
+}
+
+// transparent: the cause already says which side ("reading local
+// stream", "receiving h2 data"), the variant is there to be matched on
+impl std::fmt::Display for SpliceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.cause(), f)
+    }
+}
+
+impl std::error::Error for SpliceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause().source()
+    }
+}
+
 /// Send `data` on an h2 stream, never ahead of the peer's flow-control
 /// window: waits for capacity and sends in whatever chunks the window
 /// allows. This is the sending half of the end-to-end backpressure.
@@ -189,12 +244,13 @@ const STALL_WARN: Duration = Duration::from_millis(100);
 /// `who` names this stream in the log, see [`splice`].
 ///
 /// # Errors
-/// Returns an error if the stream is reset or closed by the peer.
+/// Returns [`SpliceError::Peer`] if the stream is reset or closed by
+/// the peer; nothing here can fail on the local side.
 pub async fn send_all(
     send: &mut SendStream<Bytes>,
     mut data: Bytes,
     who: &str,
-) -> anyhow::Result<()> {
+) -> Result<(), SpliceError> {
     let mut stalled: Option<std::time::Instant> = None;
     while !data.is_empty() {
         send.reserve_capacity(data.len());
@@ -215,8 +271,10 @@ pub async fn send_all(
                 continue;
             }
         }
-        .context("h2 stream closed while waiting for send capacity")?
-        .context("h2 stream error while waiting for send capacity")?;
+        .context("h2 stream closed while waiting for send capacity")
+        .map_err(SpliceError::Peer)?
+        .context("h2 stream error while waiting for send capacity")
+        .map_err(SpliceError::Peer)?;
         if let Some(since) = stalled.take() {
             info!("{who}: peer resumed reading after {:?}", since.elapsed());
         }
@@ -224,7 +282,8 @@ pub async fn send_all(
             continue;
         }
         send.send_data(data.split_to(available.min(data.len())), false)
-            .context("sending h2 data")?;
+            .context("sending h2 data")
+            .map_err(SpliceError::Peer)?;
     }
     Ok(())
 }
@@ -249,17 +308,24 @@ pub struct Transferred {
 /// both tunnel ends see, so their lines can be matched up.
 ///
 /// # Errors
-/// Returns an error if either side fails; EOFs in both directions are a
-/// clean completion.
+/// Returns an error if either side fails, saying which; EOFs in both
+/// directions are a clean completion.
 pub async fn splice<S>(
     io: S,
     mut recv: RecvStream,
     mut send: SendStream<Bytes>,
     who: &str,
-) -> anyhow::Result<Transferred>
+) -> Result<Transferred, SpliceError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // the local read buffer: topped up by READ_CHUNK once the room left
+    // is under READ_FLOOR, so one allocation serves many small reads (a
+    // varlink message is a few hundred bytes) and a full read gets a
+    // fresh one
+    const READ_CHUNK: usize = 16 * 1024;
+    const READ_FLOOR: usize = 4 * 1024;
+
     let (mut rd, mut wr) = tokio::io::split(io);
 
     // io -> h2; "up"/"down" are relative to this splice: the same code
@@ -268,17 +334,22 @@ where
         let mut sent = 0;
         let mut buf = bytes::BytesMut::new();
         loop {
-            // reserve before every read: read_buf on a full BytesMut
-            // returns Ok(0), which would read as a false EOF below
-            buf.reserve(16 * 1024);
+            // buf is empty here, its capacity is the room; there must
+            // be some before every read, because read_buf on a full
+            // BytesMut returns Ok(0), which would read as a false EOF
+            if buf.capacity() < READ_FLOOR {
+                buf.reserve(READ_CHUNK);
+            }
             let n = rd
                 .read_buf(&mut buf)
                 .await
-                .context("reading local stream")?;
+                .context("reading local stream")
+                .map_err(SpliceError::Local)?;
             if n == 0 {
                 send.send_data(Bytes::new(), true)
-                    .context("sending h2 end-of-stream")?;
-                return anyhow::Ok(sent);
+                    .context("sending h2 end-of-stream")
+                    .map_err(SpliceError::Peer)?;
+                return Ok::<_, SpliceError>(sent);
             }
             sent += n as u64;
             // split().freeze() hands the chunk to h2 without recopying
@@ -291,7 +362,9 @@ where
         let mut received = 0;
         let mut stalled: Option<std::time::Instant> = None;
         while let Some(chunk) = recv.data().await {
-            let chunk = chunk.context("receiving h2 data")?;
+            let chunk = chunk
+                .context("receiving h2 data")
+                .map_err(SpliceError::Peer)?;
             // write_all must never be dropped mid-write -- it would
             // leave an unknown number of bytes written -- so the stall
             // timer runs beside it and the write keeps its state
@@ -300,7 +373,9 @@ where
             loop {
                 tokio::select! {
                     result = &mut write => {
-                        result.context("writing local stream")?;
+                        result
+                            .context("writing local stream")
+                            .map_err(SpliceError::Local)?;
                         break;
                     }
                     () = tokio::time::sleep(STALL_WARN), if stalled.is_none() => {
@@ -323,10 +398,14 @@ where
             received += chunk.len() as u64;
             recv.flow_control()
                 .release_capacity(chunk.len())
-                .context("releasing h2 window")?;
+                .context("releasing h2 window")
+                .map_err(SpliceError::Peer)?;
         }
-        wr.shutdown().await.context("closing local stream")?;
-        anyhow::Ok(received)
+        wr.shutdown()
+            .await
+            .context("closing local stream")
+            .map_err(SpliceError::Local)?;
+        Ok::<_, SpliceError>(received)
     };
 
     let (sent, received) = tokio::try_join!(up, down)?;
@@ -702,14 +781,13 @@ mod tests {
         assert_eq!(got, expected);
     }
 
-    /// The full stack: caller bytes -> h2 stream -> WebSocket -> h2
-    /// server -> local echo, and back.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn h2_over_ws_splice_end_to_end() {
-        let (client_ws, server_ws) = ws_pair().await;
-
-        // node side: h2 server, splicing the one stream onto an echo
-        let node = tokio::spawn(async move {
+    /// The node side of a tunnel: h2 server, splicing the one stream
+    /// onto a local echo. Ends once the client connection is gone, with
+    /// what the splice returned.
+    fn echo_node(
+        server_ws: WsByteStream<DuplexStream>,
+    ) -> tokio::task::JoinHandle<Result<Transferred, SpliceError>> {
+        tokio::spawn(async move {
             let mut conn = h2::server::handshake(server_ws).await.unwrap();
             let (req, mut respond) = conn.accept().await.unwrap().unwrap();
             let body = req.into_body();
@@ -730,9 +808,18 @@ mod tests {
             while let Some(Ok(next)) = conn.accept().await {
                 drop(next);
             }
-            stream.await.unwrap().unwrap();
+            let result = stream.await.unwrap();
             echo.await.unwrap();
-        });
+            result
+        })
+    }
+
+    /// The full stack: caller bytes -> h2 stream -> WebSocket -> h2
+    /// server -> local echo, and back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_over_ws_splice_end_to_end() {
+        let (client_ws, server_ws) = ws_pair().await;
+        let node = echo_node(server_ws);
 
         // relay side: h2 client, splicing the caller onto the stream
         let (client_conn, send_request, response, send) = h2_connect(client_ws).await;
@@ -755,6 +842,173 @@ mod tests {
             .unwrap();
         // end the connection the way the real world does: abruptly;
         // the node must treat that as EOF and wind down
+        client_conn.abort();
+        drop(send_request);
+        tokio::time::timeout(step, node)
+            .await
+            .expect("node side must end once the client is gone")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Varlink traffic is many small messages; the splice read buffer
+    /// hands each read to h2 as its own chunk and tops itself up only
+    /// when nearly spent, and however it carves up its capacity every
+    /// byte must come out the other end, in order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn many_small_messages_arrive_intact() {
+        let (client_ws, server_ws) = ws_pair().await;
+        let node = echo_node(server_ws);
+
+        let (client_conn, send_request, response, send) = h2_connect(client_ws).await;
+        let recv = response.await.unwrap().into_body();
+        let (io, mut caller) = duplex(1024);
+        let relay = tokio::spawn(async move { splice(io, recv, send, "test relay").await });
+
+        // one round trip per message keeps each splice read to one
+        // message, so the buffer is refilled many times over; well over
+        // a chunk's worth of them in total
+        let mut total = 0;
+        for i in 0..4096u32 {
+            let msg: Vec<u8> = (0..=i % 200)
+                .map(|j| u8::try_from((i + j) % 251).unwrap())
+                .collect();
+            caller.write_all(&msg).await.unwrap();
+            let mut got = vec![0u8; msg.len()];
+            caller.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, msg, "message {i} was mangled");
+            total += msg.len() as u64;
+        }
+
+        drop(caller);
+        let step = std::time::Duration::from_secs(3);
+        let moved = tokio::time::timeout(step, relay)
+            .await
+            .expect("relay splice must end on caller EOF")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            moved,
+            Transferred {
+                sent: total,
+                received: total
+            }
+        );
+        client_conn.abort();
+        drop(send_request);
+        tokio::time::timeout(step, node)
+            .await
+            .expect("node side must end once the client is gone")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A local stream whose read fails at once: the caller's TCP reset
+    /// under the relay.
+    struct ResetOnRead;
+
+    impl AsyncRead for ResetOnRead {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))
+        }
+    }
+
+    impl AsyncWrite for ResetOnRead {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The local side going away is the caller's own affair and must be
+    /// reported as such, so the relay can keep it at debug.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_local_side_is_a_local_error() {
+        let (client_ws, server_ws) = ws_pair().await;
+        let node = echo_node(server_ws);
+
+        let (client_conn, send_request, response, send) = h2_connect(client_ws).await;
+        let recv = response.await.unwrap().into_body();
+        let err = splice(ResetOnRead, recv, send, "test relay")
+            .await
+            .unwrap_err();
+        assert!(err.is_local(), "expected a local error, got {err:?}");
+        // the message names the cause, whether printed directly or
+        // through anyhow
+        assert_eq!(format!("{err:#}"), "reading local stream: connection reset");
+        assert_eq!(
+            format!("{:#}", anyhow::Error::from(err)),
+            "reading local stream: connection reset"
+        );
+
+        client_conn.abort();
+        drop(send_request);
+        tokio::time::timeout(std::time::Duration::from_secs(3), node)
+            .await
+            .expect("node side must end once the client is gone")
+            .unwrap()
+            .unwrap_err();
+    }
+
+    /// The h2 peer resetting the stream is the tunnel's affair, and
+    /// must not be blamed on the local side.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_peer_is_a_peer_error() {
+        let (client_ws, server_ws) = ws_pair().await;
+
+        // node side: takes the first bytes, then resets the stream. The
+        // relay has its response by then, so the reset can only land in
+        // the splice
+        let node = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_ws).await.unwrap();
+            let (req, mut respond) = conn.accept().await.unwrap().unwrap();
+            let mut body = req.into_body();
+            let mut send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let first = async {
+                body.data().await.unwrap().unwrap();
+                send.send_reset(h2::Reason::INTERNAL_ERROR);
+            };
+            let drive = async {
+                while let Some(Ok(next)) = conn.accept().await {
+                    drop(next);
+                }
+            };
+            tokio::join!(first, drive);
+        });
+
+        let (client_conn, send_request, response, send) = h2_connect(client_ws).await;
+        let recv = response.await.unwrap().into_body();
+        let (io, mut caller) = duplex(1024);
+        let relay = tokio::spawn(async move { splice(io, recv, send, "test relay").await });
+        caller.write_all(b"hello?").await.unwrap();
+
+        let step = std::time::Duration::from_secs(3);
+        let err = tokio::time::timeout(step, relay)
+            .await
+            .expect("relay splice must end on the reset")
+            .unwrap()
+            .unwrap_err();
+        assert!(!err.is_local(), "expected a peer error, got {err:?}");
+        assert!(
+            format!("{err:#}").starts_with("receiving h2 data: "),
+            "unexpected message: {err:#}"
+        );
+
         client_conn.abort();
         drop(send_request);
         tokio::time::timeout(step, node)
