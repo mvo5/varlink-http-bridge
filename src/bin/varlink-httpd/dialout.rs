@@ -473,9 +473,16 @@ where
     while let Some(next) = conn.accept().await {
         let (request, mut respond) = next.context("tunnel connection failed")?;
         let body = request.into_body();
-        let send = respond
-            .send_response(http::Response::new(()), false)
-            .context("accepting tunnel stream")?;
+        // a caller gone before its stream is answered (hung up, or the
+        // relay gave up queueing it for a slot) is that caller's
+        // problem, not the tunnel's
+        let send = match respond.send_response(http::Response::new(()), false) {
+            Ok(send) => send,
+            Err(e) => {
+                debug!("tunnel stream was gone before it was accepted: {e}");
+                continue;
+            }
+        };
         let stream_id = u32::from(send.stream_id());
         let who = format!("relay stream {stream_id}");
         served += 1;
