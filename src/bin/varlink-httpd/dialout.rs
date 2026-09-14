@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use axum::extract::connect_info::Connected;
 use axum::serve::IncomingStream;
 use log::{debug, error, info, warn};
@@ -209,6 +209,28 @@ impl TunnelUrl {
 const REDIAL_MIN: Duration = Duration::from_secs(1);
 const REDIAL_MAX: Duration = Duration::from_secs(60);
 
+// the relay's heartbeat (node.rs) mirrored, so both ends give up on a
+// silent path in the same ~40s
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+// connect, TLS, WebSocket upgrade and h2 handshake together
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The time limits of one tunnel, in one place so a test can shrink them.
+struct Tuning {
+    dial_timeout: Duration,
+    heartbeat_interval: Duration,
+    heartbeat_timeout: Duration,
+}
+
+impl Tuning {
+    const DEFAULT: Self = Self {
+        dial_timeout: DIAL_TIMEOUT,
+        heartbeat_interval: HEARTBEAT_INTERVAL,
+        heartbeat_timeout: HEARTBEAT_TIMEOUT,
+    };
+}
+
 /// Keep one tunnel connection alive forever: redial on every end, with
 /// exponential backoff on failed dials and jitter so a fleet does not
 /// stampede a restarted relay.
@@ -221,12 +243,23 @@ const REDIAL_MAX: Duration = Duration::from_secs(60);
 /// to a log that was only opened after it started.
 async fn dial_loop(target: TunnelUrl, node_id: NodeId, sink: StreamSink) {
     let relay = target.authority();
+    let tuning = Tuning::DEFAULT;
     let mut backoff = REDIAL_MIN;
     let mut outage: Option<Outage> = None;
     loop {
         let attempt = outage.as_ref().map_or(0, |o| o.attempts) + 1;
         let started_down = outage.as_ref().map(|o| o.since);
-        match dial_once(&target, node_id, &sink, &relay, started_down, attempt).await {
+        match dial_once(
+            &target,
+            node_id,
+            &sink,
+            &relay,
+            started_down,
+            attempt,
+            &tuning,
+        )
+        .await
+        {
             // the connection was established and later ended: normal
             // operation (middleboxes reap long-lived connections)
             Ok(lived) => {
@@ -316,27 +349,38 @@ async fn dial_once(
     relay: &str,
     down_since: Option<std::time::Instant>,
     attempts: u32,
+    tuning: &Tuning,
 ) -> Result<Duration> {
-    let tcp = TcpStream::connect((target.host.as_str(), target.port))
-        .await
-        .context("connecting to relay")?;
-    varlink_http_bridge::set_tcp_keepalive_and_nodelay(&tcp)?;
-    let url = target.ws_url(node_id);
-    let ws_upgrade = async {
+    // one bound over the whole prelude: none of these steps has a
+    // timeout of its own, and a relay that accepts and then says
+    // nothing (a black-holed path, a wedged frontend) would otherwise
+    // park the dial loop for good
+    let prelude = async {
+        let tcp = TcpStream::connect((target.host.as_str(), target.port))
+            .await
+            .context("connecting to relay")?;
+        varlink_http_bridge::set_tcp_keepalive_and_nodelay(&tcp)?;
+        let url = target.ws_url(node_id);
         if target.tls {
             let tls = tls_connect(&target.host, tcp).await?;
             let (ws, _response) = tokio_tungstenite::client_async(url, tls)
                 .await
                 .context("tunnel WebSocket upgrade")?;
-            anyhow::Ok(Tunnel::Tls(ws))
+            anyhow::Ok(Tunnel::Tls(accept_h2(ws).await?))
         } else {
             let (ws, _response) = tokio_tungstenite::client_async(url, tcp)
                 .await
                 .context("tunnel WebSocket upgrade")?;
-            anyhow::Ok(Tunnel::Plain(ws))
+            anyhow::Ok(Tunnel::Plain(accept_h2(ws).await?))
         }
     };
-    let tunnel = ws_upgrade.await.map_err(|e| upgrade_hint(e, node_id))?;
+    let tunnel = match tokio::time::timeout(tuning.dial_timeout, prelude).await {
+        Ok(dialed) => dialed.map_err(|e| upgrade_hint(e, node_id))?,
+        Err(_) => bail!(
+            "the tunnel handshake did not complete within {:?}",
+            tuning.dial_timeout
+        ),
+    };
 
     match down_since {
         Some(since) => info!(
@@ -347,18 +391,32 @@ async fn dial_once(
     }
     let started = std::time::Instant::now();
     match tunnel {
-        Tunnel::Tls(ws) => serve_tunnel(ws, sink).await,
-        Tunnel::Plain(ws) => serve_tunnel(ws, sink).await,
+        Tunnel::Tls(conn) => serve_tunnel(conn, sink, tuning).await,
+        Tunnel::Plain(conn) => serve_tunnel(conn, sink, tuning).await,
     }?;
     Ok(started.elapsed())
 }
+
+/// The h2 server side of a tunnel over one of its transports.
+type H2Conn<S> = h2::server::Connection<WsByteStream<S>, bytes::Bytes>;
 
 /// The two transports a tunnel can run on, so the dial and the serving
 /// half stay separate (the log line in between needs the dial to be
 /// done and the serving not to have started).
 enum Tunnel {
-    Tls(WebSocketStream<tokio_openssl::SslStream<TcpStream>>),
-    Plain(WebSocketStream<TcpStream>),
+    Tls(H2Conn<tokio_openssl::SslStream<TcpStream>>),
+    Plain(H2Conn<TcpStream>),
+}
+
+/// The h2 handshake, roles reversed: the relay sends the client preface.
+async fn accept_h2<S>(ws: WebSocketStream<S>) -> Result<H2Conn<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    h2_server_builder()
+        .handshake::<_, bytes::Bytes>(WsByteStream::new(ws))
+        .await
+        .context("h2 handshake with relay")
 }
 
 /// Turn the two rejections an operator can actually fix into advice.
@@ -403,21 +461,46 @@ async fn tls_connect(host: &str, tcp: TcpStream) -> Result<tokio_openssl::SslStr
 /// One established tunnel: h2 server role-reversed over the WebSocket;
 /// every stream the relay opens is answered with 200 and handed to
 /// axum as a connection, spliced by its own task.
-async fn serve_tunnel<S>(ws: WebSocketStream<S>, sink: &StreamSink) -> Result<()>
+async fn serve_tunnel<S>(mut conn: H2Conn<S>, sink: &StreamSink, tuning: &Tuning) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut conn = h2_server_builder()
-        .handshake::<_, bytes::Bytes>(WsByteStream::new(ws))
-        .await
-        .context("h2 handshake with relay")?;
+    let mut ping_pong = conn.ping_pong().expect("first ping_pong handle");
+    // the relay pings too, but only the side that notices a silent path
+    // can end its half: after a NAT mapping expires the relay reaps this
+    // node in ~40s, while accept() alone would wait for the OS TCP
+    // keepalive, ~2h by default, serving nobody
+    let heartbeat = async {
+        loop {
+            tokio::time::sleep(tuning.heartbeat_interval).await;
+            let ping = ping_pong.ping(h2::Ping::opaque());
+            match tokio::time::timeout(tuning.heartbeat_timeout, ping).await {
+                Ok(Ok(_pong)) => {}
+                Ok(Err(e)) => return anyhow::Error::new(e).context("PING to the relay"),
+                Err(_) => {
+                    return anyhow!(
+                        "no PONG from the relay within {:?}",
+                        tuning.heartbeat_timeout
+                    );
+                }
+            }
+        }
+    };
+    tokio::pin!(heartbeat);
     let load = std::sync::Arc::new(StreamLoad::default());
     let mut served: u64 = 0;
     // once per tunnel: a full queue means axum is not taking
     // connections as fast as callers arrive, which is worth knowing but
     // not worth a line per stream
     let mut queue_warned = false;
-    while let Some(next) = conn.accept().await {
+    loop {
+        let next = tokio::select! {
+            next = conn.accept() => next,
+            // reachable but not answering, or not reachable at all: an
+            // error here is what makes the dial loop call it an outage
+            why = &mut heartbeat => return Err(why),
+        };
+        let Some(next) = next else { break };
         let (request, mut respond) = next.context("tunnel connection failed")?;
         let body = request.into_body();
         // a caller gone before its stream is answered (hung up, or the
@@ -482,7 +565,30 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
     use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message;
+
+    const TEST_NODE: &str = "0123456789abcdef0123456789abcdef";
+
+    /// A relay stub's address, and the tunnel URL that dials it.
+    async fn stub_relay() -> (TcpListener, TunnelUrl) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = TunnelUrl {
+            tls: false,
+            host: "127.0.0.1".to_string(),
+            port: listener.local_addr().unwrap().port(),
+        };
+        (listener, target)
+    }
+
+    fn plain_sink(conns: mpsc::Sender<(DuplexStream, TunnelPeer)>) -> StreamSink {
+        StreamSink {
+            conns,
+            describe: "stub relay".into(),
+        }
+    }
 
     #[test]
     fn an_outage_is_one_log_line_not_one_per_attempt() {
@@ -595,5 +701,77 @@ mod tests {
         ] {
             assert!(TunnelUrl::parse(bad).is_err(), "must reject {bad:?}");
         }
+    }
+
+    /// The path went silent under an established tunnel (a NAT mapping
+    /// expired): the relay has long reaped this node, and only the
+    /// node's own heartbeat can notice and redial.
+    #[tokio::test]
+    async fn a_relay_that_stops_answering_pings_is_an_outage() {
+        let (listener, target) = stub_relay().await;
+        // upgrades, speaks just enough h2 for the node's handshake to
+        // succeed (the client preface and an empty SETTINGS), and then
+        // never says another word
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+            preface.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+            ws.send(Message::Binary(preface.into())).await.unwrap();
+            // keep reading so nothing backs up, answer nothing
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+        let (tx, _rx) = mpsc::channel(1);
+        let sink = plain_sink(tx);
+        let tuning = Tuning {
+            heartbeat_interval: Duration::from_millis(50),
+            heartbeat_timeout: Duration::from_millis(100),
+            ..Tuning::DEFAULT
+        };
+        let dial = dial_once(
+            &target,
+            TEST_NODE.parse().unwrap(),
+            &sink,
+            "stub",
+            None,
+            1,
+            &tuning,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), dial)
+            .await
+            .expect("the heartbeat must end a tunnel nobody answers on");
+        let e = result.expect_err("a silent relay is an outage, not a clean close");
+        assert!(format!("{e:#}").contains("no PONG"), "{e:#}");
+    }
+
+    /// A relay that accepts TCP and then never finishes the upgrade
+    /// must fail the dial, not park the dial loop.
+    #[tokio::test]
+    async fn a_relay_that_never_finishes_the_handshake_fails_the_dial() {
+        let (listener, target) = stub_relay().await;
+        tokio::spawn(async move {
+            let _held = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (tx, _rx) = mpsc::channel(1);
+        let sink = plain_sink(tx);
+        let tuning = Tuning {
+            dial_timeout: Duration::from_millis(200),
+            ..Tuning::DEFAULT
+        };
+        let dial = dial_once(
+            &target,
+            TEST_NODE.parse().unwrap(),
+            &sink,
+            "stub",
+            None,
+            1,
+            &tuning,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), dial)
+            .await
+            .expect("the dial must be bounded");
+        let e = result.expect_err("a handshake that never completes is a failed dial");
+        assert!(format!("{e:#}").contains("200ms"), "{e:#}");
     }
 }
