@@ -113,8 +113,9 @@ async fn stub_node_never_answering(
     }))
 }
 
-/// The relay attaches a node's h2 handle only after the h2 handshake,
-/// which runs in the stub's task; tests must not race it.
+/// The relay attaches a node's h2 handle only once the node answered
+/// its first PING, which the stub's task does by driving its
+/// connection; tests must not race it.
 async fn wait_registered(nodes: &Nodes, id: &str) {
     let id = id.parse::<NodeId>().unwrap();
     tokio::time::timeout(STEP, async {
@@ -124,6 +125,20 @@ async fn wait_registered(nodes: &Nodes, id: &str) {
     })
     .await
     .expect("node must register");
+}
+
+/// Wait until the relay has given `id` up: the reservation is gone,
+/// not only the h2 handle. `within` is the reason the relay must have
+/// noticed by then.
+async fn wait_released(nodes: &Nodes, id: &str, within: Duration, why: &str) {
+    let id = id.parse::<NodeId>().unwrap();
+    tokio::time::timeout(within, async {
+        while nodes.occupied(id) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect(why);
 }
 
 /// Send `CONNECT <authority>` (plus `extra` pipelined behind it) and
@@ -260,19 +275,50 @@ async fn id_is_reclaimable_after_the_node_drops() {
     // aborting drops the stub's WebSocket; the relay's conn driver ends
     // and releases the id
     node.abort();
-    let id = TEST_ID.parse::<NodeId>().unwrap();
-    tokio::time::timeout(STEP, async {
-        while nodes.occupied(id) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("id must be released when the connection dies");
+    wait_released(
+        &nodes,
+        TEST_ID,
+        STEP,
+        "id must be released when the connection dies",
+    )
+    .await;
 
     let _node = stub_node(node_addr, TEST_ID).await.unwrap();
     wait_registered(&nodes, TEST_ID).await;
     let (_stream, status) = send_connect(connect_addr, TEST_ID, b"").await;
     assert_eq!(status, "HTTP/1.1 200 Connection established");
+}
+
+/// A peer that completes the upgrade and then says nothing holds a
+/// reservation but is not a node: h2's client handshake never waits for
+/// the peer, so only its first pong proves anyone is listening. Callers
+/// must not be routed at it, and it must be given up on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_peer_never_becomes_a_node() {
+    let (node_addr, connect_addr, nodes) = start_relay().await;
+    let tcp = TcpStream::connect(node_addr).await.unwrap();
+    let url = format!("ws://{node_addr}{TUNNEL_PATH}?node_id={TEST_ID}");
+    // held open and never read: the h2 preface and PING land unanswered
+    let (_ws, _response) = tokio_tungstenite::client_async(url, tcp).await.unwrap();
+    let id = TEST_ID.parse::<NodeId>().unwrap();
+    assert!(nodes.occupied(id), "the upgrade reserves the id");
+
+    // long enough for the relay to have run its h2 handshake many times over
+    tokio::time::sleep(node::HEARTBEAT_TIMEOUT / 4).await;
+    assert!(
+        nodes.get(id).is_none(),
+        "a peer that never answered a PING must not be routable"
+    );
+    let (_stream, status) = send_connect(connect_addr, TEST_ID, b"").await;
+    assert_eq!(status, "HTTP/1.1 502 Bad Gateway");
+
+    wait_released(
+        &nodes,
+        TEST_ID,
+        node::HEARTBEAT_TIMEOUT + STEP,
+        "a peer that never answers the first PING must be given up on",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
