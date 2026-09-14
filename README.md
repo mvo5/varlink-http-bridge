@@ -266,12 +266,16 @@ Authentication has two orthogonal layers that compose:
 
 `--auth=ssh` authenticates every request by an SSH key signature.
 `--auth=none` selects no per-request mechanism, leaving mTLS to
-authenticate the client; without mTLS the bridge refuses to start.
+authenticate the client; without mTLS the bridge refuses to start. The
+one exception is an instance with no local listener (`--bind=none
+--relay=`, see README.relayd.md) given a `VARLINK_SOCKETS_PATH` other
+than the default registry: it serves those sockets, and only those,
+unauthenticated over TLS, for harmless things like an update trigger.
 
 mTLS is enabled separately (see below) and applies on top of whatever
 `--auth=` selects, so `--auth=ssh` together with mTLS requires both to
-pass. `--insecure` is the one way to serve with no authentication at
-all, and implies `--auth=none`.
+pass. `--insecure` is the one way to serve a local listener with no
+authentication at all, and implies `--auth=none`.
 
 ### TLS / mTLS
 

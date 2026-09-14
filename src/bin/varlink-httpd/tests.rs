@@ -1954,6 +1954,40 @@ fn test_build_authenticators_none_with_named_sockets_accepts() {
     check_request(auths[0].as_ref(), "GET", "/health", None, None, None).unwrap();
 }
 
+/// Every spelling of the registry is the registry: none of them may unlock
+/// `--auth=none`, and a path that does not resolve fails closed.
+#[test]
+fn test_sockets_named_resolves_spellings_of_the_registry() {
+    let root = tempfile::tempdir().unwrap();
+    let run = root.path().join("run");
+    let registry = run.join("varlink").join("registry");
+    std::fs::create_dir_all(&registry).unwrap();
+    // /var/run -> /run, as on every systemd host, and a direct symlink
+    std::os::unix::fs::symlink(&run, root.path().join("var-run")).unwrap();
+    std::os::unix::fs::symlink(&registry, root.path().join("link")).unwrap();
+
+    let registry_str = registry.to_str().unwrap();
+    for spelling in [
+        registry_str.to_string(),
+        format!("{registry_str}/"),
+        format!("/{registry_str}"),
+        format!("{}/varlink/./registry", run.display()),
+        format!("{}/var-run/varlink/registry", root.path().display()),
+        format!("{}/link", root.path().display()),
+        format!("{}/missing", root.path().display()),
+    ] {
+        assert!(!crate::sockets_named(&spelling, &registry), "{spelling}");
+    }
+
+    let other = root.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    assert!(crate::sockets_named(other.to_str().unwrap(), &registry));
+    // a registry absent on this host cannot be what was named
+    let absent = root.path().join("absent");
+    assert!(crate::sockets_named(other.to_str().unwrap(), &absent));
+    assert!(!crate::sockets_named(absent.to_str().unwrap(), &absent));
+}
+
 #[test]
 fn test_build_authenticators_none_with_mtls_accepts() {
     let root = tempfile::tempdir().unwrap();
