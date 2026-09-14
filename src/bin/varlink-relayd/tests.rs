@@ -7,7 +7,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use varlink_http_bridge::tunnel::{NodeId, TUNNEL_PATH, WsByteStream, h2_server_builder, splice};
+use varlink_http_bridge::tunnel::{
+    NodeId, STREAM_WINDOW, TUNNEL_PATH, WsByteStream, h2_server_builder, splice,
+};
 
 use crate::registry::Nodes;
 use crate::{caller, node};
@@ -35,6 +37,17 @@ async fn stub_node(
     node_addr: SocketAddr,
     id: &str,
 ) -> Result<tokio::task::JoinHandle<()>, tokio_tungstenite::tungstenite::Error> {
+    stub_node_hanging_streams(node_addr, id, 0).await
+}
+
+/// The same node, except the local peers of its first `hang_first`
+/// streams never read a byte: the hung-local-service case, where
+/// `splice` stops releasing h2 window once the stream buffer is full.
+async fn stub_node_hanging_streams(
+    node_addr: SocketAddr,
+    id: &str,
+    hang_first: usize,
+) -> Result<tokio::task::JoinHandle<()>, tokio_tungstenite::tungstenite::Error> {
     let tcp = TcpStream::connect(node_addr).await.unwrap();
     let url = format!("ws://{node_addr}{TUNNEL_PATH}?node_id={id}");
     let (ws, _response) = tokio_tungstenite::client_async(url, tcp).await?;
@@ -43,18 +56,27 @@ async fn stub_node(
             .handshake::<_, bytes::Bytes>(WsByteStream::new(ws))
             .await
             .unwrap();
+        let mut streams = 0;
+        // keeps the hung streams' local peers open without reading them
+        let mut hung = Vec::new();
         while let Some(Ok((req, mut respond))) = conn.accept().await {
             let body = req.into_body();
             let send = respond
                 .send_response(http::Response::new(()), false)
                 .unwrap();
-            tokio::spawn(async move {
-                let (io, echo) = tokio::io::duplex(4096);
+            streams += 1;
+            // the buffer the bridge gives a tunnel stream
+            let (io, peer) = tokio::io::duplex(STREAM_WINDOW as usize);
+            if streams <= hang_first {
+                hung.push(peer);
+            } else {
                 tokio::spawn(async move {
-                    let (mut rd, mut wr) = tokio::io::split(echo);
+                    let (mut rd, mut wr) = tokio::io::split(peer);
                     let _ = tokio::io::copy(&mut rd, &mut wr).await;
                     let _ = wr.shutdown().await;
                 });
+            }
+            tokio::spawn(async move {
                 let _ = splice(io, body, send, "stub node").await;
             });
         }
@@ -224,4 +246,106 @@ async fn upgrade_without_id_is_rejected() {
         panic!("expected an HTTP rejection, got {err:?}");
     };
     assert_eq!(resp.status(), 400);
+}
+
+/// Callers share one tunnel: their streams must run at the same time,
+/// in both directions, not one after the other.
+#[tokio::test(flavor = "multi_thread")]
+async fn callers_are_multiplexed_onto_one_tunnel() {
+    let (node_addr, connect_addr, nodes) = start_relay().await;
+    let _node = stub_node(node_addr, TEST_ID).await.unwrap();
+    wait_registered(&nodes, TEST_ID).await;
+
+    let (mut a, status_a) = send_connect(connect_addr, TEST_ID, b"").await;
+    let (mut b, status_b) = send_connect(connect_addr, TEST_ID, b"").await;
+    assert_eq!(status_a, "HTTP/1.1 200 Connection established");
+    assert_eq!(status_b, "HTTP/1.1 200 Connection established");
+
+    for round in 0..4u8 {
+        a.write_all(b"aaaa").await.unwrap();
+        b.write_all(b"bbbb").await.unwrap();
+        let mut got_a = [0u8; 4];
+        let mut got_b = [0u8; 4];
+        tokio::time::timeout(STEP, a.read_exact(&mut got_a))
+            .await
+            .unwrap_or_else(|_| panic!("caller a stalled in round {round}"))
+            .unwrap();
+        tokio::time::timeout(STEP, b.read_exact(&mut got_b))
+            .await
+            .unwrap_or_else(|_| panic!("caller b stalled in round {round}"))
+            .unwrap();
+        assert_eq!((&got_a, &got_b), (b"aaaa", b"bbbb"));
+    }
+}
+
+/// Callers whose streams stopped draining -- a hung local service, a
+/// caller that went away -- must not starve the other callers on the
+/// same tunnel. That is what `CONNECTION_WINDOW` is sized for: with
+/// h2's default of one stream window for the whole connection, the
+/// wedged callers below own all of it and the healthy caller never sees
+/// its echo.
+#[tokio::test(flavor = "multi_thread")]
+async fn hung_streams_do_not_starve_other_callers() {
+    // few enough that a correctly sized connection window has room for
+    // all of them and one more
+    const HUNG_CALLERS: usize = 8;
+
+    let (node_addr, connect_addr, nodes) = start_relay().await;
+    let _node = stub_node_hanging_streams(node_addr, TEST_ID, HUNG_CALLERS)
+        .await
+        .unwrap();
+    wait_registered(&nodes, TEST_ID).await;
+
+    // the hung callers keep pushing for the rest of the test, so they
+    // hold every byte of window they can claim and reclaim whatever
+    // frees up, like a real hung service would
+    let mut pushers = Vec::new();
+    let mut pushed = Vec::new();
+    for _ in 0..HUNG_CALLERS {
+        let (mut hung, status) = send_connect(connect_addr, TEST_ID, b"").await;
+        assert_eq!(status, "HTTP/1.1 200 Connection established");
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        pushed.push(Arc::clone(&counter));
+        pushers.push(tokio::spawn(async move {
+            let chunk = vec![0x41u8; STREAM_WINDOW as usize];
+            while hung.write_all(&chunk).await.is_ok() {
+                counter.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
+    }
+
+    // wait until every hung caller is wedged and holding window
+    let total = || -> usize {
+        pushed
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .sum()
+    };
+    tokio::time::timeout(STEP, async {
+        loop {
+            let before = total();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if total() == before && before > 0 {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the hung callers must wedge");
+
+    // half a stream window, so leftover bytes of window will not do
+    let ping = vec![0x2Au8; STREAM_WINDOW as usize / 2];
+    let (mut healthy, status) = send_connect(connect_addr, TEST_ID, b"").await;
+    assert_eq!(status, "HTTP/1.1 200 Connection established");
+    let mut got = vec![0u8; ping.len()];
+    let echo = tokio::time::timeout(STEP, async {
+        healthy.write_all(&ping).await.unwrap();
+        healthy.read_exact(&mut got).await.unwrap();
+    })
+    .await;
+    for pusher in pushers {
+        pusher.abort();
+    }
+    echo.expect("hung streams must not block a healthy caller");
+    assert_eq!(got, ping);
 }

@@ -287,3 +287,25 @@ while the inner h2 stream has window capacity, and opens h2 window only
 as bytes drain to the other side, so backpressure propagates end to end
 in both directions. This lives in the `tunnel` module's primitives and
 is tested there.
+
+That backpressure has to stay *per stream*, though. All callers of one
+node share a single h2 connection, and h2's default is one 64KiB window
+for the whole connection, i.e. shared by all of its streams: a single
+caller whose local service hangs -- or who stopped reading its socket --
+then holds the entire connection window and every other caller on that
+tunnel starves. Both tunnel ends therefore size the connection window as
+`MAX_TUNNEL_STREAMS` (256) stream windows of 32KiB each, i.e. 8MiB, and
+the node advertises that same stream limit, so no stream can hold more
+than its own share and a caller beyond the limit waits for a slot (and
+gets a `503` if none frees up in time) instead of slowing everybody
+down. The window is a promise, not an allocation: an idle tunnel costs
+the same with 8MiB as with h2's 64KiB default, and only a tunnel whose
+callers all wedge at once holds that much.
+
+The 32KiB stream window is what bounds a single caller's throughput over
+a long fat pipe (window/RTT, so ~650KB/s at 50ms, measured 0.60MB/s) --
+ample for varlink call and reply, and the price for serving 256 callers
+per node out of one connection window. Bulk data is what would suffer:
+256KiB gets 4.89MB/s and 1MiB gets 17.65MB/s over the same 50ms link, so
+carrying file transfers through the tunnel means revisiting the window
+(see the `TODO` on `STREAM_WINDOW`).
