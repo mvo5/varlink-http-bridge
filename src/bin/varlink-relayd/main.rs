@@ -30,8 +30,8 @@ use crate::registry::Nodes;
 
 const DEFAULT_BIND: &str = "127.0.0.1:8443";
 const DEFAULT_CONNECT_BIND: &str = "127.0.0.1:8444";
-// bounds every prelude (TLS, upgrade, h2 handshake, CONNECT head), so a
-// silent or trickling peer cannot pin a task and fd forever
+// bounds every prelude (TLS, upgrade, CONNECT head), so a silent or
+// trickling peer cannot pin a task and fd forever
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 // how long a caller may queue for a stream slot on a full node before
 // it gets a 503
