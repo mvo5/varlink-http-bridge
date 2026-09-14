@@ -13,7 +13,9 @@ use log::debug;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use varlink_http_bridge::tunnel::{MAX_TUNNEL_STREAMS, NodeId, StreamSlot, send_all, splice};
+use varlink_http_bridge::tunnel::{
+    MAX_TUNNEL_STREAMS, NodeId, SpliceError, StreamSlot, send_all, splice,
+};
 
 use crate::HANDSHAKE_TIMEOUT;
 use crate::registry::Nodes;
@@ -69,6 +71,18 @@ impl Denied {
     fn error(&self) -> &anyhow::Error {
         match self {
             Self::Caller(e) | Self::Node(e) | Self::Overload(e) => e,
+        }
+    }
+}
+
+// which side of the splice failed says whose problem it is: the local
+// side is the caller's own tcp (hung up, reset, a scanner that left),
+// the h2 side is the node's
+impl From<SpliceError> for Denied {
+    fn from(e: SpliceError) -> Self {
+        match e {
+            SpliceError::Local(e) => Self::Caller(e),
+            SpliceError::Peer(e) => Self::Node(e),
         }
     }
 }
@@ -167,9 +181,7 @@ async fn handle(
         .map_err(Denied::Caller)?;
     // bytes a caller pipelined behind its CONNECT must not be lost
     if !early_data.is_empty() {
-        send_all(&mut send, early_data, &who)
-            .await
-            .map_err(Denied::Node)?;
+        send_all(&mut send, early_data, &who).await?;
     }
     debug!(
         "{who}: spliced, tunnel now at {}/{MAX_TUNNEL_STREAMS} streams",
@@ -177,18 +189,18 @@ async fn handle(
     );
 
     let started = std::time::Instant::now();
-    let result = splice(stream, recv, send, &who).await;
+    // a failure is logged once, by serve, at the level its side earns
+    let moved = splice(stream, recv, send, &who)
+        .await
+        .map_err(|e| e.context(format!("{who}: ended after {:?}", started.elapsed())))?;
     // the one line that answers "did anything actually flow?"
-    match &result {
-        Ok(moved) => debug!(
-            "{who}: done after {:?}, {} bytes to the node, {} back",
-            started.elapsed(),
-            moved.sent,
-            moved.received
-        ),
-        Err(e) => debug!("{who}: ended after {:?}: {e:#}", started.elapsed()),
-    }
-    result.map(|_| ()).map_err(Denied::Node)
+    debug!(
+        "{who}: done after {:?}, {} bytes to the node, {} back",
+        started.elapsed(),
+        moved.sent,
+        moved.received
+    );
+    Ok(())
 }
 
 /// Parse `CONNECT <id>[:port] HTTP/1.1` plus headers (all ignored); the
@@ -247,6 +259,16 @@ mod tests {
         assert_eq!(
             Denied::Overload(anyhow!("kept all streams busy")).level(),
             Level::Warn
+        );
+        // a spliced stream ending badly: the caller's own side going
+        // away is routine, the node's is news
+        assert_eq!(
+            Denied::from(SpliceError::Local(anyhow!("reading local stream"))).level(),
+            Level::Debug
+        );
+        assert_eq!(
+            Denied::from(SpliceError::Peer(anyhow!("receiving h2 data"))).level(),
+            Level::Info
         );
     }
 }
