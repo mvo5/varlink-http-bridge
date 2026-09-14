@@ -457,7 +457,13 @@ where
                     moved.received,
                     moved.sent
                 ),
-                Err(e) => debug!("{who}: ended after {:?}: {e:#}", started.elapsed()),
+                Err(e) => debug!(
+                    "{who}: ended after {:?} on the {} side: {e:#}",
+                    started.elapsed(),
+                    // "relay" covers the caller behind it: a hangup
+                    // there reaches this end as a reset stream
+                    if e.is_local() { "server" } else { "relay" }
+                ),
             }
         });
         if sink.conns.is_closed() {
