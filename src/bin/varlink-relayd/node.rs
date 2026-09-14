@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use log::{debug, info, warn};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -20,7 +20,11 @@ use crate::HANDSHAKE_TIMEOUT;
 use crate::registry::{Nodes, ReservationGuard};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
+pub(crate) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+// so the tests can watch a silent peer being given up on
+#[cfg(test)]
+pub(crate) const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Accept connecting nodes and register them.
 pub(crate) async fn serve(
@@ -68,9 +72,10 @@ pub(crate) async fn serve(
 
 /// One node connection: WebSocket upgrade carrying the claimed id
 /// (reserving it), then HTTP/2 with the roles reversed (this side is
-/// the h2 client), kept alive by PINGs until the connection dies or
-/// stops answering. The [`ReservationGuard`] releases the id when this
-/// returns, whichever way.
+/// the h2 client), registered once the node answers a first PING and
+/// kept alive by PINGs until the connection dies or stops answering.
+/// The [`ReservationGuard`] releases the id when this returns,
+/// whichever way.
 async fn handle<S>(stream: S, nodes: &Nodes, peer: std::net::SocketAddr) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -105,14 +110,31 @@ where
     let reservation = &guard.reservation;
     let id = reservation.id;
 
-    let (h2, mut conn) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        h2_client_builder().handshake::<_, bytes::Bytes>(WsByteStream::new(ws)),
-    )
-    .await
-    .map_err(|_| anyhow!("h2 handshake with node timed out"))?
-    .context("h2 handshake with node")?;
+    // not bounded: h2's client handshake only writes the preface and
+    // queues SETTINGS, it never waits for the peer
+    let (h2, mut conn) = h2_client_builder()
+        .handshake::<_, bytes::Bytes>(WsByteStream::new(ws))
+        .await
+        .context("h2 handshake with node")?;
     let mut ping_pong = conn.ping_pong().expect("first ping_pong handle");
+
+    // so the first pong is the first proof anyone is listening: a peer
+    // that upgrades and then goes silent stays a socket, not a node
+    // callers get routed at
+    tokio::select! {
+        result = &mut conn => {
+            return Err(match result {
+                Ok(()) => anyhow!("node {id} closed before answering the first PING"),
+                Err(e) => anyhow::Error::new(e)
+                    .context(format!("node {id} failed before answering the first PING")),
+            });
+        }
+        answered = ping(&mut ping_pong) => {
+            if !answered {
+                bail!("node {id} did not answer the first PING within {HEARTBEAT_TIMEOUT:?}");
+            }
+        }
+    }
     nodes.attach(reservation, h2);
     let load = std::sync::Arc::clone(&reservation.load);
     let connected = std::time::Instant::now();
@@ -125,10 +147,8 @@ where
                 // a colliding claim asked whether this holder is alive
                 () = reservation.probe.notified() => {}
             }
-            match tokio::time::timeout(HEARTBEAT_TIMEOUT, ping_pong.ping(h2::Ping::opaque())).await
-            {
-                Ok(Ok(_pong)) => {}
-                Ok(Err(_)) | Err(_) => return,
+            if !ping(&mut ping_pong).await {
+                return;
             }
         }
     };
@@ -143,7 +163,7 @@ where
     };
     // select tears the connection down when the heartbeat gives up
     tokio::select! {
-        result = conn => match result {
+        result = &mut conn => match result {
             Ok(()) => info!("node {id} disconnected {}", lived()),
             Err(e) => info!("node {id} connection failed {}: {e}", lived()),
         },
@@ -154,6 +174,15 @@ where
         ),
     }
     Ok(())
+}
+
+/// One PING, bounded by [`HEARTBEAT_TIMEOUT`]: false when the node did
+/// not answer in time or the connection is gone.
+async fn ping(ping_pong: &mut h2::PingPong) -> bool {
+    matches!(
+        tokio::time::timeout(HEARTBEAT_TIMEOUT, ping_pong.ping(h2::Ping::opaque())).await,
+        Ok(Ok(_pong))
+    )
 }
 
 /// Validate a node's upgrade request and reserve its id: the tunnel
