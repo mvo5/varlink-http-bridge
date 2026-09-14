@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -54,10 +55,25 @@ async fn stub_node_hanging_streams(
     id: &str,
     hang_first: usize,
 ) -> Result<tokio::task::JoinHandle<()>, tokio_tungstenite::tungstenite::Error> {
+    let (node, _seen) = stub_node_counting_streams(node_addr, id, hang_first).await?;
+    Ok(node)
+}
+
+/// The same node again, also counting every stream the relay opened
+/// towards it, answered or not: the relay's admission is only right if
+/// the node hears of exactly the callers that were let through.
+async fn stub_node_counting_streams(
+    node_addr: SocketAddr,
+    id: &str,
+    hang_first: usize,
+) -> Result<(tokio::task::JoinHandle<()>, Arc<AtomicUsize>), tokio_tungstenite::tungstenite::Error>
+{
     let tcp = TcpStream::connect(node_addr).await.unwrap();
     let url = format!("ws://{node_addr}{TUNNEL_PATH}?node_id={id}");
     let (ws, _response) = tokio_tungstenite::client_async(url, tcp).await?;
-    Ok(tokio::spawn(async move {
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&seen);
+    let node = tokio::spawn(async move {
         let mut conn = h2_server_builder()
             .handshake::<_, bytes::Bytes>(WsByteStream::new(ws))
             .await
@@ -66,6 +82,7 @@ async fn stub_node_hanging_streams(
         // keeps the hung streams' local peers open without reading them
         let mut hung = Vec::new();
         while let Some(Ok((req, mut respond))) = conn.accept().await {
+            counted.fetch_add(1, Ordering::Relaxed);
             let body = req.into_body();
             // like the bridge: a caller gone before its stream is
             // answered must not end the tunnel
@@ -88,7 +105,8 @@ async fn stub_node_hanging_streams(
                 let _ = splice(io, body, send, "stub node").await;
             });
         }
-    }))
+    });
+    Ok((node, seen))
 }
 
 /// A node that keeps the tunnel up but never answers a stream: the
@@ -586,9 +604,8 @@ async fn a_caller_gets_503_when_the_node_stays_full() {
         held.push(stream);
     }
 
-    // more than one: h2 queues the first request beyond the limit in the
-    // connection and the next ones behind that queue, both must get the
-    // 503
+    // more than one: each waits its turn in the relay's line for a slot,
+    // and each must be told, not only the head of the line
     for caller in 0..3 {
         let (_stream, status) = send_connect(connect_addr, TEST_ID, b"").await;
         assert_eq!(
@@ -622,6 +639,80 @@ async fn a_node_that_does_not_answer_is_not_reported_as_full() {
     let (_stream, status) = send_connect(connect_addr, TEST_ID, b"").await;
     assert_eq!(status, "HTTP/1.1 502 Bad Gateway");
 
-    // the tunnel itself is fine as far as the relay can tell
-    assert!(nodes.get(TEST_ID.parse().unwrap()).is_some());
+    // the tunnel itself is fine as far as the relay can tell, and the
+    // slot the caller held while it waited on the node is back
+    let (_h2, load) = nodes
+        .get(TEST_ID.parse().unwrap())
+        .expect("the node must still be registered");
+    tokio::time::timeout(STEP, async {
+        while load.active() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the slot must be released with the caller");
+    assert_eq!(load.queued(), 0);
+}
+
+/// A caller that gave up waiting must be gone for good: it holds no
+/// slot, and the node never hears of it. Left to h2's own queue, an
+/// abandoned request keeps its HEADERS, and the next slot to free would
+/// be spent opening and resetting one phantom stream per waiter before
+/// a live caller gets it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timed_out_waiter_leaves_no_phantom_stream() {
+    const GAVE_UP: usize = 3;
+    let (node_addr, connect_addr, nodes) = start_relay().await;
+    let (_node, seen) = stub_node_counting_streams(node_addr, TEST_ID, 0)
+        .await
+        .unwrap();
+    wait_registered(&nodes, TEST_ID).await;
+    let (_h2, load) = nodes.get(TEST_ID.parse().unwrap()).unwrap();
+
+    let mut held = Vec::new();
+    for _ in 0..MAX_TUNNEL_STREAMS {
+        let (stream, status) = send_connect(connect_addr, TEST_ID, b"").await;
+        assert_eq!(status, "HTTP/1.1 200 Connection established");
+        held.push(stream);
+    }
+    let served = MAX_TUNNEL_STREAMS as usize;
+    assert_eq!(seen.load(Ordering::Relaxed), served);
+
+    let mut waiters = Vec::new();
+    for _ in 0..GAVE_UP {
+        waiters.push(open_connect(connect_addr, TEST_ID, b"").await);
+    }
+    for (n, waiter) in waiters.iter_mut().enumerate() {
+        assert_eq!(
+            read_status(waiter, STEP).await.as_deref(),
+            Some("HTTP/1.1 503 Service Unavailable"),
+            "waiter {n} must be turned away"
+        );
+    }
+    // nothing of them is left: no slot held, nobody in line, and the
+    // node was never asked
+    assert_eq!(load.active(), MAX_TUNNEL_STREAMS);
+    assert_eq!(load.queued(), 0);
+    assert_eq!(
+        seen.load(Ordering::Relaxed),
+        served,
+        "the node must not hear of a caller that gave up"
+    );
+
+    // the freed slot goes to a live caller, with no phantom ahead of it
+    held.pop();
+    let (mut next, status) = send_connect(connect_addr, TEST_ID, b"").await;
+    assert_eq!(status, "HTTP/1.1 200 Connection established");
+    assert_eq!(
+        seen.load(Ordering::Relaxed),
+        served + 1,
+        "exactly one more stream must have reached the node"
+    );
+    next.write_all(b"ping").await.unwrap();
+    let mut got = [0u8; 4];
+    tokio::time::timeout(STEP, next.read_exact(&mut got))
+        .await
+        .expect("the live caller must be spliced")
+        .unwrap();
+    assert_eq!(&got, b"ping");
 }
