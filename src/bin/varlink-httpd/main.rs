@@ -368,7 +368,10 @@ where
     L::Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     L::Addr: Clone + Send + std::fmt::Display + 'static,
 {
-    fn new(mut inner: L, config: TlsConfig) -> std::io::Result<Self> {
+    /// `failed` is the level a handshake that fails or times out is
+    /// logged at: what a public port sees all day is debug, a private
+    /// one's mismatch is worth a warning.
+    fn new(mut inner: L, config: TlsConfig, failed: log::Level) -> std::io::Result<Self> {
         let local_addr = inner.local_addr()?;
         let (tx, rx) = tokio::sync::mpsc::channel(256);
 
@@ -378,13 +381,24 @@ where
                 let tx = tx.clone();
                 let config = config.clone();
                 tokio::spawn(async move {
-                    match tls_accept(&config, stream).await {
-                        Ok(tls_stream) => {
+                    // a client that connects and says nothing holds this
+                    // task and its fd until its TCP dies; on a tunnel
+                    // stream it holds one of the node's MAX_TUNNEL_STREAMS
+                    // slots, and that many of them take the node off the
+                    // relay. Dropping the stream frees either.
+                    let handshake = tls_accept(&config, stream);
+                    match tokio::time::timeout(config.handshake_timeout, handshake).await {
+                        Ok(Ok(tls_stream)) => {
                             if tx.send((tls_stream, addr)).await.is_err() {
                                 warn!("TLS listener receiver dropped");
                             }
                         }
-                        Err(e) => warn!("TLS handshake from {addr}: {e:#}"),
+                        Ok(Err(e)) => log::log!(failed, "TLS handshake from {addr}: {e:#}"),
+                        Err(_) => log::log!(
+                            failed,
+                            "TLS handshake from {addr}: nothing in {:?}, dropping the connection",
+                            config.handshake_timeout
+                        ),
                     }
                 });
             }
@@ -591,7 +605,14 @@ struct TlsConfig {
     acceptor: openssl::ssl::SslAcceptor,
     /// `None` when mTLS is off, so no client certificate is requested.
     client_trust: Option<Arc<ClientTrust>>,
+    /// How long a client gets to complete its handshake before the
+    /// connection is dropped.
+    handshake_timeout: Duration,
 }
+
+// generous for a slow link, short enough that silent connections do not
+// pile up (see AsyncTlsListener::new)
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn load_tls_config(
     cert_path: &str,
@@ -612,6 +633,7 @@ fn load_tls_config(
     Ok(TlsConfig {
         acceptor: builder.build(),
         client_trust,
+        handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
     })
 }
 
@@ -1299,6 +1321,7 @@ async fn shutdown_signal() {
 enum Transport {
     Tcp(TcpListener),
     Vsock(VsockListener),
+    Relay(dialout::DialOutListener),
 }
 
 impl std::fmt::Display for Transport {
@@ -1311,6 +1334,10 @@ impl std::fmt::Display for Transport {
             Transport::Vsock(l) => {
                 let addr = l.local_addr().map_err(|_| std::fmt::Error)?;
                 write!(f, "vsock:{}:{}", addr.cid(), addr.port())
+            }
+            Transport::Relay(l) => {
+                let tunnel = axum::serve::Listener::local_addr(l).map_err(|_| std::fmt::Error)?;
+                write!(f, "relay {tunnel}")
             }
         }
     }
@@ -1364,9 +1391,12 @@ async fn serve_listener(
 
     match (listener, tls_config) {
         (Transport::Vsock(l), Some(config)) => {
-            axum::serve(AsyncTlsListener::new(l, config)?, make_svc)
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+            axum::serve(
+                AsyncTlsListener::new(l, config, log::Level::Warn)?,
+                make_svc,
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
         }
         (Transport::Vsock(l), None) => {
             axum::serve(l, make_svc)
@@ -1375,12 +1405,30 @@ async fn serve_listener(
         }
         (Transport::Tcp(l), Some(config)) => {
             let plain = PlainListener { inner: l };
-            axum::serve(AsyncTlsListener::new(plain, config)?, make_svc)
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+            axum::serve(
+                AsyncTlsListener::new(plain, config, log::Level::Warn)?,
+                make_svc,
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
         }
         (Transport::Tcp(l), None) => {
             axum::serve(PlainListener { inner: l }, make_svc)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+        (Transport::Relay(l), Some(config)) => {
+            // a tunnel stream is a public port: a caller that speaks no
+            // TLS is routine there, and debug per README.relayd.md
+            axum::serve(
+                AsyncTlsListener::new(l, config, log::Level::Debug)?,
+                make_svc,
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+        }
+        (Transport::Relay(l), None) => {
+            axum::serve(l, make_svc)
                 .with_graceful_shutdown(shutdown_signal())
                 .await?;
         }
@@ -1951,6 +1999,15 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("Varlink proxy started (socket-activated)");
     }
 
+    // the tunnel is one more listener, TLS and auth included
+    if let Some(url) = &cli.relay {
+        let node_id = varlink_http_bridge::tunnel::local_node_id(cli.instance.as_deref())?;
+        let listener = dialout::DialOutListener::start(url, node_id)?;
+        listeners.push((Transport::Relay(listener), tls_config.clone()));
+    } else if cli.instance.is_some() {
+        bail!("--instance only makes sense together with --relay");
+    }
+
     let mut join_set = tokio::task::JoinSet::new();
     for (listener, tls) in listeners {
         eprintln!(
@@ -1959,19 +2016,6 @@ async fn main() -> anyhow::Result<()> {
         );
         let app_clone = app.clone();
         join_set.spawn(async move { serve_listener(listener, tls, app_clone).await });
-    }
-
-    if let Some(url) = cli.relay {
-        let node_id = varlink_http_bridge::tunnel::local_node_id(cli.instance.as_deref())?;
-        eprintln!(
-            "Relaying {scheme} via {url} as node {node_id} -> Varlink: {}",
-            cli.varlink_sockets_path
-        );
-        let listener = dialout::DialOutListener::start(&url, node_id, tls_config.clone())?;
-        let app_clone = app.clone();
-        join_set.spawn(async move { dialout::serve(listener, app_clone).await });
-    } else if cli.instance.is_some() {
-        bail!("--instance only makes sense together with --relay");
     }
 
     // Wait for all listeners; propagate the first error
