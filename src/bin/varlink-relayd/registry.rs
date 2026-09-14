@@ -5,7 +5,6 @@
 //! release via the guard), the caller face only reads ([`Nodes::get`]).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,14 +22,11 @@ use varlink_http_bridge::tunnel::{NodeId, StreamLoad};
 #[derive(Default)]
 pub(crate) struct Nodes {
     map: Mutex<HashMap<NodeId, Node>>,
-    generation: AtomicU64,
 }
 
 struct Node {
     // None while reserved but not yet attached (h2 handshake pending)
     h2: Option<SendRequest<Bytes>>,
-    // guards release: only the connection that reserved may deregister
-    generation: u64,
     // pokes the holder's heartbeat out of cycle on a colliding claim
     probe: Arc<Notify>,
     load: Arc<StreamLoad>,
@@ -55,7 +51,6 @@ pub(crate) struct Collision {
 /// heartbeat, and release its entry.
 pub(crate) struct Reservation {
     pub(crate) id: NodeId,
-    generation: u64,
     pub(crate) probe: Arc<Notify>,
     pub(crate) load: Arc<StreamLoad>,
 }
@@ -86,14 +81,12 @@ impl Nodes {
             }
             return Err(Collision { loud });
         }
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed);
         let probe = Arc::new(Notify::new());
         let load = Arc::new(StreamLoad::default());
         map.insert(
             id,
             Node {
                 h2: None,
-                generation,
                 probe: Arc::clone(&probe),
                 load: Arc::clone(&load),
                 // a fresh holder reports the first collision at once
@@ -102,22 +95,16 @@ impl Nodes {
         );
         Ok(ReservationGuard {
             nodes: self,
-            reservation: Reservation {
-                id,
-                generation,
-                probe,
-                load,
-            },
+            reservation: Reservation { id, probe, load },
         })
     }
 
+    /// Make a reserved node reachable for callers. The guard holding
+    /// `reservation` keeps the entry in place, so it is always there.
     pub(crate) fn attach(&self, reservation: &Reservation, h2: SendRequest<Bytes>) {
         let mut map = self.map.lock().expect("nodes lock");
-        if let Some(node) = map.get_mut(&reservation.id)
-            && node.generation == reservation.generation
-        {
-            node.h2 = Some(h2);
-        }
+        let node = map.get_mut(&reservation.id).expect("reserved id is held");
+        node.h2 = Some(h2);
     }
 
     pub(crate) fn get(&self, id: NodeId) -> Option<(SendRequest<Bytes>, Arc<StreamLoad>)> {
@@ -128,14 +115,10 @@ impl Nodes {
             .and_then(|node| Some((node.h2.clone()?, Arc::clone(&node.load))))
     }
 
+    // no owner check needed: first-wins means a second reservation for
+    // the id cannot exist until this one is gone
     fn release(&self, reservation: &Reservation) {
-        let mut map = self.map.lock().expect("nodes lock");
-        if map
-            .get(&reservation.id)
-            .is_some_and(|node| node.generation == reservation.generation)
-        {
-            map.remove(&reservation.id);
-        }
+        self.map.lock().expect("nodes lock").remove(&reservation.id);
     }
 
     #[cfg(test)]
