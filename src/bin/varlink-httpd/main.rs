@@ -1250,6 +1250,20 @@ const WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// takes more than just `--auth=none` (see `build_authenticators`).
 const DEFAULT_SOCKETS_PATH: &str = "/run/varlink/registry";
 
+/// Whether `path` names something other than the registry at `registry`.
+/// Resolved through the filesystem: `/run/varlink/registry/`,
+/// `/var/run/varlink/registry` and a symlink to it are all the registry,
+/// however spelled. A path that does not resolve counts as the registry
+/// too, so a typo fails closed.
+fn sockets_named(path: &str, registry: &std::path::Path) -> bool {
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    // without a registry on this host nothing that resolves can be it
+    let registry = std::fs::canonicalize(registry).unwrap_or_else(|_| registry.to_path_buf());
+    path != registry
+}
+
 /// Finish the close handshake. Bounded so that a stuck peer cannot
 /// hold this task forever.
 async fn close_ws(ws: &mut WebSocket) {
@@ -1637,8 +1651,9 @@ fn print_help() {
                                             mTLS is enabled separately and applies
                                             on top of whatever is selected here.
                                             none additionally needs --require-mtls,
-                                            --insecure, or a VARLINK_SOCKETS_PATH
-                                            naming what to expose
+                                            --insecure, or --bind=none --relay= with
+                                            a VARLINK_SOCKETS_PATH naming what to
+                                            expose
           --cert=PATH                       TLS certificate PEM file
                                             (default: self-signed, generated
                                             and persisted on first start)
@@ -1830,6 +1845,19 @@ fn parse_cli() -> anyhow::Result<Command> {
             AuthMechanism::names()
         ),
     };
+
+    // --auth=none with nothing else authenticating the client is only for a
+    // relay-only instance serving a named socket (README.relayd.md); on a
+    // local listener that is what --insecure is for. Socket activation
+    // serves local listeners even with --bind=none.
+    let relay_only = bind_none && relay.is_some() && std::env::var_os("LISTEN_FDS").is_none();
+    if auth == [AuthMechanism::None] && !insecure && !require_mtls && !relay_only {
+        bail!(
+            "--auth=none needs mTLS (--require-mtls) or --insecure; only an instance \
+             without a local listener (--bind=none --relay=) may serve a named \
+             VARLINK_SOCKETS_PATH unauthenticated"
+        );
+    }
 
     check_mechanism_flags(&auth, authorized_keys.is_some(), api_keys.is_some())?;
 
@@ -2059,7 +2087,8 @@ fn build_authenticators(
             }
             // Naming the sockets is the deliberate step: it serves those and
             // only those without authentication, for instances that expose
-            // harmless, rate-limited sockets (a relay-only node, say).
+            // harmless, rate-limited sockets through the relay alone
+            // (parse_cli has refused any local listener by now).
             AuthMechanism::None if sockets_named => {
                 warn!("--auth=none: requests are not authenticated, expose only harmless sockets");
                 authenticators.push(Box::new(AllowAllAuthenticator {
@@ -2107,7 +2136,10 @@ async fn main() -> anyhow::Result<()> {
         &cli.auth,
         cli.insecure,
         cli.require_mtls,
-        cli.varlink_sockets_path != DEFAULT_SOCKETS_PATH,
+        sockets_named(
+            &cli.varlink_sockets_path,
+            std::path::Path::new(DEFAULT_SOCKETS_PATH),
+        ),
         cli.authorized_keys.as_deref(),
         cli.api_keys.as_deref(),
         creds_dir.as_deref(),

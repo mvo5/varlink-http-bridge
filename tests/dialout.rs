@@ -223,6 +223,34 @@ fn relay_only_instance_with_auth_none() {
     );
 }
 
+/// `--auth=none` is only for the shape above: next to a local listener it
+/// is what `--insecure` is for, and the default registry is never harmless.
+#[test]
+fn auth_none_is_refused_outside_a_relay_only_instance() {
+    let sockets = tempfile::tempdir().unwrap();
+    let sockets = sockets.path().to_str().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cases: [(&[&str], &str); 2] = [
+        (
+            &["--auth=none", "--bind=127.0.0.1:0", sockets],
+            "--insecure",
+        ),
+        (&["--auth=none", "--bind=none"], "naming what to expose"),
+    ];
+    for (args, expected) in cases {
+        // refused while parsing, so the relay is never dialed
+        let output = Command::new(env!("CARGO_BIN_EXE_varlink-httpd"))
+            .env("STATE_DIRECTORY", state.path())
+            .args(args)
+            .arg("--relay=ws://127.0.0.1:1")
+            .output()
+            .expect("running varlink-httpd");
+        assert!(!output.status.success(), "{args:?} was accepted");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{args:?}: {stderr}");
+    }
+}
+
 /// Callers share one tunnel per node, so many of them must be in flight
 /// at once -- more than the node queues internally.
 #[test]
