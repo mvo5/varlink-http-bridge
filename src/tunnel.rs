@@ -350,25 +350,46 @@ where
 /// TODO: raise this to 256KiB or 1MiB if the tunnel ever carries bulk
 /// data (a file transfer, SFTP: OpenSSH's sftp keeps 64 requests of
 /// 32KiB in flight, so it wants ~2MiB of window and gets none of that
-/// pipelining here). Or raise the window per connection at runtime once
-/// a stream turns out to be moving volume
+/// pipelining here). It is not a one-line change: [`CONNECTION_WINDOW`]
+/// is this times [`MAX_TUNNEL_STREAMS`], so 1MiB would promise 256MiB
+/// per tunnel and direction. Either trade concurrency for it (1MiB x 32
+/// streams keeps the same 32MiB), or raise the window per connection at
+/// runtime once a stream turns out to be moving volume
 /// (`h2::server::Connection::set_initial_window_size`, which is how
 /// hyper does BDP estimation) and leave control traffic small.
 pub const STREAM_WINDOW: u32 = 32 * 1024;
 
-/// h2 settings for the node end (the server, roles being reversed).
+/// Streams per tunnel, i.e. callers one node serves at once; further
+/// callers wait for a slot.
+pub const MAX_TUNNEL_STREAMS: u32 = 256;
+
+/// Connection-level h2 receive window, with room for every stream to
+/// hold its full [`STREAM_WINDOW`]: with h2's default of one stream
+/// window per connection, a single caller whose local service hangs
+/// exhausts it and every other caller on the tunnel starves. A promise,
+/// not an allocation: only a tunnel whose callers all wedge at once
+/// holds this much.
+pub const CONNECTION_WINDOW: u32 = STREAM_WINDOW * MAX_TUNNEL_STREAMS;
+
+/// h2 settings for the node end (the server, roles being reversed). Only
+/// the accepting side can advertise the stream limit.
 pub fn h2_server_builder() -> h2::server::Builder {
     let mut builder = h2::server::Builder::new();
-    builder.initial_window_size(STREAM_WINDOW);
+    builder
+        .initial_window_size(STREAM_WINDOW)
+        .initial_connection_window_size(CONNECTION_WINDOW)
+        .max_concurrent_streams(MAX_TUNNEL_STREAMS);
     builder
 }
 
 /// h2 settings for the relay end: a caller that stops reading stalls its
 /// stream here the way a hung local service does on the node, so the
-/// same window applies.
+/// same windows apply.
 pub fn h2_client_builder() -> h2::client::Builder {
     let mut builder = h2::client::Builder::new();
-    builder.initial_window_size(STREAM_WINDOW);
+    builder
+        .initial_window_size(STREAM_WINDOW)
+        .initial_connection_window_size(CONNECTION_WINDOW);
     builder
 }
 
