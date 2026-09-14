@@ -57,11 +57,13 @@ pub(crate) struct DialOutListener {
 impl DialOutListener {
     pub(crate) fn start(url: &str, node_id: NodeId) -> Result<Self> {
         let target = TunnelUrl::parse(url)?;
+        let relay_tls = target.tls.then(relay_tls_connector).transpose()?;
         let (tx, rx) = mpsc::channel(16);
         let describe: std::sync::Arc<str> = format!("{url} as node {node_id}").into();
         tokio::spawn(dial_loop(
             target,
             node_id,
+            relay_tls,
             StreamSink {
                 conns: tx,
                 describe: std::sync::Arc::clone(&describe),
@@ -241,7 +243,12 @@ impl Tuning {
 /// an hour writes a warning every minute and the log stops being read.
 /// A reminder every [`OUTAGE_REMINDER`] keeps a lasting outage visible
 /// to a log that was only opened after it started.
-async fn dial_loop(target: TunnelUrl, node_id: NodeId, sink: StreamSink) {
+async fn dial_loop(
+    target: TunnelUrl,
+    node_id: NodeId,
+    relay_tls: Option<openssl::ssl::SslConnector>,
+    sink: StreamSink,
+) {
     let relay = target.authority();
     let tuning = Tuning::DEFAULT;
     let mut backoff = REDIAL_MIN;
@@ -251,9 +258,9 @@ async fn dial_loop(target: TunnelUrl, node_id: NodeId, sink: StreamSink) {
         let started_down = outage.as_ref().map(|o| o.since);
         match dial_once(
             &target,
+            relay_tls.as_ref(),
             node_id,
             &sink,
-            &relay,
             started_down,
             attempt,
             &tuning,
@@ -344,13 +351,15 @@ fn with_jitter(base: Duration) -> Duration {
 /// the tunnel lasted.
 async fn dial_once(
     target: &TunnelUrl,
+    // Some iff the URL is wss://, see DialOutListener::start
+    relay_tls: Option<&openssl::ssl::SslConnector>,
     node_id: NodeId,
     sink: &StreamSink,
-    relay: &str,
     down_since: Option<std::time::Instant>,
     attempts: u32,
     tuning: &Tuning,
 ) -> Result<Duration> {
+    let relay = target.authority();
     // one bound over the whole prelude: none of these steps has a
     // timeout of its own, and a relay that accepts and then says
     // nothing (a black-holed path, a wedged frontend) would otherwise
@@ -361,8 +370,8 @@ async fn dial_once(
             .context("connecting to relay")?;
         varlink_http_bridge::set_tcp_keepalive_and_nodelay(&tcp)?;
         let url = target.ws_url(node_id);
-        if target.tls {
-            let tls = tls_connect(&target.host, tcp).await?;
+        if let Some(connector) = relay_tls {
+            let tls = tls_connect(connector, &target.host, tcp).await?;
             let (ws, _response) = tokio_tungstenite::client_async(url, tls)
                 .await
                 .context("tunnel WebSocket upgrade")?;
@@ -438,13 +447,25 @@ fn upgrade_hint(e: anyhow::Error, node_id: NodeId) -> anyhow::Error {
     }
 }
 
+/// The TLS client for the relay leg, verifying against the system trust
+/// store. Built once, at startup: loading the store is not free, and a
+/// broken one should fail there rather than on every dial.
+fn relay_tls_connector() -> Result<openssl::ssl::SslConnector> {
+    Ok(
+        openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
+            .context("TLS connector")?
+            .build(),
+    )
+}
+
 /// TLS to the relay, verified against the system trust store. (This
 /// leg only protects an unsigned id claim; the caller's TLS session to
 /// this bridge rides through it end-to-end either way.)
-async fn tls_connect(host: &str, tcp: TcpStream) -> Result<tokio_openssl::SslStream<TcpStream>> {
-    let connector = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())
-        .context("TLS connector")?
-        .build();
+async fn tls_connect(
+    connector: &openssl::ssl::SslConnector,
+    host: &str,
+    tcp: TcpStream,
+) -> Result<tokio_openssl::SslStream<TcpStream>> {
     let ssl = connector
         .configure()
         .context("TLS configure")?
@@ -730,9 +751,9 @@ mod tests {
         };
         let dial = dial_once(
             &target,
+            None,
             TEST_NODE.parse().unwrap(),
             &sink,
-            "stub",
             None,
             1,
             &tuning,
@@ -761,9 +782,9 @@ mod tests {
         };
         let dial = dial_once(
             &target,
+            None,
             TEST_NODE.parse().unwrap(),
             &sink,
-            "stub",
             None,
             1,
             &tuning,
