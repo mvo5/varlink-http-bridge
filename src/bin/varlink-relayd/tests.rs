@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use varlink_http_bridge::tunnel::{
-    NodeId, STREAM_WINDOW, TUNNEL_PATH, WsByteStream, h2_server_builder, splice,
+    MAX_TUNNEL_STREAMS, NodeId, STREAM_WINDOW, TUNNEL_PATH, WsByteStream, h2_server_builder, splice,
 };
 
 use crate::registry::Nodes;
@@ -17,6 +17,8 @@ use crate::{caller, node};
 const TEST_ID: &str = "0123456789abcdef0123456789abcdef";
 const OTHER_ID: &str = "fedcba9876543210fedcba9876543210";
 const STEP: Duration = Duration::from_secs(5);
+// short, so the 503 test does not sit out the production 10s
+const SLOT_TIMEOUT: Duration = Duration::from_millis(500);
 
 async fn start_relay() -> (SocketAddr, SocketAddr, Arc<Nodes>) {
     let node_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -25,7 +27,11 @@ async fn start_relay() -> (SocketAddr, SocketAddr, Arc<Nodes>) {
     let connect_addr = connect_listener.local_addr().unwrap();
     let nodes = Arc::new(Nodes::default());
     tokio::spawn(node::serve(node_listener, None, Arc::clone(&nodes)));
-    tokio::spawn(caller::serve(connect_listener, Arc::clone(&nodes)));
+    tokio::spawn(caller::serve(
+        connect_listener,
+        Arc::clone(&nodes),
+        SLOT_TIMEOUT,
+    ));
     (node_addr, connect_addr, nodes)
 }
 
@@ -61,9 +67,11 @@ async fn stub_node_hanging_streams(
         let mut hung = Vec::new();
         while let Some(Ok((req, mut respond))) = conn.accept().await {
             let body = req.into_body();
-            let send = respond
-                .send_response(http::Response::new(()), false)
-                .unwrap();
+            // like the bridge: a caller gone before its stream is
+            // answered must not end the tunnel
+            let Ok(send) = respond.send_response(http::Response::new(()), false) else {
+                continue;
+            };
             streams += 1;
             // the buffer the bridge gives a tunnel stream
             let (io, peer) = tokio::io::duplex(STREAM_WINDOW as usize);
@@ -103,13 +111,24 @@ async fn send_connect(
     authority: &str,
     extra: &[u8],
 ) -> (TcpStream, String) {
+    let mut stream = open_connect(connect_addr, authority, extra).await;
+    let status = read_status(&mut stream, STEP)
+        .await
+        .expect("relay must answer the CONNECT");
+    (stream, status)
+}
+
+async fn open_connect(connect_addr: SocketAddr, authority: &str, extra: &[u8]) -> TcpStream {
     let mut stream = TcpStream::connect(connect_addr).await.unwrap();
     let mut request =
         format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").into_bytes();
     request.extend_from_slice(extra);
     stream.write_all(&request).await.unwrap();
+    stream
+}
 
-    let status = tokio::time::timeout(STEP, async {
+async fn read_status(stream: &mut TcpStream, within: Duration) -> Option<String> {
+    tokio::time::timeout(within, async {
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
@@ -124,8 +143,7 @@ async fn send_connect(
             .to_string()
     })
     .await
-    .expect("relay must answer the CONNECT");
-    (stream, status)
+    .ok()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -348,4 +366,80 @@ async fn hung_streams_do_not_starve_other_callers() {
     }
     echo.expect("hung streams must not block a healthy caller");
     assert_eq!(got, ping);
+}
+
+/// The node advertises `MAX_TUNNEL_STREAMS`, so that many callers is
+/// the point where the next one has to queue for a free slot instead of
+/// being served right away -- and is served once one frees up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_beyond_the_stream_limit_waits_for_a_slot() {
+    let (node_addr, connect_addr, nodes) = start_relay().await;
+    let _node = stub_node(node_addr, TEST_ID).await.unwrap();
+    wait_registered(&nodes, TEST_ID).await;
+
+    let mut held = Vec::new();
+    for _ in 0..MAX_TUNNEL_STREAMS {
+        let (stream, status) = send_connect(connect_addr, TEST_ID, b"").await;
+        assert_eq!(status, "HTTP/1.1 200 Connection established");
+        held.push(stream);
+    }
+
+    let mut queued = open_connect(connect_addr, TEST_ID, b"").await;
+    assert_eq!(
+        read_status(&mut queued, SLOT_TIMEOUT / 5).await,
+        None,
+        "a caller beyond the limit must not be served yet"
+    );
+
+    held.pop();
+    assert_eq!(
+        read_status(&mut queued, STEP).await.as_deref(),
+        Some("HTTP/1.1 200 Connection established"),
+    );
+    queued.write_all(b"ping").await.unwrap();
+    let mut got = [0u8; 4];
+    tokio::time::timeout(STEP, queued.read_exact(&mut got))
+        .await
+        .expect("the queued caller must be spliced")
+        .unwrap();
+    assert_eq!(&got, b"ping");
+}
+
+/// A caller that never gets a slot must be told so, rather than left
+/// hanging on a socket that will never answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_gets_503_when_the_node_stays_full() {
+    let (node_addr, connect_addr, nodes) = start_relay().await;
+    let _node = stub_node(node_addr, TEST_ID).await.unwrap();
+    wait_registered(&nodes, TEST_ID).await;
+
+    let mut held = Vec::new();
+    for _ in 0..MAX_TUNNEL_STREAMS {
+        let (stream, status) = send_connect(connect_addr, TEST_ID, b"").await;
+        assert_eq!(status, "HTTP/1.1 200 Connection established");
+        held.push(stream);
+    }
+
+    // more than one: h2 queues the first request beyond the limit in the
+    // connection and the next ones behind that queue, both must get the
+    // 503
+    for caller in 0..3 {
+        let (_stream, status) = send_connect(connect_addr, TEST_ID, b"").await;
+        assert_eq!(
+            status, "HTTP/1.1 503 Service Unavailable",
+            "caller {caller} on a full node"
+        );
+    }
+
+    // resetting the queued requests must not have taken the tunnel down
+    held.pop();
+    let (mut next, status) = send_connect(connect_addr, TEST_ID, b"").await;
+    assert_eq!(status, "HTTP/1.1 200 Connection established");
+    next.write_all(b"ping").await.unwrap();
+    let mut got = [0u8; 4];
+    tokio::time::timeout(STEP, next.read_exact(&mut got))
+        .await
+        .expect("the tunnel must have survived the rejected callers")
+        .unwrap();
+    assert_eq!(&got, b"ping");
 }
