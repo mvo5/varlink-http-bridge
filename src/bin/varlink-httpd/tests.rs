@@ -596,8 +596,8 @@ async fn test_integration_real_systemd_openapi_get() {
 }
 
 // Guards against the generated document and the router drifting apart:
-// every documented path must be served (may fail for other reasons, but
-// never 404), and calling a documented method must work end to end.
+// every documented path must be served, and calling a documented method
+// must work end to end.
 #[test_with::path(/run/systemd/io.systemd.Hostname)]
 #[tokio::test]
 async fn test_integration_openapi_paths_are_routable() {
@@ -608,13 +608,18 @@ async fn test_integration_openapi_paths_are_routable() {
 
     let paths = doc["paths"].as_object().expect("missing 'paths' object");
     for path in paths.keys() {
+        // GET, never POST: the paths include the real hostnamed's Set*
+        // methods, and an empty body unsets the host's static hostname.
         let res = client
-            .post(format!("http://{}{path}", server.addr))
-            .json(&json!({}))
+            .get(format!("http://{}{path}", server.addr))
             .send()
             .await
-            .expect("failed to post to documented path");
-        assert_ne!(res.status(), 404, "documented path '{path}' is not routed");
+            .expect("failed to get documented path");
+        assert_eq!(
+            res.status(),
+            405,
+            "documented path '{path}' is not routed as a call path"
+        );
     }
 
     let describe_path = "/call/io.systemd.Hostname/io.systemd.Hostname.Describe";
