@@ -25,7 +25,8 @@ const MAX_CONNECT_REQUEST: usize = 8 * 1024;
 const MAX_CONNECT_HEADERS: usize = 16;
 
 /// Accept callers and splice them onto their node. `slot_timeout`
-/// bounds the wait for a free stream on a saturated node.
+/// bounds the wait for a stream slot on a full node, and then the
+/// node's accept of the stream.
 pub(crate) async fn serve(
     listener: TcpListener,
     nodes: Arc<Nodes>,
@@ -52,7 +53,8 @@ async fn deny(stream: &mut TcpStream, status: &str) {
 
 /// Why a caller was turned away, which decides how loud that is: what a
 /// public port sees all day (nonsense, unknown nodes) must not bury the
-/// journal, a node out of stream slots is ours to fix.
+/// journal, and a node out of stream slots is one event its load tier
+/// reports once, not once more per caller that runs into it.
 enum Denied {
     Caller(anyhow::Error),
     Node(anyhow::Error),
@@ -62,9 +64,8 @@ enum Denied {
 impl Denied {
     fn level(&self) -> log::Level {
         match self {
-            Self::Caller(_) => log::Level::Debug,
+            Self::Caller(_) | Self::Overload(_) => log::Level::Debug,
             Self::Node(_) => log::Level::Info,
-            Self::Overload(_) => log::Level::Warn,
         }
     }
 
@@ -87,8 +88,9 @@ impl From<SpliceError> for Denied {
     }
 }
 
-/// One caller: read `CONNECT <id>[:port]`, open an h2 stream to the
-/// node, reply `200 Connection established`, then splice opaque bytes.
+/// One caller: read `CONNECT <id>[:port]`, take one of the node's
+/// stream slots, open an h2 stream to the node, reply `200 Connection
+/// established`, then splice opaque bytes.
 async fn handle(
     mut stream: TcpStream,
     nodes: &Nodes,
@@ -113,58 +115,19 @@ async fn handle(
         return Err(Denied::Node(anyhow!("no connected node {id}")));
     };
 
-    // before the wait: a caller sitting in the queue otherwise looks
-    // like a network problem
-    if load.active() >= MAX_TUNNEL_STREAMS {
-        debug!(
-            "caller waiting for a free stream on node {id}, all {MAX_TUNNEL_STREAMS} are in use"
-        );
-    }
-    let stream_to_node = async {
-        let mut h2 = h2.ready().await.context("h2 stream slot")?;
-        let request = http::Request::builder()
-            .uri(format!("https://{id}/"))
-            .method(http::Method::POST)
-            .body(())
-            .context("building request")?;
-        let (response, send) = h2.send_request(request, false).context("opening stream")?;
-        // beyond MAX_TUNNEL_STREAMS h2 queues the request until a slot
-        // frees, so the timeout has to cover waiting for the response
-        let response = response.await.context("waiting for the node's accept")?;
-        if response.status() != http::StatusCode::OK {
-            bail!("node rejected the stream: {}", response.status());
-        }
-        anyhow::Ok((response.into_body(), send))
+    // the slot comes first, before any h2 stream exists: a caller that
+    // gives up waiting then leaves nothing behind for the node to drain
+    let who = format!("node {id}");
+    let Ok((_busy, report)) =
+        tokio::time::timeout(slot_timeout, StreamSlot::acquire(&load, &who)).await
+    else {
+        deny(&mut stream, "503 Service Unavailable").await;
+        return Err(Denied::Overload(anyhow!(
+            "gave up after {slot_timeout:?}: node {id} kept all {MAX_TUNNEL_STREAMS} \
+             streams busy, {} more callers are waiting",
+            load.queued()
+        )));
     };
-    let (recv, mut send) = match tokio::time::timeout(slot_timeout, stream_to_node).await {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => {
-            deny(&mut stream, "502 Bad Gateway").await;
-            return Err(Denied::Node(e));
-        }
-        Err(_) => {
-            // the count tells a full tunnel from a node that has stopped
-            // answering; only the first is the relay's own capacity
-            let active = load.active();
-            if active < MAX_TUNNEL_STREAMS {
-                deny(&mut stream, "502 Bad Gateway").await;
-                return Err(Denied::Node(anyhow!(
-                    "node {id} did not accept the stream within {slot_timeout:?} \
-                     with {active}/{MAX_TUNNEL_STREAMS} streams in use"
-                )));
-            }
-            deny(&mut stream, "503 Service Unavailable").await;
-            return Err(Denied::Overload(anyhow!(
-                "gave up after {slot_timeout:?}: node {id} kept all \
-                 {MAX_TUNNEL_STREAMS} streams busy"
-            )));
-        }
-    };
-
-    // the h2 stream id is the one name both ends of the tunnel see, so
-    // the node's lines for this caller can be found from the relay's
-    let who = format!("node {id} stream {}", u32::from(send.stream_id()));
-    let (_busy, report) = StreamSlot::open(&load);
     if let Some(report) = report {
         log::log!(
             report.level(),
@@ -173,6 +136,41 @@ async fn handle(
             report.tier
         );
     }
+
+    let stream_to_node = async {
+        let mut h2 = h2.ready().await.context("h2 send handle")?;
+        let request = http::Request::builder()
+            .uri(format!("https://{id}/"))
+            .method(http::Method::POST)
+            .body(())
+            .context("building request")?;
+        let (response, send) = h2.send_request(request, false).context("opening stream")?;
+        let response = response.await.context("waiting for the node's accept")?;
+        if response.status() != http::StatusCode::OK {
+            bail!("node rejected the stream: {}", response.status());
+        }
+        anyhow::Ok((response.into_body(), send))
+    };
+    // with a slot in hand the stream goes out at once, so this wait is
+    // the node's to answer: past it the node is not accepting, which is
+    // not the relay's capacity and so not a 503
+    let (recv, mut send) = match tokio::time::timeout(slot_timeout, stream_to_node).await {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            deny(&mut stream, "502 Bad Gateway").await;
+            return Err(Denied::Node(e));
+        }
+        Err(_) => {
+            deny(&mut stream, "502 Bad Gateway").await;
+            return Err(Denied::Node(anyhow!(
+                "node {id} did not accept the stream within {slot_timeout:?}"
+            )));
+        }
+    };
+
+    // the h2 stream id is the one name both ends of the tunnel see, so
+    // the node's lines for this caller can be found from the relay's
+    let who = format!("{who} stream {}", u32::from(send.stream_id()));
 
     stream
         .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
@@ -255,10 +253,12 @@ mod tests {
             Denied::Node(anyhow!("no connected node")).level(),
             Level::Info
         );
-        // this one is the relay's own capacity, and needs an operator
+        // a full node is one event, reported once by its load tier; a
+        // caller retrying against it every second must not add a line
+        // above debug per attempt
         assert_eq!(
             Denied::Overload(anyhow!("kept all streams busy")).level(),
-            Level::Warn
+            Level::Debug
         );
         // a spliced stream ending badly: the caller's own side going
         // away is routine, the node's is news

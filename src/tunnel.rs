@@ -15,10 +15,10 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
 use bytes::{Buf, Bytes};
@@ -26,6 +26,7 @@ use futures_util::{Sink, Stream};
 use h2::{RecvStream, SendStream};
 use log::{info, warn};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::error::{Error as WsError, ProtocolError};
@@ -456,11 +457,48 @@ pub const CONNECTION_WINDOW: u32 = STREAM_WINDOW * MAX_TUNNEL_STREAMS;
 /// into [`MAX_TUNNEL_STREAMS`] is silent by itself, callers just queue.
 /// A tier is reported once per crossing and re-armed only once usage
 /// drops clear of it, so a tunnel hovering at a tier stays quiet.
-#[derive(Debug, Default)]
+///
+/// On the relay it is also the admission gate: a caller takes one of
+/// the node's slots ([`StreamSlot::acquire`]) before it opens an h2
+/// stream, and waits in line here when all are taken. Left to h2, the
+/// wait would be its unbounded `pending_open` queue, where a caller
+/// that gave up still leaves its HEADERS behind and is drained through
+/// the node's slots as a phantom stream, one per abandoned waiter.
+#[derive(Debug)]
 pub struct StreamLoad {
     active: AtomicU32,
     // in percent, 0 for none
     reported: AtomicU32,
+    // the node's advertised limit, mirrored so callers queue here
+    slots: Arc<Semaphore>,
+    queue: Mutex<Queue>,
+}
+
+impl Default for StreamLoad {
+    fn default() -> Self {
+        Self {
+            active: AtomicU32::new(0),
+            reported: AtomicU32::new(0),
+            slots: Arc::new(Semaphore::new(MAX_TUNNEL_STREAMS as usize)),
+            queue: Mutex::new(Queue {
+                waiting: 0,
+                since: Instant::now(),
+                served: 0,
+                gave_up: 0,
+            }),
+        }
+    }
+}
+
+/// The callers waiting for a slot. One run of them, from the first to
+/// queue until the last leaves, is one event: a line when it starts,
+/// one with the numbers when it drains, nothing per caller in between.
+#[derive(Debug)]
+struct Queue {
+    waiting: u32,
+    since: Instant,
+    served: u32,
+    gave_up: u32,
 }
 
 /// In percent of [`MAX_TUNNEL_STREAMS`], ascending.
@@ -495,6 +533,55 @@ impl StreamLoad {
         self.active.load(Relaxed)
     }
 
+    /// Callers waiting for a slot right now.
+    pub fn queued(&self) -> u32 {
+        self.queue().waiting
+    }
+
+    // the lock only guards counters, so a panic elsewhere while it was
+    // held is no reason to take every later caller down with it
+    fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn enqueue<'a>(&'a self, who: &'a str) -> Queued<'a> {
+        let mut queue = self.queue();
+        queue.waiting += 1;
+        if queue.waiting == 1 {
+            queue.since = Instant::now();
+            queue.served = 0;
+            queue.gave_up = 0;
+            info!(
+                "{who}: all {MAX_TUNNEL_STREAMS} streams are in use, callers are queueing for a slot"
+            );
+        }
+        Queued {
+            load: self,
+            who,
+            served: false,
+        }
+    }
+
+    fn dequeue(&self, who: &str, served: bool) {
+        let mut queue = self.queue();
+        queue.waiting -= 1;
+        if served {
+            queue.served += 1;
+        } else {
+            queue.gave_up += 1;
+        }
+        if queue.waiting == 0 {
+            info!(
+                "{who}: the queue drained after {:?}, {} callers were served from it, {} gave up",
+                queue.since.elapsed(),
+                queue.served,
+                queue.gave_up
+            );
+        }
+    }
+
     fn opened(&self) -> Option<LoadReport> {
         let active = self.active.fetch_add(1, Relaxed) + 1;
         let tier = tier_reached(active, 0);
@@ -518,21 +605,84 @@ fn tier_reached(active: u32, margin: u32) -> u32 {
         .unwrap_or(0)
 }
 
+/// One caller in the line for a slot, counted there until it is served
+/// or gives up; a dropped wait (the caller's timeout) is giving up.
+struct Queued<'a> {
+    load: &'a StreamLoad,
+    who: &'a str,
+    served: bool,
+}
+
+impl Queued<'_> {
+    fn served(mut self) {
+        self.served = true;
+    }
+}
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        self.load.dequeue(self.who, self.served);
+    }
+}
+
 /// A stream counted in a [`StreamLoad`] until dropped, so that no exit
-/// path can leak the count.
+/// path can leak the count or, on the relay, the node's slot it holds.
 #[derive(Debug)]
-pub struct StreamSlot(Arc<StreamLoad>);
+pub struct StreamSlot {
+    load: Arc<StreamLoad>,
+    // None on the node, which has no gate of its own (see `open`)
+    _permit: Option<OwnedSemaphorePermit>,
+}
 
 impl StreamSlot {
+    /// The node side: h2 already holds the relay to the advertised
+    /// limit, so an accepted stream only counts, it never waits.
     pub fn open(load: &Arc<StreamLoad>) -> (Self, Option<LoadReport>) {
+        Self::counted(load, None)
+    }
+
+    /// The relay side: take one of the node's slots, waiting in line
+    /// when all are taken. The wait is unbounded here, the caller puts
+    /// its timeout around it and dropping the future leaves the line.
+    /// `who` names the node in the queue's two log lines.
+    ///
+    /// # Panics
+    /// If the gate were closed, which nothing ever does.
+    pub async fn acquire(load: &Arc<StreamLoad>, who: &str) -> (Self, Option<LoadReport>) {
+        let permit = if let Ok(permit) = Arc::clone(&load.slots).try_acquire_owned() {
+            permit
+        } else {
+            let queued = load.enqueue(who);
+            let permit = Arc::clone(&load.slots)
+                .acquire_owned()
+                .await
+                .expect("the slot gate is never closed");
+            queued.served();
+            permit
+        };
+        Self::counted(load, Some(permit))
+    }
+
+    fn counted(
+        load: &Arc<StreamLoad>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> (Self, Option<LoadReport>) {
         let report = load.opened();
-        (Self(Arc::clone(load)), report)
+        (
+            Self {
+                load: Arc::clone(load),
+                _permit: permit,
+            },
+            report,
+        )
     }
 }
 
 impl Drop for StreamSlot {
     fn drop(&mut self) {
-        self.0.closed();
+        // runs before the permit is released, so the next caller through
+        // the gate never sees a count above the limit
+        self.load.closed();
     }
 }
 
@@ -1148,13 +1298,14 @@ mod tests {
     #[test]
     fn stream_load_reports_every_tier_once() {
         use log::Level;
-        let load = StreamLoad::default();
+        let load = Arc::new(StreamLoad::default());
         let cap = MAX_TUNNEL_STREAMS;
+        let mut held = Vec::new();
         let mut reports = Vec::new();
         for _ in 0..cap {
-            if let Some(report) = load.opened() {
-                reports.push(report);
-            }
+            let (slot, report) = StreamSlot::open(&load);
+            held.push(slot);
+            reports.extend(report);
         }
         assert_eq!(load.active(), cap);
 
@@ -1172,33 +1323,135 @@ mod tests {
             vec![Level::Info, Level::Info, Level::Warn, Level::Warn],
             "only the last two tiers are worth a warning"
         );
+
+        // no exit path leaks the count
+        drop(held);
+        assert_eq!(load.active(), 0);
     }
 
     #[test]
     fn stream_load_rearms_a_tier_only_after_dropping_clear_of_it() {
-        let load = StreamLoad::default();
+        let load = Arc::new(StreamLoad::default());
         let cap = MAX_TUNNEL_STREAMS;
+        let mut held = Vec::new();
         // just onto the first tier
-        while load.opened().is_none() {}
+        loop {
+            let (slot, report) = StreamSlot::open(&load);
+            held.push(slot);
+            if report.is_some() {
+                break;
+            }
+        }
         let at_tier = load.active();
 
         // hovering there must stay quiet
         for _ in 0..5 {
-            load.closed();
-            assert_eq!(load.opened(), None, "no repeat while hovering at a tier");
+            held.pop();
+            let (slot, report) = StreamSlot::open(&load);
+            assert_eq!(report, None, "no repeat while hovering at a tier");
+            held.push(slot);
         }
 
         // dropping clear of it (by the hysteresis margin) arms it again
         while load.active() * 100 / cap >= 50 - TIER_HYSTERESIS {
-            load.closed();
+            held.pop();
         }
         let mut crossings = 0;
         while load.active() < at_tier {
-            if load.opened().is_some() {
-                crossings += 1;
-            }
+            let (slot, report) = StreamSlot::open(&load);
+            held.push(slot);
+            crossings += u32::from(report.is_some());
         }
         assert_eq!(crossings, 1, "the tier must be armed again");
+    }
+
+    /// The relay's gate: `MAX_TUNNEL_STREAMS` slots are handed out
+    /// without a wait, the caller beyond them waits in line, and slots
+    /// that free up go to the line in order.
+    #[tokio::test]
+    async fn stream_slots_beyond_the_limit_wait_their_turn() {
+        use futures_util::FutureExt as _;
+        let load = Arc::new(StreamLoad::default());
+        let mut held = Vec::new();
+        for _ in 0..MAX_TUNNEL_STREAMS {
+            let (slot, _report) = StreamSlot::acquire(&load, "node")
+                .now_or_never()
+                .expect("a free slot needs no wait");
+            held.push(slot);
+        }
+        assert_eq!(load.active(), MAX_TUNNEL_STREAMS);
+
+        let waiter = |load: &Arc<StreamLoad>| {
+            let load = Arc::clone(load);
+            tokio::spawn(async move { StreamSlot::acquire(&load, "node").await })
+        };
+        let in_line = |n: u32| {
+            let load = Arc::clone(&load);
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while load.queued() != n {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{n} callers must be in line"));
+            }
+        };
+        let first = waiter(&load);
+        in_line(1).await;
+        let second = waiter(&load);
+        in_line(2).await;
+        assert!(!first.is_finished() && !second.is_finished());
+
+        // one slot frees: the head of the line gets it, nobody else
+        held.pop();
+        let (slot, _report) = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the freed slot must go to the first waiter")
+            .unwrap();
+        in_line(1).await;
+        assert_eq!(load.active(), MAX_TUNNEL_STREAMS);
+        assert!(!second.is_finished());
+
+        drop(slot);
+        let (_slot, _report) = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the next freed slot must go to the second waiter")
+            .unwrap();
+        in_line(0).await;
+        assert_eq!(load.active(), MAX_TUNNEL_STREAMS);
+    }
+
+    /// A waiter that gives up (its future dropped, which is what the
+    /// relay's timeout does) is gone at once: it holds no slot and no
+    /// place in line, and the next slot to free goes to a live caller.
+    #[tokio::test]
+    async fn a_dropped_wait_leaves_no_trace_in_the_line() {
+        use futures_util::FutureExt as _;
+        let load = Arc::new(StreamLoad::default());
+        let mut held = Vec::new();
+        for _ in 0..MAX_TUNNEL_STREAMS {
+            let (slot, _report) = StreamSlot::acquire(&load, "node")
+                .now_or_never()
+                .expect("a free slot needs no wait");
+            held.push(slot);
+        }
+
+        for _ in 0..3 {
+            // polled once and dropped, like a timed-out caller
+            assert!(
+                StreamSlot::acquire(&load, "node").now_or_never().is_none(),
+                "a full gate must make the caller wait"
+            );
+        }
+        assert_eq!(load.queued(), 0, "a dropped wait must leave the line");
+        assert_eq!(load.active(), MAX_TUNNEL_STREAMS);
+
+        held.pop();
+        let (_slot, _report) = StreamSlot::acquire(&load, "node")
+            .now_or_never()
+            .expect("the freed slot must be there for the next live caller");
+        assert_eq!(load.active(), MAX_TUNNEL_STREAMS);
     }
 
     #[test]

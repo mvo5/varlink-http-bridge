@@ -298,9 +298,14 @@ tunnel starves. Both tunnel ends therefore size the connection window as
 the node advertises that same stream limit, so no stream can hold more
 than its own share and a caller beyond the limit waits for a slot (and
 gets a `503` if none frees up in time) instead of slowing everybody
-down. The window is a promise, not an allocation: an idle tunnel costs
-the same with 8MiB as with h2's 64KiB default, and only a tunnel whose
-callers all wedge at once holds that much.
+down. The relay keeps that line itself, in front of h2: a caller takes
+one of the node's slots before it opens a stream, so one that gives up
+waiting never reaches the node -- left to h2's own queue, an abandoned
+request would still open and reset a stream on the node once a slot
+frees, one per waiter, ahead of the live callers. The window is a
+promise, not an allocation: an idle tunnel costs the same with 8MiB as
+with h2's 64KiB default, and only a tunnel whose callers all wedge at
+once holds that much.
 
 The 32KiB stream window is what bounds a single caller's throughput over
 a long fat pipe (window/RTT, so ~650KB/s at 50ms, measured 0.60MB/s) --
@@ -322,7 +327,7 @@ stops being read at all:
 | ----- | ------------------ | ------ |
 | `error` | the process cannot do its job any more | never, in practice |
 | `warn` | someone has to act: a tunnel is down, a node id is claimed twice, a tunnel is out of stream slots, a stream is wedged, the listener is out of file descriptors | one per event, not per attempt |
-| `info` | lifecycle worth tracking: listeners bound, a node connected or disconnected (with how long it lasted and how many streams went with it), a tunnel established or recovered, a caller asking for a node nobody has | per node, per tunnel |
+| `info` | lifecycle worth tracking: listeners bound, a node connected or disconnected (with how long it lasted and how many streams went with it), a tunnel established or recovered, callers starting to queue on a full tunnel and that queue draining (how long, how many served from it, how many gave up), a caller asking for a node nobody has | per node, per tunnel |
 | `debug` | one line per caller and per retry, with the numbers: bytes each way, how long, why it ended | per stream |
 
 Three rules keep the volume proportional to the trouble rather than to
