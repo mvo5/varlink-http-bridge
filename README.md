@@ -32,6 +32,12 @@ this is the form the generated OpenAPI descriptions use.
 
 For `/call` the parameters are POSTed as regular JSON.
 
+Streaming methods (the varlink `more` flag) are selected with the
+`?more=true` query parameter and reply with an RFC 7464 JSON text
+sequence, content type `application/json-seq`.
+`more` changes what the call does, so it is a call parameter rather than
+content negotiation: the `Accept` header is not consulted.
+
 ### Websocket support
 
 ```
@@ -54,7 +60,9 @@ bridge needs a ship, and this one discovers your varlink services.
 ## Examples (curl)
 
 Using `curl` for direct calls is usually more convenient/ergonomic than
-using the websocket endpoint.
+using the websocket endpoint. The examples use `--json`, which needs
+curl 7.82 or newer; older versions take
+`-X POST -H "Content-Type: application/json" -d ...` instead.
 
 For demo purposes, let's first start the service *without authentication*.
 This mode is NOT SECURE! See below how to set up authentication.
@@ -113,10 +121,10 @@ $ curl -s http://localhost:1031/sockets/io.systemd.Hostname/io.systemd.Hostname 
   ]
 }
 
-$ curl -s -X POST http://localhost:1031/call/io.systemd.Hostname.Describe -d '{}' -H "Content-Type: application/json" | jq .StaticHostname
+$ curl -s http://localhost:1031/call/io.systemd.Hostname.Describe --json '{}' | jq .StaticHostname
 "myhost"
 
-$ curl -s -X POST http://localhost:1031/call/org.varlink.service.GetInfo?socket=io.systemd.Hostname -d '{}' -H "Content-Type: application/json" | jq
+$ curl -s 'http://localhost:1031/call/org.varlink.service.GetInfo?socket=io.systemd.Hostname' --json '{}' | jq
 {
   "interfaces": [
     "io.systemd",
@@ -130,10 +138,11 @@ $ curl -s -X POST http://localhost:1031/call/org.varlink.service.GetInfo?socket=
   "version": "259 (259-1)"
 }
 
-# streaming methods use 'Accept: application/json-seq' (RFC 7464)
-$ curl -s -H "Accept: application/json-seq" -H "Content-Type: application/json" \
-    http://localhost:1031/call/io.systemd.UserDatabase.GetUserRecord \
-    -d '{"service":"io.systemd.Multiplexer"}' | jq --seq
+# streaming methods (varlink "more" flag) are requested with ?more=true;
+# the replies come back as a json-seq (RFC 7464).
+$ curl -s 'http://localhost:1031/call/io.systemd.UserDatabase.GetUserRecord?more=true' \
+    -H 'Accept: application/json-seq' \
+    --json '{"service":"io.systemd.Multiplexer"}' | jq --seq
 {
   "incomplete": true,
   "record": {

@@ -849,10 +849,9 @@ async fn test_jsonseq_hostname_describe() {
     let client = Client::new();
     let res = client
         .post(format!(
-            "http://{}/call/io.systemd.Hostname.Describe",
+            "http://{}/call/io.systemd.Hostname.Describe?more=true",
             server.addr,
         ))
-        .header("Accept", "application/json-seq")
         .json(&json!({}))
         .send()
         .await
@@ -885,10 +884,9 @@ async fn test_jsonseq_userdb_get_user_record_more() {
     let client = Client::new();
     let res = client
         .post(format!(
-            "http://{}/call/io.systemd.UserDatabase.GetUserRecord?socket=io.systemd.Multiplexer",
+            "http://{}/call/io.systemd.UserDatabase.GetUserRecord?socket=io.systemd.Multiplexer&more=true",
             server.addr,
         ))
-        .header("Accept", "application/json-seq")
         .json(&json!({"service": "io.systemd.Multiplexer"}))
         .send()
         .await
@@ -1959,28 +1957,30 @@ fn test_build_authenticators_ssh_without_keys_rejects() {
     assert!(check_request(auths[0].as_ref(), "GET", "/health", None, None, None).is_err());
 }
 
-/// `Accept` may arrive split over several field lines; the `more` request
-/// must be seen in any of them, not just the first.
 #[test]
-fn test_wants_json_seq_across_field_lines() {
-    fn headers(accept: &[&str]) -> axum::http::HeaderMap {
-        let mut headers = axum::http::HeaderMap::new();
-        for value in accept {
-            headers.append(axum::http::header::ACCEPT, value.parse().unwrap());
-        }
-        headers
+fn test_call_mode_from_params() {
+    use crate::CallMode;
+
+    fn params(more: Option<&str>) -> HashMap<String, String> {
+        more.map(|v| HashMap::from([("more".to_string(), v.to_string())]))
+            .unwrap_or_default()
     }
 
-    assert!(!crate::wants_json_seq(&headers(&[])));
-    assert!(!crate::wants_json_seq(&headers(&["application/json"])));
-    assert!(crate::wants_json_seq(&headers(&["application/json-seq"])));
-    assert!(crate::wants_json_seq(&headers(&[
-        "application/json, application/json-seq"
-    ])));
-    assert!(crate::wants_json_seq(&headers(&[
-        "application/json",
-        "application/json-seq"
-    ])));
+    assert_eq!(
+        CallMode::from_params(&params(None)).unwrap(),
+        CallMode::Call
+    );
+    assert_eq!(
+        CallMode::from_params(&params(Some("false"))).unwrap(),
+        CallMode::Call
+    );
+    assert_eq!(
+        CallMode::from_params(&params(Some("true"))).unwrap(),
+        CallMode::More
+    );
+    assert!(CallMode::from_params(&params(Some("yes"))).is_err());
+    assert!(CallMode::from_params(&params(Some(""))).is_err());
+    assert!(CallMode::from_params(&params(Some("1"))).is_err());
 }
 
 // --- SSH key auth tests ---

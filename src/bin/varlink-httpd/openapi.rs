@@ -138,8 +138,8 @@ fn method_more_flag(method: &zlink::idl::Method) -> MoreFlag {
 /// This belongs on the Response Object: the OAS 3.1 meta-schema forbids
 /// unknown keys (`description` among them) inside a Media Type Object.
 const JSON_SEQ_NOTE: &str = "Streaming replies use the varlink 'more' flag: \
-     request them with Accept: application/json-seq and each reply arrives as \
-     an RFC 7464 JSON text sequence record (RS 0x1E + JSON + LF).";
+     request them with ?more=true and each reply arrives as an RFC 7464 JSON \
+     text sequence record (RS 0x1E + JSON + LF).";
 
 pub fn idl_to_openapi(address: &str, iface: &Interface) -> Value {
     let mut paths = serde_json::Map::new();
@@ -170,6 +170,18 @@ pub fn idl_to_openapi(address: &str, iface: &Interface) -> Value {
         );
         let output_schema = fields_to_schema(method.outputs());
         let more_flag = method_more_flag(method);
+        if !matches!(more_flag, MoreFlag::None) {
+            operation.insert(
+                "parameters".to_string(),
+                json!([{
+                    "name": "more",
+                    "in": "query",
+                    "required": matches!(more_flag, MoreFlag::Requires),
+                    "description": "Set to true to stream replies (varlink 'more' flag) as application/json-seq",
+                    "schema": {"type": "boolean"}
+                }]),
+            );
+        }
 
         let mut content = serde_json::Map::new();
         if !matches!(more_flag, MoreFlag::Requires) {

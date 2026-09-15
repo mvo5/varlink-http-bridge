@@ -91,7 +91,7 @@ impl From<zlink::Error> for AppError {
                 varlink_service::Error::ExpectedMore => {
                     message = Some(
                         "This method requires the varlink 'more' flag. \
-                         Use Accept: application/json-seq to enable streaming."
+                         Use ?more=true to enable streaming."
                             .to_string(),
                     );
                     StatusCode::BAD_REQUEST
@@ -1029,25 +1029,35 @@ fn varlink_call_to_jsonseq(
         .unwrap()
 }
 
-fn wants_json_seq(headers: &axum::http::HeaderMap) -> bool {
-    headers
-        .get_all(axum::http::header::ACCEPT)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .any(|v| v.contains("application/json-seq"))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallMode {
+    /// Regular call, one reply, returned as a JSON body.
+    Call,
+    /// `more` set, replies streamed as a JSON text sequence (RFC 7464).
+    More,
 }
 
-/// Call a varlink method on the given socket.
-///
-/// - Default: single JSON response via varlink `call`
-/// - `Accept: application/json-seq`: stream replies via varlink `more`
-///   as a JSON text sequence (RFC 7464)
+impl CallMode {
+    /// `more` changes what the call does, so it is a call parameter and not
+    /// content negotiation: the `Accept` header is deliberately not consulted.
+    fn from_params(params: &HashMap<String, String>) -> Result<Self, AppError> {
+        match params.get("more").map(String::as_str) {
+            None | Some("false") => Ok(Self::Call),
+            Some("true") => Ok(Self::More),
+            Some(other) => Err(AppError::bad_request(format!(
+                "invalid value '{other}' for ?more=, expected true or false"
+            ))),
+        }
+    }
+}
+
+/// Call a varlink method on the given socket in the requested [`CallMode`].
 async fn call_varlink_method(
     socket: &str,
     method: &str,
     state: &AppState,
     conn_cache: &VarlinkConnCache,
-    headers: &axum::http::HeaderMap,
+    mode: CallMode,
     call_args: &HashMap<String, Value>,
 ) -> Result<Response, AppError> {
     let method_call = DynMethod {
@@ -1057,18 +1067,19 @@ async fn call_varlink_method(
 
     let conn_arc = get_varlink_connection(socket, state, conn_cache).await?;
     let mut connection = conn_arc.lock_owned().await;
-    if wants_json_seq(headers) {
-        connection
-            .send_call(&zlink::Call::new(&method_call).set_more(true), vec![])
-            .await?;
-        Ok(varlink_call_to_jsonseq(connection))
-    } else {
-        connection
+    match mode {
+        CallMode::More => {
+            connection
+                .send_call(&zlink::Call::new(&method_call).set_more(true), vec![])
+                .await?;
+            Ok(varlink_call_to_jsonseq(connection))
+        }
+        CallMode::Call => connection
             .call_method::<_, DynReply, DynReplyError>(&method_call.into(), vec![])
             .await?
             .0
             .map(|r| r.into_parameters().unwrap_or_default().into_response())
-            .map_err(AppError::from)
+            .map_err(AppError::from),
     }
 }
 
@@ -1079,10 +1090,10 @@ async fn route_call_post(
     Path(method): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
     axum::Json(call_args): axum::Json<HashMap<String, Value>>,
 ) -> Result<Response, AppError> {
     debug!("POST call for method: {method}, params: {params:#?}");
+    let mode = CallMode::from_params(&params)?;
 
     let socket = if let Some(socket) = params.get("socket") {
         socket.clone()
@@ -1098,7 +1109,7 @@ async fn route_call_post(
             .to_string()
     };
 
-    call_varlink_method(&socket, &method, &state, &conn_cache, &headers, &call_args).await
+    call_varlink_method(&socket, &method, &state, &conn_cache, mode, &call_args).await
 }
 
 /// Call a varlink method with the socket given explicitly in the path.
@@ -1108,10 +1119,10 @@ async fn route_call_socket_post(
     Path((socket, method)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
     axum::Json(call_args): axum::Json<HashMap<String, Value>>,
 ) -> Result<Response, AppError> {
     debug!("POST call for socket: {socket}, method: {method}");
+    let mode = CallMode::from_params(&params)?;
 
     // `?socket=` is the override for the other /call route and has no meaning
     // here; accepting it would suggest it does something
@@ -1121,7 +1132,7 @@ async fn route_call_socket_post(
         ));
     }
 
-    call_varlink_method(&socket, &method, &state, &conn_cache, &headers, &call_args).await
+    call_varlink_method(&socket, &method, &state, &conn_cache, mode, &call_args).await
 }
 
 async fn route_ws(
