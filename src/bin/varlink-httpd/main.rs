@@ -377,13 +377,18 @@ where
                 let tx = tx.clone();
                 let config = config.clone();
                 tokio::spawn(async move {
-                    match tls_accept(&config, stream).await {
-                        Ok(tls_stream) => {
+                    let handshake = tls_accept(&config, stream);
+                    match tokio::time::timeout(config.handshake_timeout, handshake).await {
+                        Ok(Ok(tls_stream)) => {
                             if tx.send((tls_stream, addr)).await.is_err() {
                                 warn!("TLS listener receiver dropped");
                             }
                         }
-                        Err(e) => warn!("TLS handshake from {addr}: {e:#}"),
+                        Ok(Err(e)) => warn!("TLS handshake from {addr}: {e:#}"),
+                        Err(_) => warn!(
+                            "TLS handshake from {addr}: nothing in {:?}, dropping the connection",
+                            config.handshake_timeout
+                        ),
                     }
                 });
             }
@@ -590,7 +595,12 @@ struct TlsConfig {
     acceptor: openssl::ssl::SslAcceptor,
     /// `None` when mTLS is off, so no client certificate is requested.
     client_trust: Option<Arc<ClientTrust>>,
+    /// How long a client gets to complete its handshake before the
+    /// connection is dropped.
+    handshake_timeout: Duration,
 }
+
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn load_tls_config(
     cert_path: &str,
@@ -611,6 +621,7 @@ fn load_tls_config(
     Ok(TlsConfig {
         acceptor: builder.build(),
         client_trust,
+        handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
     })
 }
 
