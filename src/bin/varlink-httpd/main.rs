@@ -315,23 +315,6 @@ async fn get_varlink_connection(
     Ok(connection)
 }
 
-/// Accept a TCP connection, configure socket options, and retry on transient errors.
-async fn accept_and_configure(
-    listener: &TcpListener,
-) -> (tokio::net::TcpStream, std::net::SocketAddr) {
-    loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                if let Err(e) = varlink_http_bridge::set_tcp_keepalive_and_nodelay(&stream) {
-                    warn!("on accept from {addr}: {e:#}");
-                }
-                return (stream, addr);
-            }
-            Err(e) => warn!("TCP accept failed: {e}"),
-        }
-    }
-}
-
 fn format_x509_subject(cert: &openssl::x509::X509Ref) -> String {
     cert.subject_name()
         .entries()
@@ -443,7 +426,7 @@ impl axum::serve::Listener for PlainListener {
     type Addr = std::net::SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        accept_and_configure(&self.inner).await
+        varlink_http_bridge::listen::accept_and_configure(&self.inner).await
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
