@@ -217,12 +217,21 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 // connect, TLS, WebSocket upgrade and h2 handshake together
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+// The stream id at which a tunnel is rotated. The relay opens every
+// caller as a new stream on the one connection and never rotates it,
+// and client stream ids are the odd numbers below 2^31: after 2^30
+// callers send_request fails for good on a connection that still looks
+// healthy (PINGs answered, no GOAWAY). This side sees every id, so it
+// asks for a fresh connection 2^20 ids short of the ceiling: at 100
+// callers/s that is ~124 days in, with ~3h of headroom left.
+const ROTATE_AT_STREAM_ID: u32 = (1 << 31) - (1 << 21);
 
-/// The time limits of one tunnel, in one place so a test can shrink them.
+/// The limits of one tunnel, in one place so a test can shrink them.
 struct Tuning {
     dial_timeout: Duration,
     heartbeat_interval: Duration,
     heartbeat_timeout: Duration,
+    rotate_at: u32,
 }
 
 impl Tuning {
@@ -230,6 +239,7 @@ impl Tuning {
         dial_timeout: DIAL_TIMEOUT,
         heartbeat_interval: HEARTBEAT_INTERVAL,
         heartbeat_timeout: HEARTBEAT_TIMEOUT,
+        rotate_at: ROTATE_AT_STREAM_ID,
     };
 }
 
@@ -514,6 +524,7 @@ where
     // connections as fast as callers arrive, which is worth knowing but
     // not worth a line per stream
     let mut queue_warned = false;
+    let mut rotating = false;
     loop {
         let next = tokio::select! {
             next = conn.accept() => next,
@@ -523,6 +534,19 @@ where
         };
         let Some(next) = next else { break };
         let (request, mut respond) = next.context("tunnel connection failed")?;
+        let stream_id = u32::from(respond.stream_id());
+        // GOAWAY to the relay; the streams in flight finish, accept()
+        // then returns None, and the dial loop redials. Between the
+        // relay refusing new streams on this connection and the fresh
+        // tunnel registering, callers get 502: the redial backoff (~1s)
+        // plus the dial, and longer if a stream in flight takes its
+        // time, since the relay frees this node's id only when the
+        // connection has closed
+        if stream_id >= tuning.rotate_at && !rotating {
+            rotating = true;
+            info!("tunnel stream ids reached {stream_id}, rotating the connection");
+            conn.graceful_shutdown();
+        }
         let body = request.into_body();
         // a caller gone before its stream is answered (hung up, or the
         // relay gave up queueing it for a slot) is that caller's
@@ -534,7 +558,6 @@ where
                 continue;
             }
         };
-        let stream_id = u32::from(send.stream_id());
         let who = format!("relay stream {stream_id}");
         served += 1;
         let (slot, report) = StreamSlot::open(&load);
@@ -587,9 +610,10 @@ where
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
+    use varlink_http_bridge::tunnel::h2_client_builder;
 
     const TEST_NODE: &str = "0123456789abcdef0123456789abcdef";
 
@@ -794,5 +818,118 @@ mod tests {
             .expect("the dial must be bounded");
         let e = result.expect_err("a handshake that never completes is a failed dial");
         assert!(format!("{e:#}").contains("200ms"), "{e:#}");
+    }
+
+    /// The relay never rotates the connection and cannot tell when its
+    /// stream ids are about to run out, so the node does it: the
+    /// streams already open finish, the connection then ends cleanly
+    /// (no outage), and the next dial gets a fresh one.
+    #[tokio::test]
+    async fn a_tunnel_rotates_before_the_relay_runs_out_of_stream_ids() {
+        let (listener, target) = stub_relay().await;
+        let again = TunnelUrl {
+            tls: false,
+            host: target.host.clone(),
+            port: target.port,
+        };
+        let (tx, mut rx) = mpsc::channel(16);
+        let sink = plain_sink(tx);
+        let node: NodeId = TEST_NODE.parse().unwrap();
+        // client stream ids are 1, 3, 5, ...: the third caller crosses
+        let tuning = || Tuning {
+            rotate_at: 5,
+            ..Tuning::DEFAULT
+        };
+        let first = {
+            let sink = sink.clone();
+            tokio::spawn(
+                async move { dial_once(&target, None, node, &sink, None, 1, &tuning()).await },
+            )
+        };
+
+        // the relay: h2 client over the WebSocket, as node.rs does it
+        let (tcp, _) = listener.accept().await.unwrap();
+        let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let (mut h2, conn) = h2_client_builder()
+            .handshake::<_, bytes::Bytes>(WsByteStream::new(ws))
+            .await
+            .unwrap();
+        let mut conn = tokio::spawn(conn);
+        let mut callers = Vec::new();
+        for _ in 0..3 {
+            let request = http::Request::post("https://node/").body(()).unwrap();
+            let (response, mut send) = h2.send_request(request, false).unwrap();
+            send.send_data(bytes::Bytes::from_static(b"hello"), true)
+                .unwrap();
+            callers.push(response);
+        }
+
+        // the node hands each one to axum; read the greeting and hold
+        // the connection, as a caller mid-request would
+        let mut accepted = Vec::new();
+        for _ in 0..3 {
+            let (mut io, peer) = rx.recv().await.unwrap();
+            let mut greeting = [0u8; 5];
+            io.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(&greeting, b"hello");
+            accepted.push((io, peer.stream.unwrap()));
+        }
+        accepted.sort_by_key(|(_, id)| *id);
+        let ids: Vec<u32> = accepted.iter().map(|(_, id)| *id).collect();
+        assert_eq!(ids, [1, 3, 5]);
+
+        // answering the stream that crossed the mark must not take the
+        // two opened before it down with it
+        let reply = |(mut io, _): (DuplexStream, u32)| async move {
+            io.write_all(b"world").await.unwrap();
+        };
+        reply(accepted.pop().unwrap()).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut conn)
+                .await
+                .is_err(),
+            "the connection must stay up while streams are in flight"
+        );
+        for open in accepted {
+            reply(open).await;
+        }
+        for response in callers {
+            let response = response.await.unwrap();
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let mut body = response.into_body();
+            let mut answer = Vec::new();
+            while let Some(chunk) = body.data().await {
+                answer.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(answer, b"world");
+        }
+
+        // with nothing in flight the node closes, cleanly on both ends...
+        tokio::time::timeout(Duration::from_secs(5), conn)
+            .await
+            .expect("the connection must end once the streams are done")
+            .unwrap()
+            .expect("a rotation is a clean close for the relay");
+        tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the dial must return once the connection ended")
+            .unwrap()
+            .expect("a rotation is a clean close for the node, not an outage");
+
+        // ...and the next dial is a fresh connection
+        let second =
+            tokio::spawn(
+                async move { dial_once(&again, None, node, &sink, None, 1, &tuning()).await },
+            );
+        let (tcp, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("the node must dial again")
+            .unwrap();
+        let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let (_h2, _conn) = h2_client_builder()
+            .handshake::<_, bytes::Bytes>(WsByteStream::new(ws))
+            .await
+            .expect("a fresh tunnel");
+        second.abort();
     }
 }
