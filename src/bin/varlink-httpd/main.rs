@@ -359,20 +359,14 @@ async fn tls_accept<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     config: &TlsConfig,
     stream: S,
 ) -> anyhow::Result<tokio_openssl::SslStream<S>> {
-    let mut ssl = openssl::ssl::Ssl::new(config.acceptor.context()).context("SSL context error")?;
-    if let Some(trust) = &config.client_trust {
-        // Per handshake so a CA that changed on disk applies to new connections
-        // without restarting the listener.
-        ssl.set_verify_cert_store(trust.store()?)
-            .context("installing client CA store")?;
-    }
-    let mut tls_stream =
-        tokio_openssl::SslStream::new(ssl, stream).context("SSL stream creation failed")?;
-    std::pin::Pin::new(&mut tls_stream)
-        .accept()
-        .await
-        .context("TLS handshake failed")?;
-    Ok(tls_stream)
+    // Per handshake so a CA that changed on disk applies to new connections
+    // without restarting the listener.
+    let client_store = config
+        .client_trust
+        .as_ref()
+        .map(|trust| trust.store())
+        .transpose()?;
+    varlink_http_bridge::listen::tls_accept(&config.acceptor, client_store, stream).await
 }
 
 /// TLS wrapper for any `axum::serve::Listener`. Performs handshakes concurrently
@@ -621,19 +615,13 @@ fn load_tls_config(
     client_ca_path: Option<&str>,
     require_client_cert: bool,
 ) -> anyhow::Result<TlsConfig> {
-    use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
-
-    let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())?;
-    // mozilla_modern_v5 allows TLS 1.2, but we need 1.3 for channel binding
-    // (export_keying_material requires TLS 1.3).
-    builder.set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_3))?;
-    builder.set_certificate_chain_file(cert_path)?;
-    builder.set_private_key_file(key_path, SslFiletype::PEM)?;
-    builder.check_private_key()?;
+    let mut builder = varlink_http_bridge::listen::tls_acceptor_builder(cert_path, key_path)?;
 
     // The CAs store is configured per-handshake.
     let client_trust = require_client_cert.then(|| {
-        builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        builder.set_verify(
+            openssl::ssl::SslVerifyMode::PEER | openssl::ssl::SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+        );
         Arc::new(ClientTrust::new(client_ca_path))
     });
 
