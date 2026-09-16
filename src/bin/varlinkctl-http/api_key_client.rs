@@ -10,6 +10,8 @@ use anyhow::{Context, Result};
 use futures_util::future::LocalBoxFuture;
 use log::debug;
 
+use varlink_http_bridge::secret_file::{SecretAccess, read_secret_file};
+
 use crate::client_auth::ClientAuth;
 
 /// Environment variable carrying the API key itself (not a path, unlike
@@ -28,8 +30,7 @@ fn api_key_path() -> Option<PathBuf> {
 /// Trimmed so a trailing newline works; an empty file is unset, not an empty
 /// key.
 fn key_from_file(path: &Path) -> Result<Option<String>> {
-    let key =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let key = read_secret_file(path, SecretAccess::OwnerAndGroup)?;
     let key = key.trim();
     Ok((!key.is_empty()).then(|| key.to_string()))
 }
@@ -91,21 +92,41 @@ async fn connect_with_api_key(url: &str) -> Result<Option<crate::Ws>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_fake_key(path: &Path, content: &str, mode: u32) {
+        std::fs::write(path, content).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
 
     #[test]
     fn test_key_from_file_trims_and_treats_empty_as_unset() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(API_KEY_FILE);
 
-        std::fs::write(&path, "vhb_abc\n").unwrap();
+        write_fake_key(&path, "vhb_abc\n", 0o600);
         assert_eq!(key_from_file(&path).unwrap().as_deref(), Some("vhb_abc"));
 
-        std::fs::write(&path, "  \n\t ").unwrap();
+        write_fake_key(&path, "  \n\t ", 0o600);
         assert_eq!(
             key_from_file(&path).unwrap(),
             None,
             "a whitespace-only file must not become an empty bearer key"
         );
+    }
+
+    #[test]
+    fn test_key_from_file_refuses_world_readable_but_allows_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(API_KEY_FILE);
+
+        write_fake_key(&path, "vhb_abc\n", 0o644);
+        let err = format!("{:#}", key_from_file(&path).unwrap_err());
+        assert!(err.contains("0644"), "{err}");
+
+        // a root-owned /etc copy shared with a group is a supported setup
+        write_fake_key(&path, "vhb_abc\n", 0o640);
+        assert_eq!(key_from_file(&path).unwrap().as_deref(), Some("vhb_abc"));
     }
 
     #[test]

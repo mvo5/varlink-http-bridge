@@ -372,7 +372,7 @@ client TLS material in the first existing directory:
 | `client-key-file`      | Client private key PEM (for mTLS)         |
 | `server-ca-file`       | CA certificate PEM (for private/self-signed server CAs) |
 | `known-hosts`          | pinned server public keys, one line per peer |
-| `api-key`              | API key, for `--auth=api-key` servers      |
+| `api-key`              | API key, for `--auth=api-key` servers; refused if world-readable |
 
 Without a `server-ca-file` the system CAs are used. If present, it
 is the exclusive trust anchor and system CAs are no longer consulted.
