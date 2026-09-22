@@ -9,6 +9,7 @@ use std::time::{Instant, SystemTime};
 
 use crate::{AuthRequest, Authenticator};
 use varlink_http_bridge::sshauth_token::{SSHAUTH_NONCE_HEADER, SignedParts, UnverifiedToken};
+use varlink_http_bridge::sysconf::CredentialsLoader;
 
 /// One tracked `authorized_keys` file: its mtime when last read and the
 /// (fingerprint -> key) map of supported keys it contained. Bundling
@@ -365,24 +366,11 @@ const SSH_AUTHORIZED_KEYS_PREFIX: &str = "varlink-httpd.ssh.authorized-keys.";
 /// A missing directory means no credentials; other errors propagate so
 /// the caller keeps the cached keys.
 fn ssh_authorized_keys_prefixed(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let mut paths = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.starts_with(SSH_AUTHORIZED_KEYS_PREFIX))
-        {
-            paths.push(entry.path().to_string_lossy().into_owned());
-        }
-    }
-    paths.sort();
-    Ok(paths)
+    Ok(CredentialsLoader::from_dir(dir)
+        .paths_with_prefix(SSH_AUTHORIZED_KEYS_PREFIX)?
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
 }
 
 /// Names of the authorized-keys credentials present in `dir`, so a
