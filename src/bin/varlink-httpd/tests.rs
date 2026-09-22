@@ -2057,6 +2057,34 @@ fn test_unread_credentials_ignores_absent_files() {
     );
 }
 
+// --- credential imports in the shipped unit ---
+
+/// A credential the code looks for but the unit does not import would sit in
+/// the credstore and never reach the service, so the two lists must agree,
+/// down to the `ImportCredential=` spelling of the globs.
+#[test]
+fn test_unit_imports_every_mechanism_credential() {
+    let unit = include_str!("../../../data/varlink-httpd.service.in");
+    let imported: Vec<&str> = unit
+        .lines()
+        .filter_map(|line| line.strip_prefix("ImportCredential="))
+        // `id:alias` imports under another name, the credstore id is what matters
+        .map(|value| value.split_once(':').map_or(value, |(id, _alias)| id))
+        .collect();
+
+    let mut looked_for: Vec<&str> = crate::auth_api_key::API_KEY_CREDENTIALS.to_vec();
+    #[cfg(feature = "sshauth")]
+    {
+        looked_for.extend(crate::auth_ssh::SSH_AUTHORIZED_KEYS_CREDENTIALS);
+    }
+    for pattern in looked_for {
+        assert!(
+            imported.contains(&pattern),
+            "{pattern} is read by the service but not imported by the unit"
+        );
+    }
+}
+
 // --- --auth= mechanism selection tests ---
 
 /// Every `build_authenticators()` case, with `/` never touched.

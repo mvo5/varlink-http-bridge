@@ -276,7 +276,7 @@ impl SshKeyAuthenticator {
         creds_dir: Option<std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
         let all_paths = current_paths(&paths, creds_dir.as_deref())
-            .context("failed to enumerate prefixed credentials")?;
+            .context("failed to enumerate credentials")?;
         let cache = KeyCache::load_all(&all_paths)?;
         if cache.unique_key_count() == 0 {
             warn!(
@@ -348,52 +348,51 @@ fn extract_nonce(headers: &axum::http::HeaderMap) -> Option<String> {
         .map(String::from)
 }
 
-/// Well-known credential names for SSH authorized keys, see
-/// systemd.system-credentials(7).  The dedicated credential is checked
-/// first so it takes priority over the broader ephemeral one.
-const SSH_AUTHORIZED_KEYS_CREDENTIALS: &[&str] = &[
+/// Everything ssh auth reads from the credentials directory, in
+/// `ImportCredential=` syntax (see [`CredentialsLoader::find`]). The first
+/// two are the well-known names from systemd.system-credentials(7).
+pub(crate) const SSH_AUTHORIZED_KEYS_CREDENTIALS: &[&str] = &[
     "ssh.authorized_keys.root",
     "ssh.ephemeral-authorized_keys-all",
+    "varlink-httpd.ssh.authorized-keys.*",
 ];
-
-/// One credential per provider, because neither the credstore nor overlaid
-/// confexts can merge the contents of a shared file.
-const SSH_AUTHORIZED_KEYS_PREFIX: &str = "varlink-httpd.ssh.authorized-keys.";
 
 /// Sorted so the merge order is stable. Re-enumerated on every reload
 /// check because `RefreshOnReload=credentials` swaps in a fresh tree on
 /// `systemctl reload`, so matches can appear and disappear while we run.
 /// A missing directory means no credentials; other errors propagate so
 /// the caller keeps the cached keys.
-fn ssh_authorized_keys_prefixed(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+fn credential_paths(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+    // TODO: this is silly, use the PathBuf directly, Vec<string> is wrong there
     Ok(CredentialsLoader::from_dir(dir)
-        .paths_with_prefix(SSH_AUTHORIZED_KEYS_PREFIX)?
+        .find(SSH_AUTHORIZED_KEYS_CREDENTIALS)?
         .into_iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect())
 }
 
-/// Names of the authorized-keys credentials present in `dir`, so a
-/// configuration that never reads them can say which ones it is ignoring.
-pub(crate) fn authorized_keys_credentials(dir: &std::path::Path) -> Vec<String> {
-    let mut names: Vec<String> = SSH_AUTHORIZED_KEYS_CREDENTIALS
-        .iter()
-        .filter(|name| dir.join(name).exists())
-        .map(|name| (*name).to_string())
-        .collect();
-    names.extend(
-        ssh_authorized_keys_prefixed(dir)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|path| {
-                std::path::Path::new(path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(String::from)
-            }),
-    );
-    names.sort();
-    names
+/// Report if any API key credentials are present but not read because
+/// the ssh auth is not selected or an explicit path is used instead.
+pub(crate) fn unread_credentials(
+    dir: &std::path::Path,
+    auth_is_selected: bool,
+    explicit_path_set: bool,
+) -> Vec<String> {
+    // An explicit --authorized-keys= replaces discovery rather than adding
+    // to it, so it hides credentials even when ssh auth is selected.
+    let why = if explicit_path_set {
+        "--authorized-keys= replaces credential discovery"
+    } else if !auth_is_selected {
+        "pass --auth=ssh to use them"
+    } else {
+        return Vec::new();
+    };
+    // diagnostics only, so an unreadable directory lists nothing
+    CredentialsLoader::from_dir(dir)
+        .find_with(SSH_AUTHORIZED_KEYS_CREDENTIALS, |id| {
+            format!("{id} ({why})")
+        })
+        .unwrap_or_default()
 }
 
 fn current_paths(
@@ -402,7 +401,7 @@ fn current_paths(
 ) -> std::io::Result<Vec<String>> {
     let mut all = paths.to_vec();
     if let Some(d) = creds_dir {
-        all.extend(ssh_authorized_keys_prefixed(d)?);
+        all.extend(credential_paths(d)?);
     }
     Ok(all)
 }
@@ -414,24 +413,19 @@ pub(crate) fn create_ssh_authenticator(
     creds_dir: Option<&std::path::Path>,
     root: &std::path::Path,
 ) -> anyhow::Result<SshKeyAuthenticator> {
+    // An explicit path replaces discovery, which is both the /etc file and
+    // the credentials directory, so the latter is dropped as well.
     let (paths, creds_dir) = if let Some(cli_path) = cli_authorized_keys {
-        // Explicit CLI path overrides all auto-discovery
         (vec![cli_path], None)
     } else {
-        // Register all well-known sources; files that don't exist yet
-        // will be picked up by maybe_reload() once they appear.
-        let mut paths = Vec::new();
-        paths.push(
-            root.join("etc/varlink-httpd/authorized_keys")
-                .to_string_lossy()
-                .to_string(),
-        );
-        if let Some(d) = creds_dir {
-            for name in SSH_AUTHORIZED_KEYS_CREDENTIALS {
-                paths.push(d.join(name).to_string_lossy().to_string());
-            }
-        }
-        (paths, creds_dir.map(std::path::Path::to_path_buf))
+        // Registered even if absent, so it is picked up by maybe_reload()
+        // once it appears. Credentials need no registration: current_paths()
+        // enumerates them on every reload check.
+        let etc = root.join("etc/varlink-httpd/authorized_keys");
+        (
+            vec![etc.to_string_lossy().into_owned()],
+            creds_dir.map(std::path::Path::to_path_buf),
+        )
     };
 
     SshKeyAuthenticator::new(paths, creds_dir)

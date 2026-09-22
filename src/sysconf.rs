@@ -6,19 +6,21 @@
 
 use std::path::{Path, PathBuf};
 
-/// Mirrors libsystemd's `CredentialsLoader`: one file per credential,
-/// filename = credential id.
+/// Mirrors (and extends) libsystemd's `CredentialsLoader`: one file per
+/// credential, the filename is the credential id. On top of the lookup by
+/// id, [`Self::find`] selects credentials by `ImportCredential=` patterns.
 pub struct CredentialsLoader {
     dir: PathBuf,
 }
 
 impl CredentialsLoader {
+    // TODO: make this a constructor, i.e. return Option<Self> here
     #[must_use]
     pub fn path_from_env() -> Option<PathBuf> {
         std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from)
     }
 
-    /// Loader rooted at an explicit directory (mainly for tests).
+    /// Loader from at an explicit directory (mainly for tests).
     pub fn from_dir(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
     }
@@ -30,30 +32,59 @@ impl CredentialsLoader {
         path.exists().then_some(path)
     }
 
-    /// Sorted, so the merge order is stable.
+    /// Paths of the credentials matching `patterns`, sorted so the merge
+    /// order is stable.
+    ///
+    /// Patterns use the `ImportCredential=` syntax of systemd.exec(5): an
+    /// exact id, or a prefix with a trailing `*`. The latter is for
+    /// per-provider credentials (`<id>.<provider>`).
     ///
     /// # Errors
     /// A missing directory means no credentials; other errors propagate so the
     /// caller can keep what it already loaded rather than lose sources silently.
-    pub fn paths_with_prefix(&self, prefix: &str) -> std::io::Result<Vec<PathBuf>> {
+    pub fn find(&self, patterns: &[&str]) -> std::io::Result<Vec<PathBuf>> {
+        self.find_with(patterns, |id| self.dir.join(id))
+    }
+
+    /// [`Self::find`], with each matching id handed to `f` in sorted order.
+    ///
+    /// # Errors
+    /// As for [`Self::find`].
+    pub fn find_with<T>(
+        &self,
+        patterns: &[&str],
+        f: impl Fn(&str) -> T,
+    ) -> std::io::Result<Vec<T>> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
-        let mut paths = Vec::new();
+        let mut ids = Vec::new();
         for entry in entries {
-            let entry = entry?;
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(prefix))
-            {
-                paths.push(entry.path());
+            let Some(id) = entry?.file_name().to_str().map(String::from) else {
+                continue;
+            };
+            if patterns.iter().any(|p| pattern_matches(p, &id)) {
+                ids.push(id);
             }
         }
-        paths.sort();
-        Ok(paths)
+        ids.sort();
+        Ok(ids.iter().map(|id| f(id)).collect())
+    }
+}
+
+/// `ImportCredential=` matching: only a trailing `*` is a glob.
+fn pattern_matches(pattern: &str, name: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => {
+            debug_assert!(
+                !prefix.contains('*'),
+                "only a trailing * is a glob: {pattern}"
+            );
+            name.starts_with(prefix)
+        }
+        None => name == pattern,
     }
 }
 
@@ -83,11 +114,19 @@ mod tests {
     }
 
     #[test]
-    fn test_credentials_loader_paths_with_prefix() {
+    fn test_credentials_loader_find_import_credential_patterns() {
+        const PATTERNS: &[&str] = &[
+            "varlink-httpd.api-keys",
+            "ssh.authorized_keys.root",
+            "varlink-httpd.api-keys.*",
+        ];
         let dir = tempfile::tempdir().unwrap();
         for name in [
             "varlink-httpd.api-keys.b",
             "varlink-httpd.api-keys.a",
+            "varlink-httpd.api-keys",
+            "varlink-httpd.api-keys-backup",
+            "ssh.authorized_keys.root",
             "api-keys",
             "unrelated",
         ] {
@@ -96,25 +135,42 @@ mod tests {
 
         let loader = CredentialsLoader::from_dir(dir.path());
         assert_eq!(
-            loader.paths_with_prefix("varlink-httpd.api-keys.").unwrap(),
+            loader.find(PATTERNS).unwrap(),
             vec![
+                dir.path().join("ssh.authorized_keys.root"),
+                dir.path().join("varlink-httpd.api-keys"),
                 dir.path().join("varlink-httpd.api-keys.a"),
                 dir.path().join("varlink-httpd.api-keys.b"),
             ],
-            "only prefixed credentials, sorted"
+            "exact ids and trailing-* globs, sorted; no look-alikes"
+        );
+        assert_eq!(
+            loader
+                .find_with(PATTERNS, |id| format!("{id} (unused)"))
+                .unwrap(),
+            vec![
+                "ssh.authorized_keys.root (unused)",
+                "varlink-httpd.api-keys (unused)",
+                "varlink-httpd.api-keys.a (unused)",
+                "varlink-httpd.api-keys.b (unused)",
+            ],
+            "the closure sees the ids, in the same order as find()"
         );
         assert!(
-            loader.paths_with_prefix("nomatch.").unwrap().is_empty(),
+            loader.find(&["nomatch.*"]).unwrap().is_empty(),
             "no match is not an error"
         );
 
         let missing = CredentialsLoader::from_dir(dir.path().join("nonexistent"));
         assert!(
-            missing
-                .paths_with_prefix("varlink-httpd.")
-                .unwrap()
-                .is_empty(),
+            missing.find(PATTERNS).unwrap().is_empty(),
             "a missing credentials directory means no credentials"
+        );
+        assert!(
+            missing
+                .find_with(PATTERNS, str::to_string)
+                .unwrap()
+                .is_empty()
         );
     }
 

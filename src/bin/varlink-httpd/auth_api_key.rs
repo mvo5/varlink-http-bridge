@@ -20,11 +20,9 @@ const API_KEY_PREFIX: &str = "vhb_";
 
 const API_KEYS_CONFIG: &str = "varlink-httpd/api-keys";
 
-const API_KEYS_CREDENTIAL: &str = "varlink-httpd.api-keys";
-
-/// One credential per provider, because neither the credstore nor overlaid
-/// confexts can merge the contents of a shared file.
-const API_KEYS_CREDENTIAL_PREFIX: &str = "varlink-httpd.api-keys.";
+// The credential names that can provide api-keys
+pub(crate) const API_KEY_CREDENTIALS: &[&str] =
+    &["varlink-httpd.api-keys", "varlink-httpd.api-keys.*"];
 
 const SHA256_LEN: usize = 32;
 
@@ -239,43 +237,41 @@ impl ApiKeyCache {
     }
 }
 
-/// Exact match or dot-prefix, because a bare prefix scan would also pick up an
-/// unrelated `varlink-httpd.api-keys-backup`.
-fn is_api_keys_credential(path: &std::path::Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name == API_KEYS_CREDENTIAL || name.starts_with(API_KEYS_CREDENTIAL_PREFIX)
-        })
-}
-
 /// A missing directory means no credentials; other errors propagate so
 /// the caller keeps the cached keys.
 fn credential_paths(creds_dir: Option<&std::path::Path>) -> std::io::Result<Vec<String>> {
     let Some(dir) = creds_dir else {
         return Ok(Vec::new());
     };
+    // TODO: this is silly, use the PathBuf directly, Vec<string> is wrong there
     Ok(CredentialsLoader::from_dir(dir)
-        .paths_with_prefix(API_KEYS_CREDENTIAL)?
+        .find(API_KEY_CREDENTIALS)?
         .into_iter()
-        .filter(|path| is_api_keys_credential(path))
         .map(|path| path.to_string_lossy().into_owned())
         .collect())
 }
 
-/// Names of the API key credentials present in `dir`, so a configuration that
-/// never reads them can say which ones it is ignoring.
-pub(crate) fn api_keys_credentials(dir: &std::path::Path) -> Vec<String> {
-    credential_paths(Some(dir))
+/// Report if any API key credentials are present but not read because
+/// the `api_key_auth` is not selected or an explicit path is used instead.
+pub(crate) fn unread_credentials(
+    dir: &std::path::Path,
+    auth_is_selected: bool,
+    explicit_path_set: bool,
+) -> Vec<String> {
+    // An explicit --api-keys= replaces discovery rather than adding to it,
+    // so it hides credentials even when API key auth is selected.
+    let why = if !auth_is_selected {
+        "pass --auth=api-key to use it"
+    } else if explicit_path_set {
+        "an explicit path takes priority"
+    } else {
+        // if the auth is selected and no path is set we can return
+        return Vec::new();
+    };
+    // diagnostics only, so an unreadable directory lists nothing
+    CredentialsLoader::from_dir(dir)
+        .find_with(API_KEY_CREDENTIALS, |id| format!("{id} ({why})"))
         .unwrap_or_default()
-        .iter()
-        .filter_map(|path| {
-            std::path::Path::new(path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(String::from)
-        })
-        .collect()
 }
 
 pub(crate) struct ApiKeyAuthenticator {
@@ -357,7 +353,7 @@ impl Authenticator for ApiKeyAuthenticator {
 /// configuration does not grow an authenticator that rejects everything.
 ///
 /// The hierarchy contributes only its highest-precedence file; every
-/// [`API_KEYS_CREDENTIAL`] credential is merged on top.
+/// [`API_KEY_CREDENTIALS`] credential is merged on top.
 // TODO: discover -> build -> warn-if-empty -> log is the same shape as
 // create_ssh_authenticator; fold into the WatchedFiles<T> extraction.
 pub(crate) fn create_api_key_authenticator(

@@ -1909,44 +1909,18 @@ fn unread_credentials_warning(creds_dir: &std::path::Path, cli: &BridgeCli) -> O
         }
     }
 
-    {
-        // An explicit --api-keys= replaces discovery rather than adding to it,
-        // so it hides credentials even when API key auth is selected.
-        let why = if !cli.auth.contains(&AuthMechanism::ApiKey) {
-            Some("pass --auth=api-key to use it")
-        } else if cli.api_keys.is_some() {
-            Some("an explicit path takes priority")
-        } else {
-            None
-        };
-        if let Some(why) = why {
-            unread.extend(
-                auth_api_key::api_keys_credentials(creds_dir)
-                    .into_iter()
-                    .map(|name| format!("{name} ({why})")),
-            );
-        }
-    }
+    unread.extend(auth_api_key::unread_credentials(
+        creds_dir,
+        cli.auth.contains(&AuthMechanism::ApiKey),
+        cli.api_keys.is_some(),
+    ));
 
     #[cfg(feature = "sshauth")]
-    {
-        // An explicit --authorized-keys= replaces discovery rather than adding
-        // to it, so it hides credentials even when ssh auth is selected.
-        let why = if cli.authorized_keys.is_some() {
-            Some("--authorized-keys= replaces credential discovery")
-        } else if !cli.auth.contains(&AuthMechanism::Ssh) {
-            Some("pass --auth=ssh to use them")
-        } else {
-            None
-        };
-        if let Some(why) = why {
-            unread.extend(
-                auth_ssh::authorized_keys_credentials(creds_dir)
-                    .into_iter()
-                    .map(|name| format!("{name} ({why})")),
-            );
-        }
-    }
+    unread.extend(auth_ssh::unread_credentials(
+        creds_dir,
+        cli.auth.contains(&AuthMechanism::Ssh),
+        cli.authorized_keys.is_some(),
+    ));
 
     if unread.is_empty() {
         return None;
