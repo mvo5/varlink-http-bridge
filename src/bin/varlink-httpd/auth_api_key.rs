@@ -4,6 +4,7 @@ use anyhow::{Context, bail};
 use data_encoding::{HEXLOWER, HEXLOWER_PERMISSIVE};
 use log::{info, warn};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -90,7 +91,7 @@ struct ApiKeysFile {
 impl ApiKeysFile {
     /// Stat `path`, folding `NotFound` into `Ok(None)` so missing files are
     /// treated as "tracked absence" rather than a hard error.
-    fn stat_mtime(path: &str) -> std::io::Result<Option<SystemTime>> {
+    fn stat_mtime(path: &Path) -> std::io::Result<Option<SystemTime>> {
         match std::fs::metadata(path).and_then(|m| m.modified()) {
             Ok(m) => Ok(Some(m)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -101,15 +102,19 @@ impl ApiKeysFile {
     /// Parse an API keys file. Malformed lines are skipped with a warning:
     /// a bad line can only reduce access, and dropping the whole file on
     /// one typo would lock out every other key.
-    fn parse_keys(path: &str) -> anyhow::Result<Vec<ApiKeyEntry>> {
+    fn parse_keys(path: &Path) -> anyhow::Result<Vec<ApiKeyEntry>> {
         let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read API keys from {path}"))?;
+            .with_context(|| format!("failed to read API keys from {}", path.display()))?;
         let mut entries = Vec::new();
         for (nr, line) in content.lines().enumerate() {
             match ApiKeyEntry::parse_line(line) {
                 Ok(Some(entry)) => entries.push(entry),
                 Ok(None) => {}
-                Err(e) => warn!("{path}:{}: skipping API key line: {e:#}", nr + 1),
+                Err(e) => warn!(
+                    "{}:{}: skipping API key line: {e:#}",
+                    path.display(),
+                    nr + 1
+                ),
             }
         }
         Ok(entries)
@@ -117,12 +122,14 @@ impl ApiKeysFile {
 
     /// Stat and parse `path`. Returns `Ok(None)` if the file does not
     /// exist yet (it will be picked up by `maybe_reload` once it appears).
-    fn load(path: &str) -> anyhow::Result<Option<Self>> {
+    fn load(path: &Path) -> anyhow::Result<Option<Self>> {
         let mtime = match Self::stat_mtime(path) {
             Ok(Some(m)) => m,
             Ok(None) => return Ok(None),
             Err(e) => {
-                return Err(anyhow::Error::new(e).context(format!("failed to stat {path}")));
+                return Err(
+                    anyhow::Error::new(e).context(format!("failed to stat {}", path.display()))
+                );
             }
         };
         let entries = Self::parse_keys(path)?;
@@ -131,21 +138,24 @@ impl ApiKeysFile {
 }
 
 struct ApiKeyCache {
-    files: HashMap<String, ApiKeysFile>,
+    files: HashMap<PathBuf, ApiKeysFile>,
 }
 
 impl ApiKeyCache {
     /// Initial load of all tracked paths. Files that do not (yet) exist
     /// are silently skipped; they will be picked up by `reload` once
     /// they appear. Read errors propagate (startup should fail loud).
-    fn load_all(paths: &[String]) -> anyhow::Result<Self> {
+    fn load_all(paths: &[PathBuf]) -> anyhow::Result<Self> {
         let mut files = HashMap::new();
         for path in paths {
             match ApiKeysFile::load(path)? {
                 Some(f) => {
                     files.insert(path.clone(), f);
                 }
-                None => info!("API keys file {path} does not exist yet, skipping"),
+                None => info!(
+                    "API keys file {} does not exist yet, skipping",
+                    path.display()
+                ),
             }
         }
         Ok(Self { files })
@@ -170,7 +180,7 @@ impl ApiKeyCache {
     /// this cache has recorded (including "file now exists" and "file now
     /// gone"). A path that cannot be stat()ed counts as unchanged so it
     /// cannot block refreshing the others.
-    fn any_mtime_changed(&self, paths: &[String]) -> bool {
+    fn any_mtime_changed(&self, paths: &[PathBuf]) -> bool {
         // a vanished credential is no longer in `paths`, so the loop below
         // cannot notice it and its keys would stay valid
         if self.files.keys().any(|path| !paths.contains(path)) {
@@ -180,7 +190,10 @@ impl ApiKeyCache {
             let now = match ApiKeysFile::stat_mtime(path) {
                 Ok(now) => now,
                 Err(e) => {
-                    warn!("cannot stat {path}: {e}, keeping cached API keys");
+                    warn!(
+                        "cannot stat {}: {e}, keeping cached API keys",
+                        path.display()
+                    );
                     continue;
                 }
             };
@@ -194,13 +207,13 @@ impl ApiKeyCache {
 
     /// If any tracked path has changed on disk, re-read it; a path with a
     /// transient stat error keeps its cached keys (retried on the next call).
-    fn maybe_reload(&mut self, paths: &[String]) {
+    fn maybe_reload(&mut self, paths: &[PathBuf]) {
         if self.any_mtime_changed(paths) {
             self.reload(paths);
         }
     }
 
-    fn reload(&mut self, paths: &[String]) {
+    fn reload(&mut self, paths: &[PathBuf]) {
         let mut new_files = HashMap::new();
         for path in paths {
             let mtime = match ApiKeysFile::stat_mtime(path) {
@@ -219,11 +232,15 @@ impl ApiKeyCache {
                     info!(
                         "reloaded {count} API key(s) from {path} (file changed)",
                         count = entries.len(),
+                        path = path.display(),
                     );
                     entries
                 }
                 Err(e) => {
-                    warn!("failed to reload {path}: {e:#}, skipping this source");
+                    warn!(
+                        "failed to reload {}: {e:#}, skipping this source",
+                        path.display()
+                    );
                     Vec::new()
                 }
             };
@@ -239,22 +256,17 @@ impl ApiKeyCache {
 
 /// A missing directory means no credentials; other errors propagate so
 /// the caller keeps the cached keys.
-fn credential_paths(creds_dir: Option<&std::path::Path>) -> std::io::Result<Vec<String>> {
+fn credential_paths(creds_dir: Option<&Path>) -> std::io::Result<Vec<PathBuf>> {
     let Some(dir) = creds_dir else {
         return Ok(Vec::new());
     };
-    // TODO: this is silly, use the PathBuf directly, Vec<string> is wrong there
-    Ok(CredentialsLoader::from_dir(dir)
-        .find(API_KEY_CREDENTIALS)?
-        .into_iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect())
+    CredentialsLoader::from_dir(dir).find(API_KEY_CREDENTIALS)
 }
 
 /// Report if any API key credentials are present but not read because
 /// the `api_key_auth` is not selected or an explicit path is used instead.
 pub(crate) fn unread_credentials(
-    dir: &std::path::Path,
+    dir: &Path,
     auth_is_selected: bool,
     explicit_path_set: bool,
 ) -> Vec<String> {
@@ -275,20 +287,16 @@ pub(crate) fn unread_credentials(
 }
 
 pub(crate) struct ApiKeyAuthenticator {
-    paths: Vec<String>,
-    creds_dir: Option<std::path::PathBuf>,
+    paths: Vec<PathBuf>,
+    creds_dir: Option<PathBuf>,
     keys: Mutex<ApiKeyCache>,
 }
 
 impl ApiKeyAuthenticator {
-    pub(crate) fn new(
-        paths: Vec<String>,
-        creds_dir: Option<std::path::PathBuf>,
-    ) -> anyhow::Result<Self> {
+    pub(crate) fn new(paths: Vec<PathBuf>, creds_dir: Option<PathBuf>) -> anyhow::Result<Self> {
         let mut all = paths.clone();
         all.extend(
-            credential_paths(creds_dir.as_deref())
-                .context("failed to enumerate prefixed credentials")?,
+            credential_paths(creds_dir.as_deref()).context("failed to enumerate credentials")?,
         );
         let cache = ApiKeyCache::load_all(&all)?;
         Ok(Self {
@@ -301,7 +309,7 @@ impl ApiKeyAuthenticator {
     /// Re-enumerated rather than cached: `RefreshOnReload=credentials` swaps in
     /// a fresh tree on `systemctl reload`, so credentials come and go while we
     /// run.
-    pub(crate) fn current_paths(&self) -> std::io::Result<Vec<String>> {
+    pub(crate) fn current_paths(&self) -> std::io::Result<Vec<PathBuf>> {
         let mut all = self.paths.clone();
         all.extend(credential_paths(self.creds_dir.as_deref())?);
         Ok(all)
@@ -357,27 +365,28 @@ impl Authenticator for ApiKeyAuthenticator {
 // TODO: discover -> build -> warn-if-empty -> log is the same shape as
 // create_ssh_authenticator; fold into the WatchedFiles<T> extraction.
 pub(crate) fn create_api_key_authenticator(
-    cli_api_keys: Option<String>,
-    creds_dir: Option<&std::path::Path>,
-    root: &std::path::Path,
+    cli_api_keys: Option<PathBuf>,
+    creds_dir: Option<&Path>,
+    root: &Path,
 ) -> anyhow::Result<Option<ApiKeyAuthenticator>> {
     let (paths, creds_dir) = if let Some(cli_path) = cli_api_keys {
         // an explicit path replaces discovery rather than adding to it
         (vec![cli_path], None)
     } else {
-        let paths: Vec<String> = find_config(API_KEYS_CONFIG, root)
-            .into_iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
+        let paths: Vec<PathBuf> = find_config(API_KEYS_CONFIG, root).into_iter().collect();
         if paths.is_empty() && credential_paths(creds_dir)?.is_empty() {
             return Ok(None);
         }
         (paths, creds_dir)
     };
 
-    let api_key_auth =
-        ApiKeyAuthenticator::new(paths, creds_dir.map(std::path::Path::to_path_buf))?;
-    let sources = api_key_auth.current_paths()?.join(", ");
+    let api_key_auth = ApiKeyAuthenticator::new(paths, creds_dir.map(Path::to_path_buf))?;
+    let sources = api_key_auth
+        .current_paths()?
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     if api_key_auth.key_count() == 0 {
         warn!("no API keys in {sources}; API key auth will reject all requests until keys appear");
     }
@@ -391,28 +400,22 @@ pub(crate) fn create_api_key_authenticator(
 #[derive(Debug)]
 pub(crate) struct GenApiKey {
     pub name: Option<String>,
-    pub output: Option<String>,
+    pub output: Option<PathBuf>,
 }
 
-fn default_api_keys_path() -> String {
+fn default_api_keys_path() -> PathBuf {
     // not find_config(): a write target must be named even when absent
     if rustix::process::getuid().is_root() {
-        return std::path::Path::new("/etc")
-            .join(API_KEYS_CONFIG)
-            .to_string_lossy()
-            .into_owned();
+        return Path::new("/etc").join(API_KEYS_CONFIG);
     }
     let config_dir = std::env::var_os("XDG_CONFIG_HOME").map_or_else(
         || {
             let home = std::env::var_os("HOME").unwrap_or_else(|| "/root".into());
-            std::path::Path::new(&home).join(".config")
+            Path::new(&home).join(".config")
         },
-        std::path::PathBuf::from,
+        PathBuf::from,
     );
-    config_dir
-        .join(API_KEYS_CONFIG)
-        .to_string_lossy()
-        .into_owned()
+    config_dir.join(API_KEYS_CONFIG)
 }
 
 pub(crate) fn generate_api_key() -> String {
@@ -423,11 +426,7 @@ pub(crate) fn generate_api_key() -> String {
 
 /// Append the hash line for `key` to the API keys file at `path`,
 /// returning the name it was stored under.
-pub(crate) fn append_api_key(
-    path: &std::path::Path,
-    key: &str,
-    name: Option<&str>,
-) -> anyhow::Result<String> {
+pub(crate) fn append_api_key(path: &Path, key: &str, name: Option<&str>) -> anyhow::Result<String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -460,17 +459,14 @@ pub(crate) fn append_api_key(
 pub(crate) fn run_gen_api_key(cmd: GenApiKey) -> anyhow::Result<()> {
     let output_path = cmd.output.unwrap_or_else(default_api_keys_path);
     let key = generate_api_key();
-    let name = append_api_key(
-        std::path::Path::new(&output_path),
-        &key,
-        cmd.name.as_deref(),
-    )?;
+    let name = append_api_key(&output_path, &key, cmd.name.as_deref())?;
 
     // The key itself goes to stdout (and nowhere else) so that
     // `API_KEY=$(varlink-httpd gen-api-key)` works; only its hash is stored.
     println!("{key}");
+    let output_path = output_path.display();
     eprintln!("Appended hash of API key '{name}' to {output_path}, run with:");
-    if output_path == "/etc/varlink-httpd/api-keys" {
+    if output_path.to_string() == "/etc/varlink-httpd/api-keys" {
         eprintln!("  varlink-httpd --auth=api-key");
     } else {
         eprintln!("  varlink-httpd --auth=api-key --api-keys={output_path}");

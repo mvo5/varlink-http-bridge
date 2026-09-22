@@ -1595,9 +1595,9 @@ struct BridgeCli {
     key: Option<String>,
     trust: Option<String>,
     require_mtls: bool,
-    authorized_keys: Option<String>,
+    authorized_keys: Option<std::path::PathBuf>,
     auth: Vec<AuthMechanism>,
-    api_keys: Option<String>,
+    api_keys: Option<std::path::PathBuf>,
     insecure: bool,
 }
 
@@ -1706,9 +1706,9 @@ fn parse_cli() -> anyhow::Result<Command> {
             Long("key") => key = Some(parser.value()?.parse()?),
             Long("trust") => trust = Some(parser.value()?.parse()?),
             Long("require-mtls") => require_mtls = true,
-            Long("authorized-keys") => authorized_keys = Some(parser.value()?.parse()?),
+            Long("authorized-keys") => authorized_keys = Some(parser.value()?.into()),
             Long("auth") => auth = Some(parse_auth(&parser.value()?.string()?)?),
-            Long("api-keys") => api_keys = Some(parser.value()?.parse()?),
+            Long("api-keys") => api_keys = Some(parser.value()?.into()),
             Long("insecure") => insecure = true,
             Long("help") => {
                 print_help();
@@ -1829,7 +1829,7 @@ fn parse_gen_api_key_args(parser: &mut lexopt::Parser) -> anyhow::Result<Command
                 print_gen_api_key_help();
                 std::process::exit(0);
             }
-            Value(val) if output.is_none() => output = Some(val.parse()?),
+            Value(val) if output.is_none() => output = Some(val.into()),
             _ => return Err(arg.unexpected().into()),
         }
     }
@@ -1941,8 +1941,8 @@ fn build_authenticators(
     auth: &[AuthMechanism],
     insecure: bool,
     require_mtls: bool,
-    authorized_keys: Option<&str>,
-    api_keys: Option<&str>,
+    authorized_keys: Option<&std::path::Path>,
+    api_keys: Option<&std::path::Path>,
     creds_dir: Option<&std::path::Path>,
     etc_root: &std::path::Path,
 ) -> anyhow::Result<Vec<Box<dyn Authenticator>>> {
@@ -1951,13 +1951,13 @@ fn build_authenticators(
         match mechanism {
             #[cfg(feature = "sshauth")]
             AuthMechanism::Ssh => authenticators.push(Box::new(create_ssh_authenticator(
-                authorized_keys.map(String::from),
+                authorized_keys.map(std::path::Path::to_path_buf),
                 creds_dir,
                 etc_root,
             )?)),
             AuthMechanism::ApiKey => authenticators.push(Box::new(
                 auth_api_key::create_api_key_authenticator(
-                    api_keys.map(String::from),
+                    api_keys.map(std::path::Path::to_path_buf),
                     creds_dir,
                     etc_root,
                 )?

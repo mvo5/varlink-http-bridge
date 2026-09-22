@@ -4,6 +4,7 @@ use anyhow::Context;
 use log::{debug, info, warn};
 use ssh_key::{HashAlg, PublicKey};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
@@ -26,7 +27,7 @@ struct AuthKeysFile {
 impl AuthKeysFile {
     /// Stat `path`, folding `NotFound` into `Ok(None)` so missing files are
     /// treated as "tracked absence" rather than a hard error.
-    fn stat_mtime(path: &str) -> std::io::Result<Option<SystemTime>> {
+    fn stat_mtime(path: &Path) -> std::io::Result<Option<SystemTime>> {
         match std::fs::metadata(path).and_then(|m| m.modified()) {
             Ok(m) => Ok(Some(m)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -35,9 +36,9 @@ impl AuthKeysFile {
     }
 
     /// Parse an `authorized_keys` file, returning only supported (non-RSA) keys.
-    fn parse_keys(path: &str) -> anyhow::Result<HashMap<String, PublicKey>> {
+    fn parse_keys(path: &Path) -> anyhow::Result<HashMap<String, PublicKey>> {
         let keys_vec = sshauth::keyfile::parse_authorized_keys(path, true)
-            .with_context(|| format!("failed to read authorized keys from {path}"))?;
+            .with_context(|| format!("failed to read authorized keys from {}", path.display()))?;
 
         let mut keys = HashMap::new();
         for key in keys_vec {
@@ -61,12 +62,14 @@ impl AuthKeysFile {
 
     /// Stat and parse `path`. Returns `Ok(None)` if the file does not
     /// exist yet (it will be picked up by `maybe_reload` once it appears).
-    fn load(path: &str) -> anyhow::Result<Option<Self>> {
+    fn load(path: &Path) -> anyhow::Result<Option<Self>> {
         let mtime = match Self::stat_mtime(path) {
             Ok(Some(m)) => m,
             Ok(None) => return Ok(None),
             Err(e) => {
-                return Err(anyhow::Error::new(e).context(format!("failed to stat {path}")));
+                return Err(
+                    anyhow::Error::new(e).context(format!("failed to stat {}", path.display()))
+                );
             }
         };
         let keys = Self::parse_keys(path)?;
@@ -77,13 +80,13 @@ impl AuthKeysFile {
 /// Keep track of the mtime of the tracked paths. This means when comparing two
 /// `MtimeSnapshot`s for "eq" we cover changed, appeared or vanished files.
 #[derive(PartialEq)]
-struct MtimeSnapshot(HashMap<String, SystemTime>);
+struct MtimeSnapshot(HashMap<PathBuf, SystemTime>);
 
 impl MtimeSnapshot {
     /// Takes a snapshot of the given paths. Any error that is not
     /// ENOENT fails the snapshot and returns an error that contains
     /// the failing path.
-    fn take(paths: &[String]) -> Result<Self, (String, std::io::Error)> {
+    fn take(paths: &[PathBuf]) -> Result<Self, (PathBuf, std::io::Error)> {
         let mut on_disk = HashMap::new();
         for path in paths {
             if let Some(t) = AuthKeysFile::stat_mtime(path).map_err(|e| (path.clone(), e))? {
@@ -95,21 +98,24 @@ impl MtimeSnapshot {
 }
 
 struct KeyCache {
-    files: HashMap<String, AuthKeysFile>,
+    files: HashMap<PathBuf, AuthKeysFile>,
 }
 
 impl KeyCache {
     /// Initial load of all tracked paths. Files that do not (yet) exist
     /// are silently skipped; they will be picked up by `reload` once
     /// they appear. Parse errors propagate (startup should fail loud).
-    fn load_all(paths: &[String]) -> anyhow::Result<Self> {
+    fn load_all(paths: &[PathBuf]) -> anyhow::Result<Self> {
         let mut files = HashMap::new();
         for path in paths {
             match AuthKeysFile::load(path)? {
                 Some(f) => {
                     files.insert(path.clone(), f);
                 }
-                None => info!("authorized keys file {path} does not exist yet, skipping"),
+                None => info!(
+                    "authorized keys file {} does not exist yet, skipping",
+                    path.display()
+                ),
             }
         }
         Ok(Self { files })
@@ -159,7 +165,7 @@ impl KeyCache {
     /// If any tracked path has changed on disk, re-read it; transient
     /// stat errors are logged and the cache is left untouched (retried
     /// on the next call).
-    fn maybe_reload(&mut self, paths: &[String]) {
+    fn maybe_reload(&mut self, paths: &[PathBuf]) {
         match MtimeSnapshot::take(paths) {
             Ok(on_disk) => {
                 if on_disk != self.snapshot() {
@@ -169,7 +175,10 @@ impl KeyCache {
             Err((path, e)) => {
                 // Transient error (permissions, IO): skip this reload cycle
                 // rather than risk dropping valid keys. Retry next request.
-                warn!("cannot stat {path}: {e}, skipping reload (keeping cached keys)");
+                warn!(
+                    "cannot stat {}: {e}, skipping reload (keeping cached keys)",
+                    path.display()
+                );
             }
         }
     }
@@ -193,11 +202,15 @@ impl KeyCache {
                     info!(
                         "reloaded {count} SSH key(s) from {path} (file changed)",
                         count = keys.len(),
+                        path = path.display(),
                     );
                     keys
                 }
                 Err(e) => {
-                    warn!("failed to reload {path}: {e:#}, skipping this source");
+                    warn!(
+                        "failed to reload {}: {e:#}, skipping this source",
+                        path.display()
+                    );
                     HashMap::new()
                 }
             };
@@ -263,31 +276,31 @@ impl NonceStore {
 pub(crate) struct SshKeyAuthenticator {
     /// Fixed paths only; the prefixed credentials under `creds_dir` are
     /// re-enumerated on every reload check.
-    paths: Vec<String>,
-    creds_dir: Option<std::path::PathBuf>,
+    paths: Vec<PathBuf>,
+    creds_dir: Option<PathBuf>,
     max_skew: u64,
     authorized_keys: Mutex<KeyCache>,
     nonces: Mutex<NonceStore>,
 }
 
 impl SshKeyAuthenticator {
-    pub(crate) fn new(
-        paths: Vec<String>,
-        creds_dir: Option<std::path::PathBuf>,
-    ) -> anyhow::Result<Self> {
+    pub(crate) fn new(paths: Vec<PathBuf>, creds_dir: Option<PathBuf>) -> anyhow::Result<Self> {
         let all_paths = current_paths(&paths, creds_dir.as_deref())
             .context("failed to enumerate credentials")?;
         let cache = KeyCache::load_all(&all_paths)?;
+        let sources = all_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         if cache.unique_key_count() == 0 {
             warn!(
-                "no supported SSH public keys in {} (note: RSA is not supported, use Ed25519 or ECDSA); SSH auth will reject all requests until keys appear",
-                all_paths.join(", "),
+                "no supported SSH public keys in {sources} (note: RSA is not supported, use Ed25519 or ECDSA); SSH auth will reject all requests until keys appear"
             );
         }
         info!(
             "Authenticator: adding SSH authorized keys ({count} keys from {sources})",
             count = cache.unique_key_count(),
-            sources = all_paths.join(", "),
         );
 
         let max_skew = 60;
@@ -362,19 +375,14 @@ pub(crate) const SSH_AUTHORIZED_KEYS_CREDENTIALS: &[&str] = &[
 /// `systemctl reload`, so matches can appear and disappear while we run.
 /// A missing directory means no credentials; other errors propagate so
 /// the caller keeps the cached keys.
-fn credential_paths(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
-    // TODO: this is silly, use the PathBuf directly, Vec<string> is wrong there
-    Ok(CredentialsLoader::from_dir(dir)
-        .find(SSH_AUTHORIZED_KEYS_CREDENTIALS)?
-        .into_iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect())
+fn credential_paths(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    CredentialsLoader::from_dir(dir).find(SSH_AUTHORIZED_KEYS_CREDENTIALS)
 }
 
 /// Report if any API key credentials are present but not read because
 /// the ssh auth is not selected or an explicit path is used instead.
 pub(crate) fn unread_credentials(
-    dir: &std::path::Path,
+    dir: &Path,
     auth_is_selected: bool,
     explicit_path_set: bool,
 ) -> Vec<String> {
@@ -395,10 +403,7 @@ pub(crate) fn unread_credentials(
         .unwrap_or_default()
 }
 
-fn current_paths(
-    paths: &[String],
-    creds_dir: Option<&std::path::Path>,
-) -> std::io::Result<Vec<String>> {
+fn current_paths(paths: &[PathBuf], creds_dir: Option<&Path>) -> std::io::Result<Vec<PathBuf>> {
     let mut all = paths.to_vec();
     if let Some(d) = creds_dir {
         all.extend(credential_paths(d)?);
@@ -409,9 +414,9 @@ fn current_paths(
 // TODO: use sysconf.rs like auth_api_key does. Not a plain find_config()
 // swap: this registers not-yet-existing paths for later reload.
 pub(crate) fn create_ssh_authenticator(
-    cli_authorized_keys: Option<String>,
-    creds_dir: Option<&std::path::Path>,
-    root: &std::path::Path,
+    cli_authorized_keys: Option<PathBuf>,
+    creds_dir: Option<&Path>,
+    root: &Path,
 ) -> anyhow::Result<SshKeyAuthenticator> {
     // An explicit path replaces discovery, which is both the /etc file and
     // the credentials directory, so the latter is dropped as well.
@@ -421,10 +426,9 @@ pub(crate) fn create_ssh_authenticator(
         // Registered even if absent, so it is picked up by maybe_reload()
         // once it appears. Credentials need no registration: current_paths()
         // enumerates them on every reload check.
-        let etc = root.join("etc/varlink-httpd/authorized_keys");
         (
-            vec![etc.to_string_lossy().into_owned()],
-            creds_dir.map(std::path::Path::to_path_buf),
+            vec![root.join("etc/varlink-httpd/authorized_keys")],
+            creds_dir.map(Path::to_path_buf),
         )
     };
 
