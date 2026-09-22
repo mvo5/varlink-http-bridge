@@ -9,18 +9,21 @@ use std::path::{Path, PathBuf};
 /// Mirrors (and extends) libsystemd's `CredentialsLoader`: one file per
 /// credential, the filename is the credential id. On top of the lookup by
 /// id, [`Self::find`] selects credentials by `ImportCredential=` patterns.
+#[derive(Clone, Debug)]
 pub struct CredentialsLoader {
     dir: PathBuf,
 }
 
 impl CredentialsLoader {
-    // TODO: make this a constructor, i.e. return Option<Self> here
+    /// The credentials systemd passed to this service, `None` when it
+    /// passed none (no `$CREDENTIALS_DIRECTORY`).
     #[must_use]
-    pub fn path_from_env() -> Option<PathBuf> {
-        std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from)
+    pub fn from_env() -> Option<Self> {
+        std::env::var_os("CREDENTIALS_DIRECTORY").map(|dir| Self { dir: dir.into() })
     }
 
-    /// Loader from at an explicit directory (mainly for tests).
+    /// Test-only: production code gets its loader from [`Self::from_env`].
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn from_dir(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
     }
@@ -28,8 +31,15 @@ impl CredentialsLoader {
     /// Path of credential `id`, if the file exists.
     #[must_use]
     pub fn path(&self, id: &str) -> Option<PathBuf> {
-        let path = self.dir.join(id);
+        let path = self.expected_path(id);
         path.exists().then_some(path)
+    }
+
+    /// Where credential `id` would be, whether or not it exists yet: for a
+    /// source that has to be watched before it appears.
+    #[must_use]
+    pub fn expected_path(&self, id: &str) -> PathBuf {
+        self.dir.join(id)
     }
 
     /// Paths of the credentials matching `patterns`, sorted so the merge
@@ -74,6 +84,26 @@ impl CredentialsLoader {
     }
 }
 
+/// The authentication key sources of one auth mechanism right now:
+/// its fixed `paths` plus the credentials matching `patterns`,
+/// re-enumerated on every call because `RefreshOnReload=credentials`
+/// swaps in a fresh tree on `systemctl reload`, so credentials come
+/// and go while the service runs.
+///
+/// # Errors
+/// As for [`CredentialsLoader::find`]; the caller keeps its cached keys.
+pub fn current_key_sources(
+    paths: &[PathBuf],
+    creds: Option<&CredentialsLoader>,
+    credential_patterns: &[&str],
+) -> std::io::Result<Vec<PathBuf>> {
+    let mut all = paths.to_vec();
+    if let Some(creds) = creds {
+        all.extend(creds.find(credential_patterns)?);
+    }
+    Ok(all)
+}
+
 /// `ImportCredential=` matching: only a trailing `*` is a glob.
 fn pattern_matches(pattern: &str, name: &str) -> bool {
     match pattern.strip_suffix('*') {
@@ -111,6 +141,11 @@ mod tests {
         let loader = CredentialsLoader::from_dir(dir.path());
         assert_eq!(loader.path("cert"), Some(dir.path().join("cert")));
         assert_eq!(loader.path("missing"), None);
+        assert_eq!(
+            loader.expected_path("missing"),
+            dir.path().join("missing"),
+            "a not-yet-existing credential still has a known location"
+        );
     }
 
     #[test]
@@ -171,6 +206,29 @@ mod tests {
                 .find_with(PATTERNS, str::to_string)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_current_key_sources_is_fixed_paths_plus_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("svc.keys.a"), "dummy").unwrap();
+        std::fs::write(dir.path().join("other"), "dummy").unwrap();
+        let fixed = vec![PathBuf::from("/etc/svc/keys")];
+        let loader = CredentialsLoader::from_dir(dir.path());
+
+        assert_eq!(
+            current_key_sources(&fixed, Some(&loader), &["svc.keys.*"]).unwrap(),
+            vec![
+                PathBuf::from("/etc/svc/keys"),
+                dir.path().join("svc.keys.a")
+            ],
+            "fixed paths first, then the matching credentials"
+        );
+        assert_eq!(
+            current_key_sources(&fixed, None, &["svc.keys.*"]).unwrap(),
+            fixed,
+            "no credentials directory adds nothing"
         );
     }
 

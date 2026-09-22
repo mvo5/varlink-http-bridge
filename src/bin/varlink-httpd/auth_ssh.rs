@@ -10,7 +10,7 @@ use std::time::{Instant, SystemTime};
 
 use crate::{AuthRequest, Authenticator};
 use varlink_http_bridge::sshauth_token::{SSHAUTH_NONCE_HEADER, SignedParts, UnverifiedToken};
-use varlink_http_bridge::sysconf::CredentialsLoader;
+use varlink_http_bridge::sysconf::{CredentialsLoader, current_key_sources};
 
 /// One tracked `authorized_keys` file: its mtime when last read and the
 /// (fingerprint -> key) map of supported keys it contained. Bundling
@@ -274,19 +274,23 @@ impl NonceStore {
 }
 
 pub(crate) struct SshKeyAuthenticator {
-    /// Fixed paths only; the prefixed credentials under `creds_dir` are
-    /// re-enumerated on every reload check.
+    /// Fixed paths only; the credentials in `creds` are re-enumerated on
+    /// every reload check.
     paths: Vec<PathBuf>,
-    creds_dir: Option<PathBuf>,
+    creds: Option<CredentialsLoader>,
     max_skew: u64,
     authorized_keys: Mutex<KeyCache>,
     nonces: Mutex<NonceStore>,
 }
 
 impl SshKeyAuthenticator {
-    pub(crate) fn new(paths: Vec<PathBuf>, creds_dir: Option<PathBuf>) -> anyhow::Result<Self> {
-        let all_paths = current_paths(&paths, creds_dir.as_deref())
-            .context("failed to enumerate credentials")?;
+    pub(crate) fn new(
+        paths: Vec<PathBuf>,
+        creds: Option<CredentialsLoader>,
+    ) -> anyhow::Result<Self> {
+        let all_paths =
+            current_key_sources(&paths, creds.as_ref(), SSH_AUTHORIZED_KEYS_CREDENTIALS)
+                .context("failed to enumerate credentials")?;
         let cache = KeyCache::load_all(&all_paths)?;
         let sources = all_paths
             .iter()
@@ -306,7 +310,7 @@ impl SshKeyAuthenticator {
         let max_skew = 60;
         Ok(Self {
             paths,
-            creds_dir,
+            creds,
             max_skew,
             authorized_keys: Mutex::new(cache),
             nonces: Mutex::new(NonceStore::new(max_skew)),
@@ -319,7 +323,12 @@ impl SshKeyAuthenticator {
     }
 
     fn maybe_reload(&self) {
-        let Ok(paths) = current_paths(&self.paths, self.creds_dir.as_deref()).inspect_err(|e| {
+        let Ok(paths) = current_key_sources(
+            &self.paths,
+            self.creds.as_ref(),
+            SSH_AUTHORIZED_KEYS_CREDENTIALS,
+        )
+        .inspect_err(|e| {
             warn!("cannot enumerate credentials: {e}, skipping reload (keeping cached keys)");
         }) else {
             return;
@@ -346,7 +355,7 @@ impl std::fmt::Debug for SshKeyAuthenticator {
         let fingerprints = ak.fingerprints();
         f.debug_struct("SshKeyAuthenticator")
             .field("paths", &self.paths)
-            .field("creds_dir", &self.creds_dir)
+            .field("creds", &self.creds)
             .field("max_skew", &self.max_skew)
             .field("fingerprints", &fingerprints)
             .finish_non_exhaustive()
@@ -370,19 +379,10 @@ pub(crate) const SSH_AUTHORIZED_KEYS_CREDENTIALS: &[&str] = &[
     "varlink-httpd.ssh.authorized-keys.*",
 ];
 
-/// Sorted so the merge order is stable. Re-enumerated on every reload
-/// check because `RefreshOnReload=credentials` swaps in a fresh tree on
-/// `systemctl reload`, so matches can appear and disappear while we run.
-/// A missing directory means no credentials; other errors propagate so
-/// the caller keeps the cached keys.
-fn credential_paths(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    CredentialsLoader::from_dir(dir).find(SSH_AUTHORIZED_KEYS_CREDENTIALS)
-}
-
 /// Report if any API key credentials are present but not read because
 /// the ssh auth is not selected or an explicit path is used instead.
 pub(crate) fn unread_credentials(
-    dir: &Path,
+    creds: &CredentialsLoader,
     auth_is_selected: bool,
     explicit_path_set: bool,
 ) -> Vec<String> {
@@ -396,43 +396,35 @@ pub(crate) fn unread_credentials(
         return Vec::new();
     };
     // diagnostics only, so an unreadable directory lists nothing
-    CredentialsLoader::from_dir(dir)
+    creds
         .find_with(SSH_AUTHORIZED_KEYS_CREDENTIALS, |id| {
             format!("{id} ({why})")
         })
         .unwrap_or_default()
 }
 
-fn current_paths(paths: &[PathBuf], creds_dir: Option<&Path>) -> std::io::Result<Vec<PathBuf>> {
-    let mut all = paths.to_vec();
-    if let Some(d) = creds_dir {
-        all.extend(credential_paths(d)?);
-    }
-    Ok(all)
-}
-
-// TODO: use sysconf.rs like auth_api_key does. Not a plain find_config()
-// swap: this registers not-yet-existing paths for later reload.
+// TODO: this is our own config file, so it should follow the
+// /etc > /run > /usr/lib hierarchy like auth_api_key's api-keys file, via
+// find_config(). Not a plain swap though: auth_api_key resolves the
+// hierarchy once at startup, and both need it resolved at reload time so
+// a file appearing later (or shadowing /usr/lib) is picked up.
 pub(crate) fn create_ssh_authenticator(
     cli_authorized_keys: Option<PathBuf>,
-    creds_dir: Option<&Path>,
+    creds: Option<CredentialsLoader>,
     root: &Path,
 ) -> anyhow::Result<SshKeyAuthenticator> {
     // An explicit path replaces discovery, which is both the /etc file and
     // the credentials directory, so the latter is dropped as well.
-    let (paths, creds_dir) = if let Some(cli_path) = cli_authorized_keys {
+    let (paths, creds) = if let Some(cli_path) = cli_authorized_keys {
         (vec![cli_path], None)
     } else {
         // Registered even if absent, so it is picked up by maybe_reload()
-        // once it appears. Credentials need no registration: current_paths()
+        // once it appears. Credentials need no registration: current_key_sources()
         // enumerates them on every reload check.
-        (
-            vec![root.join("etc/varlink-httpd/authorized_keys")],
-            creds_dir.map(Path::to_path_buf),
-        )
+        (vec![root.join("etc/varlink-httpd/authorized_keys")], creds)
     };
 
-    SshKeyAuthenticator::new(paths, creds_dir)
+    SshKeyAuthenticator::new(paths, creds)
 }
 
 impl Authenticator for SshKeyAuthenticator {

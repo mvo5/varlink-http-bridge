@@ -8,12 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use varlink_http_bridge::sysconf::{CredentialsLoader, find_config};
+use varlink_http_bridge::sysconf::{CredentialsLoader, current_key_sources, find_config};
 
 use crate::{AuthRequest, Authenticator};
-
-// TODO: the credentials loading of sshauth and api-keys is very
-// similar, extract common code
 
 /// Prefix for generated API keys so a leaked key is recognizable
 /// (e.g. by secret scanners) as belonging to this service.
@@ -254,19 +251,10 @@ impl ApiKeyCache {
     }
 }
 
-/// A missing directory means no credentials; other errors propagate so
-/// the caller keeps the cached keys.
-fn credential_paths(creds_dir: Option<&Path>) -> std::io::Result<Vec<PathBuf>> {
-    let Some(dir) = creds_dir else {
-        return Ok(Vec::new());
-    };
-    CredentialsLoader::from_dir(dir).find(API_KEY_CREDENTIALS)
-}
-
 /// Report if any API key credentials are present but not read because
 /// the `api_key_auth` is not selected or an explicit path is used instead.
 pub(crate) fn unread_credentials(
-    dir: &Path,
+    creds: &CredentialsLoader,
     auth_is_selected: bool,
     explicit_path_set: bool,
 ) -> Vec<String> {
@@ -281,38 +269,34 @@ pub(crate) fn unread_credentials(
         return Vec::new();
     };
     // diagnostics only, so an unreadable directory lists nothing
-    CredentialsLoader::from_dir(dir)
+    creds
         .find_with(API_KEY_CREDENTIALS, |id| format!("{id} ({why})"))
         .unwrap_or_default()
 }
 
 pub(crate) struct ApiKeyAuthenticator {
     paths: Vec<PathBuf>,
-    creds_dir: Option<PathBuf>,
+    creds: Option<CredentialsLoader>,
     keys: Mutex<ApiKeyCache>,
 }
 
 impl ApiKeyAuthenticator {
-    pub(crate) fn new(paths: Vec<PathBuf>, creds_dir: Option<PathBuf>) -> anyhow::Result<Self> {
-        let mut all = paths.clone();
-        all.extend(
-            credential_paths(creds_dir.as_deref()).context("failed to enumerate credentials")?,
-        );
+    pub(crate) fn new(
+        paths: Vec<PathBuf>,
+        creds: Option<CredentialsLoader>,
+    ) -> anyhow::Result<Self> {
+        let all = current_key_sources(&paths, creds.as_ref(), API_KEY_CREDENTIALS)
+            .context("failed to enumerate credentials")?;
         let cache = ApiKeyCache::load_all(&all)?;
         Ok(Self {
             paths,
-            creds_dir,
+            creds,
             keys: Mutex::new(cache),
         })
     }
 
-    /// Re-enumerated rather than cached: `RefreshOnReload=credentials` swaps in
-    /// a fresh tree on `systemctl reload`, so credentials come and go while we
-    /// run.
-    pub(crate) fn current_paths(&self) -> std::io::Result<Vec<PathBuf>> {
-        let mut all = self.paths.clone();
-        all.extend(credential_paths(self.creds_dir.as_deref())?);
-        Ok(all)
+    pub(crate) fn current_key_sources(&self) -> std::io::Result<Vec<PathBuf>> {
+        current_key_sources(&self.paths, self.creds.as_ref(), API_KEY_CREDENTIALS)
     }
 
     pub(crate) fn key_count(&self) -> usize {
@@ -324,6 +308,7 @@ impl std::fmt::Debug for ApiKeyAuthenticator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiKeyAuthenticator")
             .field("paths", &self.paths)
+            .field("creds", &self.creds)
             .field("key_count", &self.key_count())
             .finish_non_exhaustive()
     }
@@ -332,7 +317,7 @@ impl std::fmt::Debug for ApiKeyAuthenticator {
 impl Authenticator for ApiKeyAuthenticator {
     fn check_request(&self, request: &AuthRequest) -> anyhow::Result<()> {
         // enumerate before taking the lock, it touches the filesystem
-        let paths = self.current_paths().inspect_err(|e| {
+        let paths = self.current_key_sources().inspect_err(|e| {
             warn!("cannot enumerate credentials: {e}, skipping reload (keeping cached API keys)");
         });
         let mut keys = self.keys.lock().unwrap();
@@ -366,23 +351,23 @@ impl Authenticator for ApiKeyAuthenticator {
 // create_ssh_authenticator; fold into the WatchedFiles<T> extraction.
 pub(crate) fn create_api_key_authenticator(
     cli_api_keys: Option<PathBuf>,
-    creds_dir: Option<&Path>,
+    creds: Option<CredentialsLoader>,
     root: &Path,
 ) -> anyhow::Result<Option<ApiKeyAuthenticator>> {
-    let (paths, creds_dir) = if let Some(cli_path) = cli_api_keys {
+    let (paths, creds) = if let Some(cli_path) = cli_api_keys {
         // an explicit path replaces discovery rather than adding to it
         (vec![cli_path], None)
     } else {
         let paths: Vec<PathBuf> = find_config(API_KEYS_CONFIG, root).into_iter().collect();
-        if paths.is_empty() && credential_paths(creds_dir)?.is_empty() {
+        if current_key_sources(&paths, creds.as_ref(), API_KEY_CREDENTIALS)?.is_empty() {
             return Ok(None);
         }
-        (paths, creds_dir)
+        (paths, creds)
     };
 
-    let api_key_auth = ApiKeyAuthenticator::new(paths, creds_dir.map(Path::to_path_buf))?;
+    let api_key_auth = ApiKeyAuthenticator::new(paths, creds)?;
     let sources = api_key_auth
-        .current_paths()?
+        .current_key_sources()?
         .iter()
         .map(|p| p.display().to_string())
         .collect::<Vec<_>>()
