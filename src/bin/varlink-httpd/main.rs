@@ -1620,7 +1620,8 @@ fn print_help() {
           VARLINK_SOCKETS_PATH              directory of sockets or a single socket
                                             (default: /run/varlink/registry)
           --bind=ADDR                       address to bind to (repeatable;
-                                            default: 0.0.0.0:{DEFAULT_PORT})
+                                            default: 0.0.0.0:{DEFAULT_PORT}, or
+                                            127.0.0.1:{DEFAULT_PORT} with --insecure)
                                             use vsock::PORT for vsock (e.g. vsock::{DEFAULT_PORT})
           --auth=MECHANISMS                 comma-separated per-request authentication
                                             ({auth}); required unless --insecure.
@@ -1638,7 +1639,9 @@ fn print_help() {
           --authorized-keys=PATH            authorized SSH public keys file
           --api-keys=PATH                   API key hashes file (see gen-api-key)
           --insecure                        run over plain HTTP without any
-                                            authentication (DANGEROUS)
+                                            authentication (DANGEROUS); listens
+                                            on localhost only unless --bind= says
+                                            otherwise
           --help                            display this help and exit
     ",
             auth = AuthMechanism::names(),
@@ -1681,6 +1684,20 @@ fn check_mechanism_flags(
         bail!("--authorized-keys= requires building with the 'sshauth' feature");
     }
     Ok(())
+}
+
+fn default_bind(insecure: bool) -> (String, Option<String>) {
+    if insecure {
+        (
+            format!("127.0.0.1:{DEFAULT_PORT}"),
+            Some(format!(
+                "--insecure listens on 127.0.0.1:{DEFAULT_PORT} only, \
+                 pass --bind= if needed"
+            )),
+        )
+    } else {
+        (format!("0.0.0.0:{DEFAULT_PORT}"), None)
+    }
 }
 
 fn parse_cli() -> anyhow::Result<Command> {
@@ -1734,7 +1751,11 @@ fn parse_cli() -> anyhow::Result<Command> {
     }
 
     if bind_strs.is_empty() {
-        bind_strs.push(format!("0.0.0.0:{DEFAULT_PORT}"));
+        let (bind, note) = default_bind(insecure);
+        if let Some(note) = note {
+            warn!("{note}");
+        }
+        bind_strs.push(bind);
     }
     let binds: Vec<BindAddr> = bind_strs
         .iter()

@@ -69,7 +69,8 @@ curl 7.82 or newer; older versions take
 
 For demo purposes, let's first start the service *without authentication*.
 This mode is NOT SECURE! See below how to set up authentication.
-`--insecure` also turns TLS off, hence the plain `http://` below.
+`--insecure` also turns TLS off, hence the plain `http://` below. It
+listens on `127.0.0.1:1031` only. Use `--bind=` if more is needed.
 
 ```console
 $ systemd-run --user ./target/debug/varlink-httpd --insecure
@@ -297,7 +298,9 @@ authenticate the client; without mTLS the bridge refuses to start.
 mTLS is enabled separately (see below) and applies on top of whatever
 `--auth=` selects, so `--auth=ssh` together with mTLS requires both to
 pass. `--insecure` is the one way to serve with no authentication at
-all, and implies `--auth=none`.
+all, and implies `--auth=none`. Because nothing authenticates the
+client, it defaults to listening on `127.0.0.1:1031` instead of the
+usual `0.0.0.0:1031`. Use `--bind=` if more is needed.
 
 ### TLS / mTLS
 
@@ -308,7 +311,8 @@ TLS flag names follow the systemd convention.
 --key=PATH     path to TLS private key PEM file
 --trust=PATH   path to CA certificate PEM for client verification (mTLS)
 --require-mtls require a verified client certificate
---insecure     run over plain HTTP without any authentication (DANGEROUS)
+--insecure     run over plain HTTP without any authentication (DANGEROUS,
+               listens on localhost only unless --bind= says otherwise)
 ```
 
 `--require-mtls` makes every client present a certificate signed by the

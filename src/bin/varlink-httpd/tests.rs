@@ -1690,6 +1690,21 @@ fn test_format_x509_subject_multiple_fields() {
 // --- bind address parsing tests ---
 
 #[test]
+fn test_default_bind_insecure_is_localhost_only() {
+    let (bind, note) = crate::default_bind(true);
+    assert_eq!(bind, format!("127.0.0.1:{DEFAULT_PORT}"));
+    let note = note.expect("--insecure should explain the narrowed default");
+    assert!(note.contains("--bind="), "note: {note}");
+}
+
+#[test]
+fn test_default_bind_authenticated_is_wildcard() {
+    let (bind, note) = crate::default_bind(false);
+    assert_eq!(bind, format!("0.0.0.0:{DEFAULT_PORT}"));
+    assert_eq!(note, None);
+}
+
+#[test]
 fn test_bind_addr_parse_defaults() {
     // "vsock" and "vsock:" both mean CID_ANY + default port
     for input in ["vsock", "vsock:"] {
