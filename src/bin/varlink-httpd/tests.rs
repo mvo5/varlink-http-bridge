@@ -421,6 +421,28 @@ async fn test_call_accepts_empty_body() {
 }
 
 #[test_with::path(/run/systemd)]
+/// `connect_failed` decides the status and keeps errno out of the body; both
+/// arms are asserted by exact message so a leaked errno cannot slip through.
+#[test]
+fn connect_failed_maps_cause_to_status_and_hides_errno() {
+    let local = connect_failed(
+        "io.systemd.Hostname",
+        socket_tag::ConnectError::Local(std::io::Error::other("EMFILE details")),
+    );
+    assert_eq!(local.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(local.message, "cannot set up a connection to the service");
+
+    let unreachable = connect_failed(
+        "io.systemd.Hostname",
+        socket_tag::ConnectError::Unreachable(std::io::Error::other("ENOENT details")),
+    );
+    assert_eq!(unreachable.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        unreachable.message,
+        "cannot connect to service 'io.systemd.Hostname'"
+    );
+}
+
 #[tokio::test]
 async fn test_error_unknown_varlink_address() {
     let server = run_test_server("/run/systemd").await;
@@ -441,8 +463,12 @@ async fn test_error_unknown_varlink_address() {
     let body: Value = res.json().await.expect("error body invalid");
     let error_msg = body["error"].as_str().expect("error field missing");
     assert!(
-        error_msg.starts_with("I/O error:"),
-        "expected I/O error message, got: {error_msg}"
+        error_msg.starts_with("cannot connect to service 'no.such.address'"),
+        "expected a connect error naming the service, got: {error_msg}"
+    );
+    assert!(
+        !error_msg.contains("/proc/self/fd"),
+        "connect error leaks the internal socket path: {error_msg}"
     );
 }
 

@@ -41,6 +41,7 @@ mod auth_ssh;
 #[cfg(feature = "sshauth")]
 mod import_ssh;
 mod openapi;
+mod socket_tag;
 mod tls_cert;
 mod ws_framing;
 
@@ -66,6 +67,30 @@ impl AppError {
         Self {
             status: StatusCode::BAD_GATEWAY,
             message: message.into(),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+}
+
+/// The response body names only the service the caller already asked for;
+/// the errno text goes to the log, where it is useful without telling a
+/// remote caller which of our resources ran out.
+fn connect_failed(socket: &str, e: socket_tag::ConnectError) -> AppError {
+    match e {
+        socket_tag::ConnectError::Unreachable(_) => {
+            // a caller can name any service so just warn here to avoid flodding the error log
+            warn!("connecting to '{socket}': {e}");
+            AppError::bad_gateway(format!("cannot connect to service '{socket}'"))
+        }
+        socket_tag::ConnectError::Local(_) => {
+            error!("connecting to '{socket}': {e}");
+            AppError::internal("cannot set up a connection to the service")
         }
     }
 }
@@ -313,8 +338,18 @@ async fn get_varlink_connection(
     }
 
     debug!("Creating varlink connection for: {varlink_socket_path}");
+    let (stream, tag) =
+        socket_tag::connect_tagged(&varlink_socket_path).map_err(|e| connect_failed(socket, e))?;
+    debug!("varlink connection tagged {}", tag.reference());
+    // wrapping can fail on the SO_PASSCRED setsockopt, which is our end failing
+    let stream = zlink::tokio::unix::Stream::try_from(stream).map_err(|e| {
+        connect_failed(
+            socket,
+            socket_tag::ConnectError::Local(std::io::Error::other(e)),
+        )
+    })?;
     let connection = Arc::new(tokio::sync::Mutex::new(
-        zlink::tokio::unix::connect(&varlink_socket_path).await?,
+        zlink::tokio::unix::Connection::new(stream),
     ));
     cache.insert(socket.to_string(), connection.clone());
     Ok(connection)
@@ -1224,9 +1259,9 @@ async fn route_ws(
         .resolve_socket_with_validate(&varlink_socket)?;
 
     // Connect eagerly so connection failures return proper HTTP errors.
-    let varlink_stream = UnixStream::connect(&unix_path)
-        .await
-        .map_err(|e| AppError::bad_gateway(format!("cannot connect to {unix_path}: {e}")))?;
+    let (varlink_stream, tag) =
+        socket_tag::connect_tagged(&unix_path).map_err(|e| connect_failed(&varlink_socket, e))?;
+    debug!("websocket varlink connection tagged {}", tag.reference());
 
     Ok(ws.on_upgrade(move |ws_socket| handle_ws(ws_socket, varlink_stream)))
 }
