@@ -2775,6 +2775,7 @@ dependencies = [
  "futures-util",
  "h2",
  "http",
+ "httparse",
  "indoc",
  "lexopt",
  "listenfd",
