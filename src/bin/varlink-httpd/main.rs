@@ -43,6 +43,7 @@ mod identity;
 #[cfg(feature = "sshauth")]
 mod import_ssh;
 mod openapi;
+mod resolver;
 mod socket_tag;
 mod tls_cert;
 mod ws_framing;
@@ -1584,6 +1585,25 @@ async fn serve_listener(
     Ok(())
 }
 
+/// Best effort: a bridge that cannot publish its resolver still works, polkit
+/// just cannot resolve its tags and treats them as any unprivileged subject.
+fn start_resolver(path: &str, identities: &IdentityTable) {
+    // a socket file left by a previous run makes bind() fail
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!("resolver: cannot clear {path}: {e}");
+        return;
+    }
+    match tokio::net::UnixListener::bind(path) {
+        Ok(listener) => {
+            info!("resolver listening on {path}");
+            tokio::spawn(resolver::serve(listener, identities.clone()));
+        }
+        Err(e) => warn!("resolver: not listening on {path}: {e} (caller tags will not resolve)"),
+    }
+}
+
 #[cfg(test)]
 async fn start_server(
     listener: Transport,
@@ -1690,6 +1710,7 @@ struct BridgeCli {
     auth: Vec<AuthMechanism>,
     api_keys: Option<String>,
     insecure: bool,
+    caller_tag_socket: Option<String>,
 }
 
 fn print_help() {
@@ -1728,6 +1749,8 @@ fn print_help() {
                                             Until then every client is rejected
           --authorized-keys=PATH            authorized SSH public keys file
           --api-keys=PATH                   API key hashes file (see gen-api-key)
+          --caller-tag-socket=PATH          where polkit resolves caller tags
+                                            (default: /run/polkit/trusted-caller-tag-providers/io.systemd.VarlinkBridge)
           --insecure                        run over plain HTTP without any
                                             authentication (DANGEROUS)
           --help                            display this help and exit
@@ -1786,6 +1809,7 @@ fn parse_cli() -> anyhow::Result<Command> {
     let mut authorized_keys = None;
     let mut auth = None;
     let mut api_keys = None;
+    let mut caller_tag_socket = None;
     let mut insecure = false;
     let mut got_positional = false;
 
@@ -1800,6 +1824,7 @@ fn parse_cli() -> anyhow::Result<Command> {
             Long("authorized-keys") => authorized_keys = Some(parser.value()?.parse()?),
             Long("auth") => auth = Some(parse_auth(&parser.value()?.string()?)?),
             Long("api-keys") => api_keys = Some(parser.value()?.parse()?),
+            Long("caller-tag-socket") => caller_tag_socket = Some(parser.value()?.parse()?),
             Long("insecure") => insecure = true,
             Long("help") => {
                 print_help();
@@ -1887,6 +1912,7 @@ fn parse_cli() -> anyhow::Result<Command> {
         auth,
         api_keys,
         insecure,
+        caller_tag_socket,
     }))
 }
 
@@ -2156,11 +2182,14 @@ async fn main() -> anyhow::Result<()> {
         "HTTP"
     };
 
-    let app = create_router(
-        &cli.varlink_sockets_path,
-        authenticators,
-        IdentityTable::new(),
-    )?;
+    let identities = IdentityTable::new();
+    start_resolver(
+        cli.caller_tag_socket
+            .as_deref()
+            .unwrap_or(resolver::DEFAULT_SOCKET),
+        &identities,
+    );
+    let app = create_router(&cli.varlink_sockets_path, authenticators, identities)?;
 
     // Socket activation: consume all activated fds, or fall back to explicit --bind
     // run with e.g. "systemd-socket-activate -l 127.0.0.1:1031 -- varlink-httpd"

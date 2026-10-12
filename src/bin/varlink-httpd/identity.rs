@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::socket_tag::ConnectionTag;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Identity {
     /// `api-key`, `ssh`, `mtls`, or `anonymous` when auth was disabled.
     pub(crate) mechanism: &'static str,
@@ -73,7 +73,6 @@ impl IdentityTable {
         }
     }
 
-    #[allow(dead_code)] // the resolver, next
     pub(crate) fn resolve(&self, reference: &str) -> Option<Identity> {
         self.lock().get(reference).cloned()
     }
