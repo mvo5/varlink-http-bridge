@@ -38,6 +38,7 @@ use zlink::varlink_service::Proxy;
 mod auth_api_key;
 #[cfg(feature = "sshauth")]
 mod auth_ssh;
+mod dialout;
 #[cfg(feature = "sshauth")]
 mod import_ssh;
 mod openapi;
@@ -372,7 +373,10 @@ where
     L::Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     L::Addr: Clone + Send + std::fmt::Display + 'static,
 {
-    fn new(mut inner: L, config: TlsConfig) -> std::io::Result<Self> {
+    /// `failed` is the level a handshake that fails or times out is
+    /// logged at: what a public port sees all day is debug, a private
+    /// one's mismatch is worth a warning.
+    fn new(mut inner: L, config: TlsConfig, failed: log::Level) -> std::io::Result<Self> {
         let local_addr = inner.local_addr()?;
         let (tx, rx) = tokio::sync::mpsc::channel(256);
 
@@ -382,6 +386,11 @@ where
                 let tx = tx.clone();
                 let config = config.clone();
                 tokio::spawn(async move {
+                    // a client that connects and says nothing holds this
+                    // task and its fd until its TCP dies; on a tunnel
+                    // stream it holds one of the node's MAX_TUNNEL_STREAMS
+                    // slots, and that many of them take the node off the
+                    // relay. Dropping the stream frees either.
                     let handshake = tls_accept(&config, stream);
                     match tokio::time::timeout(config.handshake_timeout, handshake).await {
                         Ok(Ok(tls_stream)) => {
@@ -389,8 +398,9 @@ where
                                 warn!("TLS listener receiver dropped");
                             }
                         }
-                        Ok(Err(e)) => warn!("TLS handshake from {addr}: {e:#}"),
-                        Err(_) => warn!(
+                        Ok(Err(e)) => log::log!(failed, "TLS handshake from {addr}: {e:#}"),
+                        Err(_) => log::log!(
+                            failed,
                             "TLS handshake from {addr}: nothing in {:?}, dropping the connection",
                             config.handshake_timeout
                         ),
@@ -605,6 +615,8 @@ struct TlsConfig {
     handshake_timeout: Duration,
 }
 
+// generous for a slow link, short enough that silent connections do not
+// pile up (see AsyncTlsListener::new)
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn load_tls_config(
@@ -1403,6 +1415,7 @@ async fn shutdown_signal() {
 enum Transport {
     Tcp(TcpListener),
     Vsock(VsockListener),
+    Relay(dialout::DialOutListener),
 }
 
 impl std::fmt::Display for Transport {
@@ -1415,6 +1428,10 @@ impl std::fmt::Display for Transport {
             Transport::Vsock(l) => {
                 let addr = l.local_addr().map_err(|_| std::fmt::Error)?;
                 write!(f, "vsock:{}:{}", addr.cid(), addr.port())
+            }
+            Transport::Relay(l) => {
+                let tunnel = axum::serve::Listener::local_addr(l).map_err(|_| std::fmt::Error)?;
+                write!(f, "relay {tunnel}")
             }
         }
     }
@@ -1468,9 +1485,12 @@ async fn serve_listener(
 
     match (listener, tls_config) {
         (Transport::Vsock(l), Some(config)) => {
-            axum::serve(AsyncTlsListener::new(l, config)?, make_svc)
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+            axum::serve(
+                AsyncTlsListener::new(l, config, log::Level::Warn)?,
+                make_svc,
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
         }
         (Transport::Vsock(l), None) => {
             axum::serve(l, make_svc)
@@ -1479,12 +1499,30 @@ async fn serve_listener(
         }
         (Transport::Tcp(l), Some(config)) => {
             let plain = PlainListener { inner: l };
-            axum::serve(AsyncTlsListener::new(plain, config)?, make_svc)
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+            axum::serve(
+                AsyncTlsListener::new(plain, config, log::Level::Warn)?,
+                make_svc,
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
         }
         (Transport::Tcp(l), None) => {
             axum::serve(PlainListener { inner: l }, make_svc)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+        (Transport::Relay(l), Some(config)) => {
+            // a tunnel stream is a public port: a caller that speaks no
+            // TLS is routine there
+            axum::serve(
+                AsyncTlsListener::new(l, config, log::Level::Debug)?,
+                make_svc,
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+        }
+        (Transport::Relay(l), None) => {
+            axum::serve(l, make_svc)
                 .with_graceful_shutdown(shutdown_signal())
                 .await?;
         }
@@ -1599,6 +1637,8 @@ struct BridgeCli {
     auth: Vec<AuthMechanism>,
     api_keys: Option<String>,
     insecure: bool,
+    relay: Option<String>,
+    instance: Option<String>,
 }
 
 fn print_help() {
@@ -1623,6 +1663,8 @@ fn print_help() {
                                             default: 0.0.0.0:{DEFAULT_PORT}, or
                                             127.0.0.1:{DEFAULT_PORT} with --insecure)
                                             use vsock::PORT for vsock (e.g. vsock::{DEFAULT_PORT})
+                                            use none to serve only via --relay
+                                            or socket activation
           --auth=MECHANISMS                 comma-separated per-request authentication
                                             ({auth}); required unless --insecure.
                                             mTLS is enabled separately and applies
@@ -1642,6 +1684,11 @@ fn print_help() {
                                             authentication (DANGEROUS); listens
                                             on localhost only unless --bind= says
                                             otherwise
+          --relay=URL                       additionally serve through a
+                                            varlink-relayd tunnel; ws://HOST[:PORT]
+                                            or wss://HOST[:PORT]
+          --instance=LABEL                  register the tunnel under a
+                                            per-instance node id (with --relay)
           --help                            display this help and exit
     ",
             auth = AuthMechanism::names(),
@@ -1713,6 +1760,8 @@ fn parse_cli() -> anyhow::Result<Command> {
     let mut auth = None;
     let mut api_keys = None;
     let mut insecure = false;
+    let mut relay = None;
+    let mut instance = None;
     let mut got_positional = false;
 
     let mut parser = lexopt::Parser::from_env();
@@ -1727,6 +1776,8 @@ fn parse_cli() -> anyhow::Result<Command> {
             Long("auth") => auth = Some(parse_auth(&parser.value()?.string()?)?),
             Long("api-keys") => api_keys = Some(parser.value()?.parse()?),
             Long("insecure") => insecure = true,
+            Long("relay") => relay = Some(parser.value()?.parse()?),
+            Long("instance") => instance = Some(parser.value()?.parse()?),
             Long("help") => {
                 print_help();
                 std::process::exit(0);
@@ -1750,7 +1801,13 @@ fn parse_cli() -> anyhow::Result<Command> {
         }
     }
 
-    if bind_strs.is_empty() {
+    let bind_none = bind_strs.iter().any(|s| s == "none");
+    if bind_none && bind_strs.len() > 1 {
+        bail!("--bind=none cannot be combined with other --bind addresses");
+    }
+    if bind_none {
+        bind_strs.clear();
+    } else if bind_strs.is_empty() {
         let (bind, note) = default_bind(insecure);
         if let Some(note) = note {
             warn!("{note}");
@@ -1817,6 +1874,8 @@ fn parse_cli() -> anyhow::Result<Command> {
         auth,
         api_keys,
         insecure,
+        relay,
+        instance,
     }))
 }
 
@@ -2101,13 +2160,26 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if listeners.is_empty() {
-        // No socket activation: bind explicitly based on --bind (or default)
+        // No socket activation: bind explicitly based on --bind (or
+        // default); --bind=none leaves the list empty on purpose
+        if cli.binds.is_empty() && cli.relay.is_none() {
+            bail!("--bind=none without --relay= or socket activation leaves nothing to serve");
+        }
         for bind in cli.binds {
             let listener = listener_from_bind_addr(bind).await?;
             listeners.push((listener, tls_config.clone()));
         }
     } else {
         eprintln!("Varlink proxy started (socket-activated)");
+    }
+
+    // the tunnel is one more listener, TLS and auth included
+    if let Some(url) = &cli.relay {
+        let node_id = varlink_http_bridge::node_id::local_node_id(cli.instance.as_deref())?;
+        let listener = dialout::DialOutListener::start(url, node_id)?;
+        listeners.push((Transport::Relay(listener), tls_config.clone()));
+    } else if cli.instance.is_some() {
+        bail!("--instance only makes sense together with --relay");
     }
 
     let mut join_set = tokio::task::JoinSet::new();
