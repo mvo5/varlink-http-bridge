@@ -7,14 +7,14 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use futures_util::{SinkExt, StreamExt};
 use log::{debug, warn};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::{self, Message};
+use tokio_tungstenite::tungstenite;
+use varlink_http_bridge::ws::WsByteStream;
 use varlink_http_bridge::{AsyncStream, BoxedStream, TlsChannelBinding};
 
 mod api_key_client;
@@ -476,94 +476,37 @@ async fn ws_upgrade(
 
 /// Our half of the close handshake, bounded so a stuck peer cannot
 /// hang the exit.
-async fn close_ws(sink: &mut futures_util::stream::SplitSink<Ws, Message>) {
-    match tokio::time::timeout(CLOSE_TIMEOUT, sink.close()).await {
-        Ok(
-            Ok(()) | Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed),
-        ) => {}
+async fn close_ws(ws: &mut WsByteStream<BoxedStream>) {
+    match tokio::time::timeout(CLOSE_TIMEOUT, ws.shutdown()).await {
+        Ok(Ok(())) => {}
         Ok(Err(e)) => warn!("WebSocket close failed: {e:#}"),
         Err(_) => warn!("timed out closing WebSocket"),
     }
 }
 
 /// Forward data between fd3 and the WebSocket in both directions until
-/// fd3 hits EOF, the peer closes, or we get SIGINT/SIGTERM.
-async fn run_proxy(ws: Ws, fd3: UnixStream) -> Result<()> {
+/// both sides have closed or we get SIGINT/SIGTERM.
+///
+/// Whichever side closes first, the other is drained until it closes
+/// too. varlinkctl closes fd3 and then sends SIGTERM, so a peer that
+/// never answers our close is cut short by the signal branch.
+async fn run_proxy(ws: Ws, mut fd3: UnixStream) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
-    let (mut sink, mut stream) = ws.split();
-    let (mut fd3_read, mut fd3_write) = fd3.into_split();
+    let mut ws = WsByteStream::new(ws);
 
-    // fd3 -> websocket. send() completes only once the data is written
-    // out, so a slow peer naturally stops us from reading more of fd3.
-    // Borrows `sink` (no move) so the peer-close branch below can still
-    // send the close reply after this future is dropped.
-    let mut up = Box::pin(async {
-        let mut buf = bytes::BytesMut::new();
-        let mut total: u64 = 0;
-        loop {
-            // split().freeze() avoids copying each chunk into the message
-            buf.reserve(65536);
-            let n = fd3_read.read_buf(&mut buf).await.context("fd3 read")?;
-            if n == 0 {
-                break;
-            }
-            total += n as u64;
-            // when this finishes the buf part that got split is dropped
-            // and the next buf.reserve can just reclaim/reuse it
-            sink.send(Message::Binary(buf.split().freeze()))
-                .await
-                .context("ws send")?;
-        }
-        debug!("fd3 EOF after {total} bytes, closing WebSocket");
-        sink.close().await.context("ws close")
-    });
-
-    // websocket -> fd3
-    let mut down = Box::pin(async move {
-        let mut total: u64 = 0;
-        while let Some(msg) = stream.next().await {
-            match msg.context("ws read")? {
-                Message::Binary(data) => {
-                    total += data.len() as u64;
-                    fd3_write.write_all(&data).await.context("fd3 write")?;
-                }
-                Message::Text(_) => bail!("unexpected text WebSocket frame"),
-                Message::Close(_) => break,
-                _ => {}
-            }
-        }
-        debug!("WebSocket -> fd3 finished after {total} bytes");
-        Ok(())
-    });
-
-    // select is parallel, whatever is first wins
     tokio::select! {
-        r = &mut up => {
-            r?;
-            // all data is delivered at this point; warn if the close
-            // handshake fails though
-            match tokio::time::timeout(CLOSE_TIMEOUT, &mut down).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("error waiting for close response: {e:#}"),
-                Err(_) => warn!("timed out waiting for close response"),
-            }
-        }
-        r = &mut down => {
-            r?;
-            // peer closed first: answer the close handshake before exiting
-            drop(up);
-            close_ws(&mut sink).await;
+        r = tokio::io::copy_bidirectional(&mut fd3, &mut ws) => {
+            let (up, down) = r.context("proxy")?;
+            debug!("done after {up} bytes fd3 -> WebSocket, {down} bytes back");
         }
         _ = sigint.recv() => {
             debug!("SIGINT, closing WebSocket");
-            drop(up);
-            close_ws(&mut sink).await;
+            close_ws(&mut ws).await;
         }
         _ = sigterm.recv() => {
             debug!("SIGTERM, closing WebSocket");
-            drop(up);
-            close_ws(&mut sink).await;
+            close_ws(&mut ws).await;
         }
     }
     Ok(())
@@ -843,6 +786,9 @@ mod pin_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::AsyncReadExt;
+    use tungstenite::Message;
 
     type ServerWs = WebSocketStream<tokio::net::TcpStream>;
 
@@ -878,11 +824,10 @@ mod tests {
             // stall so the client's kernel send buffer fills up
             tokio::time::sleep(Duration::from_millis(500)).await;
             let mut received = Vec::new();
+            // reading on past the close frame is what sends the reply
             while let Some(msg) = ws.next().await {
-                match msg.unwrap() {
-                    Message::Binary(data) => received.extend_from_slice(&data),
-                    Message::Close(_) => break,
-                    _ => {}
+                if let Message::Binary(data) = msg.unwrap() {
+                    received.extend_from_slice(&data);
                 }
             }
             received
@@ -923,12 +868,8 @@ mod tests {
                     .await
                     .unwrap();
             }
-            // idle until the peer closes
-            while let Some(msg) = ws.next().await {
-                if matches!(msg, Ok(Message::Close(_))) {
-                    break;
-                }
-            }
+            // idle until the close handshake is done
+            while ws.next().await.is_some() {}
         });
 
         // let the proxy run into fd3 backpressure while the server floods
@@ -948,8 +889,9 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// When the peer closes first the proxy must answer the close
-    /// handshake (instead of just dropping the connection) and exit 0.
+    /// When the peer closes first the proxy must pass the EOF on to fd3,
+    /// answer the close handshake (instead of just dropping the
+    /// connection) once fd3 is closed as well, and exit 0.
     #[tokio::test]
     async fn test_run_proxy_peer_close_first() {
         let (mut ws, mut ours, proxy) = proxy_fixture().await;
@@ -968,9 +910,11 @@ mod tests {
             got_close_reply
         });
 
-        let mut hello = [0u8; 5];
-        ours.read_exact(&mut hello).await.unwrap();
-        assert_eq!(&hello, b"hello");
+        let mut hello = Vec::new();
+        ours.read_to_end(&mut hello).await.unwrap();
+        assert_eq!(hello, b"hello");
+        // like varlinkctl, close fd3 once the peer is gone
+        drop(ours);
 
         proxy.await.unwrap().expect("run_proxy failed");
         assert!(server.await.unwrap(), "server never got a close reply");

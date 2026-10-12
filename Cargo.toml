@@ -42,7 +42,7 @@ regex-lite = "0.1"
 listenfd = "1.0.2"
 tokio-tungstenite = "0.30"
 data-encoding = "2"
-futures-util = { version = "0.3" }
+futures-util = { version = "0.3", features = ["sink"] }
 bytes = "1"
 rustix = { version = "1.0", features = ["net", "process", "system"] }
 # TODO: switch back to crates.io once tokio-vsock releases a version with
