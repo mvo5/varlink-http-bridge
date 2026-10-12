@@ -137,6 +137,13 @@ pub fn exclusive_ca_store(
     Ok(store.build())
 }
 
+/// One object-safe stream type for every transport combination a client
+/// dials (TCP, vsock, with or without TLS), so what runs on top is
+/// instantiated once.
+pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncStream for T {}
+pub type BoxedStream = Box<dyn AsyncStream>;
+
 /// Enable `TCP_NODELAY` and `SO_KEEPALIVE` on a TCP socket.
 ///
 /// Keepalive timing uses the OS defaults. Tunable via
