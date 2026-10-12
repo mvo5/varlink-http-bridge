@@ -9,6 +9,7 @@ use std::time::SystemTime;
 
 use varlink_http_bridge::sysconf::{CredentialsLoader, find_config};
 
+use crate::identity::Identity;
 use crate::{AuthRequest, Authenticator};
 
 // TODO: the credentials loading of sshauth and api-keys is very
@@ -326,7 +327,7 @@ impl std::fmt::Debug for ApiKeyAuthenticator {
 }
 
 impl Authenticator for ApiKeyAuthenticator {
-    fn check_request(&self, request: &AuthRequest) -> anyhow::Result<()> {
+    fn check_request(&self, request: &AuthRequest) -> anyhow::Result<Identity> {
         // enumerate before taking the lock, it touches the filesystem
         let paths = self.current_paths().inspect_err(|e| {
             warn!("cannot enumerate credentials: {e}, skipping reload (keeping cached API keys)");
@@ -346,7 +347,9 @@ impl Authenticator for ApiKeyAuthenticator {
             method = request.method,
             path = request.path
         );
-        Ok(())
+        // the key's name is all we know about the caller; the key itself is a
+        // credential and must not travel any further
+        Ok(Identity::new("api-key", name))
     }
 }
 

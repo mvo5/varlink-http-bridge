@@ -9,6 +9,7 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+use crate::identity::Identity;
 use varlink_http_bridge::TlsChannelBinding;
 
 /// Saves each test from assembling an `AuthRequest` and its backing `HeaderMap`.
@@ -19,7 +20,7 @@ fn check_request(
     auth_header: Option<&str>,
     nonce: Option<&str>,
     tls_channel_binding: Option<&TlsChannelBinding>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Identity> {
     let mut headers = axum::http::HeaderMap::new();
     if let Some(v) = auth_header {
         headers.insert("authorization", v.parse().unwrap());
@@ -2565,7 +2566,7 @@ mod sshauth_tests {
 
     struct RejectingAuthenticator(&'static str);
     impl Authenticator for RejectingAuthenticator {
-        fn check_request(&self, _request: &AuthRequest) -> anyhow::Result<()> {
+        fn check_request(&self, _request: &AuthRequest) -> anyhow::Result<Identity> {
             anyhow::bail!("{}", self.0)
         }
     }

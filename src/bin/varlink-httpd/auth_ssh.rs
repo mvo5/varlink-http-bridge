@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
+use crate::identity::Identity;
 use crate::{AuthRequest, Authenticator};
 use varlink_http_bridge::sshauth_token::{SSHAUTH_NONCE_HEADER, SignedParts, UnverifiedToken};
 
@@ -450,7 +451,7 @@ pub(crate) fn create_ssh_authenticator(
 }
 
 impl Authenticator for SshKeyAuthenticator {
-    fn check_request(&self, request: &AuthRequest) -> anyhow::Result<()> {
+    fn check_request(&self, request: &AuthRequest) -> anyhow::Result<Identity> {
         self.maybe_reload();
 
         let (method, path) = (request.method, request.path);
@@ -486,6 +487,7 @@ impl Authenticator for SshKeyAuthenticator {
             "SSH auth OK: {method} {path} key={fp}",
             fp = verified.fingerprint()
         );
-        Ok(())
+        // the key fingerprint is the stable name for this caller
+        Ok(Identity::new("ssh", verified.fingerprint().to_string()))
     }
 }

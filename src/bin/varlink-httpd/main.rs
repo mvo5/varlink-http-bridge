@@ -38,6 +38,7 @@ use zlink::varlink_service::Proxy;
 mod auth_api_key;
 #[cfg(feature = "sshauth")]
 mod auth_ssh;
+mod identity;
 #[cfg(feature = "sshauth")]
 mod import_ssh;
 mod openapi;
@@ -45,6 +46,7 @@ mod socket_tag;
 mod tls_cert;
 mod ws_framing;
 
+use identity::Identity;
 use ws_framing::VarlinkFramer;
 
 #[cfg(feature = "sshauth")]
@@ -836,7 +838,10 @@ fn parse_auth(value: &str) -> anyhow::Result<Vec<AuthMechanism>> {
 }
 
 trait Authenticator: Send + Sync {
-    fn check_request(&self, request: &AuthRequest) -> anyhow::Result<()>;
+    /// Reports the identity it authenticated. Returning `()` would throw away
+    /// the only thing that distinguishes one remote caller from another, so
+    /// nothing downstream could ever act on it.
+    fn check_request(&self, request: &AuthRequest) -> anyhow::Result<Identity>;
 }
 
 /// Authenticator that accepts every request.
@@ -852,12 +857,12 @@ struct AllowAllAuthenticator {
 }
 
 impl Authenticator for AllowAllAuthenticator {
-    fn check_request(&self, request: &AuthRequest) -> anyhow::Result<()> {
+    fn check_request(&self, request: &AuthRequest) -> anyhow::Result<Identity> {
         debug!(
             "auth: allowing {} {} ({})",
             request.method, request.path, self.reason
         );
-        Ok(())
+        Ok(Identity::anonymous())
     }
 }
 
@@ -892,10 +897,10 @@ async fn auth_middleware(
     let mut accepted = false;
     for authenticator in state.authenticators.iter() {
         match authenticator.check_request(&auth_request) {
-            Ok(()) => {
+            Ok(identity) => {
                 debug!(
-                    "auth: accepted {} {}",
-                    auth_request.method, auth_request.path
+                    "auth: accepted {} {} as {:?}",
+                    auth_request.method, auth_request.path, identity.caller
                 );
                 accepted = true;
                 break;
