@@ -6,6 +6,7 @@
 
 use anyhow::{Context, bail};
 use async_stream::stream;
+use axum::Extension;
 use axum::{
     Router,
     body::Body,
@@ -46,7 +47,7 @@ mod socket_tag;
 mod tls_cert;
 mod ws_framing;
 
-use identity::Identity;
+use identity::{Identity, IdentityTable, Lease};
 use ws_framing::VarlinkFramer;
 
 #[cfg(feature = "sshauth")]
@@ -295,7 +296,15 @@ impl VarlinkSockets {
     }
 }
 
-type VarlinkConns = HashMap<String, Arc<tokio::sync::Mutex<zlink::tokio::unix::Connection>>>;
+// PoC: keyed by socket only, so on a kept-alive HTTP connection the first
+// identity wins. Keying by (socket, identity) is the next step.
+type VarlinkConns = HashMap<
+    String,
+    (
+        Arc<tokio::sync::Mutex<zlink::tokio::unix::Connection>>,
+        Lease,
+    ),
+>;
 
 /// Per-HTTP-connection cache of varlink unix socket connections.
 ///
@@ -330,11 +339,12 @@ async fn get_varlink_connection(
     socket: &str,
     state: &AppState,
     conn_cache: &VarlinkConnCache,
+    identity: &Identity,
 ) -> Result<Arc<tokio::sync::Mutex<zlink::tokio::unix::Connection>>, AppError> {
     let varlink_socket_path = state.varlink_sockets.resolve_socket_with_validate(socket)?;
 
     let mut cache = conn_cache.conns.lock().await;
-    if let Some(conn) = cache.get(socket) {
+    if let Some((conn, _)) = cache.get(socket) {
         debug!("Reusing varlink connection for: {varlink_socket_path}");
         return Ok(conn.clone());
     }
@@ -342,7 +352,12 @@ async fn get_varlink_connection(
     debug!("Creating varlink connection for: {varlink_socket_path}");
     let (stream, tag) =
         socket_tag::connect_tagged(&varlink_socket_path).map_err(|e| connect_failed(socket, e))?;
-    debug!("varlink connection tagged {}", tag.reference());
+    let lease = state.identities.bind(tag, identity.clone());
+    debug!(
+        "varlink connection {} is {:?}",
+        lease.reference(),
+        identity.caller
+    );
     // wrapping can fail on the SO_PASSCRED setsockopt, which is our end failing
     let stream = zlink::tokio::unix::Stream::try_from(stream).map_err(|e| {
         connect_failed(
@@ -353,7 +368,7 @@ async fn get_varlink_connection(
     let connection = Arc::new(tokio::sync::Mutex::new(
         zlink::tokio::unix::Connection::new(stream),
     ));
-    cache.insert(socket.to_string(), connection.clone());
+    cache.insert(socket.to_string(), (connection.clone(), lease));
     Ok(connection)
 }
 
@@ -868,7 +883,7 @@ impl Authenticator for AllowAllAuthenticator {
 
 async fn auth_middleware(
     State(state): State<AppState>,
-    request: axum::http::Request<axum::body::Body>,
+    mut request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     let tls_channel_binding: Option<TlsChannelBinding> = request
@@ -894,7 +909,7 @@ async fn auth_middleware(
     let mut errors = Vec::new();
     // flag instead of early return: `auth_request` borrows `request`, and
     // next.run() needs `request` back by value
-    let mut accepted = false;
+    let mut accepted = None;
     for authenticator in state.authenticators.iter() {
         match authenticator.check_request(&auth_request) {
             Ok(identity) => {
@@ -902,13 +917,14 @@ async fn auth_middleware(
                     "auth: accepted {} {} as {:?}",
                     auth_request.method, auth_request.path, identity.caller
                 );
-                accepted = true;
+                accepted = Some(identity);
                 break;
             }
             Err(e) => errors.push(e.to_string()),
         }
     }
-    if accepted {
+    if let Some(identity) = accepted {
+        request.extensions_mut().insert(identity);
         return next.run(request).await;
     }
 
@@ -932,6 +948,7 @@ async fn auth_middleware(
 struct AppState {
     varlink_sockets: Arc<VarlinkSockets>,
     authenticators: Arc<Vec<Box<dyn Authenticator>>>,
+    identities: IdentityTable,
 }
 
 /// The IDL of one interface, as fetched from a varlink socket.
@@ -952,8 +969,9 @@ impl InterfaceIdl {
         interface: &str,
         state: &AppState,
         conn_cache: &VarlinkConnCache,
+        identity: &Identity,
     ) -> Result<Self, AppError> {
-        let conn_arc = get_varlink_connection(socket, state, conn_cache).await?;
+        let conn_arc = get_varlink_connection(socket, state, conn_cache, identity).await?;
         let mut connection = conn_arc.lock().await;
 
         let description = connection
@@ -977,12 +995,13 @@ impl InterfaceIdl {
 }
 
 async fn route_openapi_get(
+    Extension(identity): Extension<Identity>,
     ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
     Path((service, interface)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
     debug!("GET openapi for service: {service}, interface: {interface}");
-    let idl = InterfaceIdl::fetch(&service, &interface, &state, &conn_cache).await?;
+    let idl = InterfaceIdl::fetch(&service, &interface, &state, &conn_cache, &identity).await?;
     let iface = idl.parse()?;
 
     // the title and every generated path come from the returned description,
@@ -1003,12 +1022,13 @@ const IDL_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 
 /// The interface description verbatim, as the service returned it.
 async fn route_idl_get(
+    Extension(identity): Extension<Identity>,
     ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
     Path((service, interface)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     debug!("GET idl for service: {service}, interface: {interface}");
-    let idl = InterfaceIdl::fetch(&service, &interface, &state, &conn_cache).await?;
+    let idl = InterfaceIdl::fetch(&service, &interface, &state, &conn_cache, &identity).await?;
     Ok(([("Content-Type", IDL_CONTENT_TYPE)], idl.raw()?.to_string()))
 }
 
@@ -1019,12 +1039,13 @@ async fn route_services_get(State(state): State<AppState>) -> Result<axum::Json<
 }
 
 async fn route_service_get(
+    Extension(identity): Extension<Identity>,
     ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
     Path(service): Path<String>,
     State(state): State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
     debug!("GET service: {service}");
-    let conn_arc = get_varlink_connection(&service, &state, &conn_cache).await?;
+    let conn_arc = get_varlink_connection(&service, &state, &conn_cache, &identity).await?;
     let mut connection = conn_arc.lock().await;
 
     let info = connection
@@ -1044,12 +1065,13 @@ fn described(name: &str, description: Option<String>) -> Value {
 }
 
 async fn route_service_interface_get(
+    Extension(identity): Extension<Identity>,
     ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
     Path((service, interface)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
     debug!("GET service: {service}, interface: {interface}");
-    let idl = InterfaceIdl::fetch(&service, &interface, &state, &conn_cache).await?;
+    let idl = InterfaceIdl::fetch(&service, &interface, &state, &conn_cache, &identity).await?;
     let iface = idl.parse()?;
 
     let methods: Vec<Value> = iface
@@ -1157,6 +1179,7 @@ async fn call_varlink_method(
     method: &str,
     state: &AppState,
     conn_cache: &VarlinkConnCache,
+    identity: &Identity,
     mode: CallMode,
     call_args: &HashMap<String, Value>,
 ) -> Result<Response, AppError> {
@@ -1165,7 +1188,7 @@ async fn call_varlink_method(
         parameters: Some(call_args),
     };
 
-    let conn_arc = get_varlink_connection(socket, state, conn_cache).await?;
+    let conn_arc = get_varlink_connection(socket, state, conn_cache, identity).await?;
     let mut connection = conn_arc.lock_owned().await;
     match mode {
         CallMode::Oneway => {
@@ -1202,6 +1225,7 @@ fn parse_call_args(body: &[u8]) -> Result<HashMap<String, Value>, AppError> {
 /// Call a varlink method, deriving the service from the method's
 /// interface prefix unless overridden via `?service=`.
 async fn route_call_post(
+    Extension(identity): Extension<Identity>,
     ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
     Path(method): Path<String>,
     Query(params): Query<HashMap<String, String>>,
@@ -1227,12 +1251,22 @@ async fn route_call_post(
             .to_string()
     };
 
-    call_varlink_method(&service, &method, &state, &conn_cache, mode, &call_args).await
+    call_varlink_method(
+        &service,
+        &method,
+        &state,
+        &conn_cache,
+        &identity,
+        mode,
+        &call_args,
+    )
+    .await
 }
 
 /// Call a varlink method with the service given explicitly in the path.
 /// This is the form the generated `OpenAPI` documents use.
 async fn route_call_service_post(
+    Extension(identity): Extension<Identity>,
     ConnectInfo(conn_cache): ConnectInfo<VarlinkConnCache>,
     Path((service, method)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
@@ -1251,10 +1285,20 @@ async fn route_call_service_post(
         ));
     }
 
-    call_varlink_method(&service, &method, &state, &conn_cache, mode, &call_args).await
+    call_varlink_method(
+        &service,
+        &method,
+        &state,
+        &conn_cache,
+        &identity,
+        mode,
+        &call_args,
+    )
+    .await
 }
 
 async fn route_ws(
+    Extension(identity): Extension<Identity>,
     Path(varlink_socket): Path<String>,
     State(state): State<AppState>,
     ws: WebSocketUpgrade,
@@ -1266,9 +1310,14 @@ async fn route_ws(
     // Connect eagerly so connection failures return proper HTTP errors.
     let (varlink_stream, tag) =
         socket_tag::connect_tagged(&unix_path).map_err(|e| connect_failed(&varlink_socket, e))?;
-    debug!("websocket varlink connection tagged {}", tag.reference());
+    debug!(
+        "websocket varlink connection {} is {:?}",
+        tag.reference(),
+        identity.caller
+    );
+    let lease = state.identities.bind(tag, identity);
 
-    Ok(ws.on_upgrade(move |ws_socket| handle_ws(ws_socket, varlink_stream)))
+    Ok(ws.on_upgrade(move |ws_socket| handle_ws(ws_socket, varlink_stream, lease)))
 }
 
 /// Send each frame as one WS binary message.
@@ -1311,7 +1360,7 @@ async fn close_ws(ws: &mut WebSocket) {
 
 // Forwards bytes between the websocket and the varlink unix socket in
 // both directions; framing decisions live in [`VarlinkFramer`].
-async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
+async fn handle_ws(mut ws: WebSocket, unix: UnixStream, _lease: Lease) {
     let (mut unix_read, mut unix_write) = tokio::io::split(unix);
     let mut varlink_framer = VarlinkFramer::new();
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
@@ -1383,6 +1432,7 @@ async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
 fn create_router(
     varlink_sockets_path: &str,
     authenticators: Vec<Box<dyn Authenticator>>,
+    identities: IdentityTable,
 ) -> anyhow::Result<Router> {
     let metadata = std::fs::metadata(varlink_sockets_path)
         .with_context(|| format!("failed to stat {varlink_sockets_path}"))?;
@@ -1396,6 +1446,7 @@ fn create_router(
             bail!("path {varlink_sockets_path} is neither a directory nor a socket");
         }),
         authenticators: Arc::new(authenticators),
+        identities,
     };
 
     // API routes behind auth middleware
@@ -1540,7 +1591,7 @@ async fn start_server(
     varlink_sockets_path: &str,
     authenticators: Vec<Box<dyn Authenticator>>,
 ) -> anyhow::Result<()> {
-    let app = create_router(varlink_sockets_path, authenticators)?;
+    let app = create_router(varlink_sockets_path, authenticators, IdentityTable::new())?;
     serve_listener(listener, tls_config, app).await
 }
 
@@ -2105,7 +2156,11 @@ async fn main() -> anyhow::Result<()> {
         "HTTP"
     };
 
-    let app = create_router(&cli.varlink_sockets_path, authenticators)?;
+    let app = create_router(
+        &cli.varlink_sockets_path,
+        authenticators,
+        IdentityTable::new(),
+    )?;
 
     // Socket activation: consume all activated fds, or fall back to explicit --bind
     // run with e.g. "systemd-socket-activate -l 127.0.0.1:1031 -- varlink-httpd"

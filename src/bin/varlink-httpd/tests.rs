@@ -9,7 +9,7 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-use crate::identity::Identity;
+use crate::identity::{Identity, IdentityTable};
 use varlink_http_bridge::TlsChannelBinding;
 
 /// Saves each test from assembling an `AuthRequest` and its backing `HeaderMap`.
@@ -966,13 +966,15 @@ async fn test_varlink_conn_cache_reuses_connection() {
     let state = AppState {
         varlink_sockets: sockets,
         authenticators: Arc::new(Vec::new()),
+        identities: IdentityTable::new(),
     };
     let cache = VarlinkConnCache::new(None);
+    let id = Identity::new("api-key", "test");
 
-    let conn1 = get_varlink_connection("io.systemd.Hostname", &state, &cache)
+    let conn1 = get_varlink_connection("io.systemd.Hostname", &state, &cache, &id)
         .await
         .unwrap();
-    let conn2 = get_varlink_connection("io.systemd.Hostname", &state, &cache)
+    let conn2 = get_varlink_connection("io.systemd.Hostname", &state, &cache, &id)
         .await
         .unwrap();
     assert!(
@@ -981,9 +983,11 @@ async fn test_varlink_conn_cache_reuses_connection() {
     );
 
     // different socket gets a different connection
-    let conn3 = get_varlink_connection("io.systemd.Manager", &state, &cache)
+    let conn3 = get_varlink_connection("io.systemd.Manager", &state, &cache, &id)
         .await
         .unwrap();
+    // one live tag per cached connection
+    assert_eq!(state.identities.len(), 2);
     assert!(
         !Arc::ptr_eq(&conn1, &conn3),
         "different sockets should have different connections"
@@ -2261,7 +2265,7 @@ mod sshauth_tests {
         let tmpdir = tempfile::tempdir().unwrap();
         // Keep tmpdir so it lives for the test duration (but gets cleaned up eventually)
         let path = tmpdir.keep();
-        create_router(path.to_str().unwrap(), authenticators).unwrap()
+        create_router(path.to_str().unwrap(), authenticators, IdentityTable::new()).unwrap()
     }
 
     #[test]
@@ -3638,7 +3642,7 @@ mod apikey_tests {
     fn make_api_key_test_router(authenticators: Vec<Box<dyn Authenticator>>) -> Router {
         let tmpdir = tempfile::tempdir().unwrap();
         let path = tmpdir.keep();
-        create_router(path.to_str().unwrap(), authenticators).unwrap()
+        create_router(path.to_str().unwrap(), authenticators, IdentityTable::new()).unwrap()
     }
 
     #[test]

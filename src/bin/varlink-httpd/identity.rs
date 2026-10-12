@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 //! Who the bridge authenticated, as reported by whichever authenticator
-//! accepted the request.
+//! accepted the request, and the table that maps a connection's tag back
+//! to them.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use crate::socket_tag::ConnectionTag;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
@@ -43,5 +49,84 @@ mod tests {
             Identity::new("ssh", "alice")
         );
         assert_eq!(Identity::anonymous().caller, None);
+    }
+}
+
+/// Tags currently bound to a live connection, process-wide, because the
+/// resolver answers for every connection.
+#[derive(Clone, Default)]
+pub(crate) struct IdentityTable {
+    inner: Arc<Mutex<HashMap<String, Identity>>>,
+}
+
+impl IdentityTable {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Make `tag` resolve to `identity` until the returned lease is dropped.
+    pub(crate) fn bind(&self, tag: ConnectionTag, identity: Identity) -> Lease {
+        self.lock().insert(tag.reference().to_string(), identity);
+        Lease {
+            tag,
+            table: self.clone(),
+        }
+    }
+
+    #[allow(dead_code)] // the resolver, next
+    pub(crate) fn resolve(&self, reference: &str) -> Option<Identity> {
+        self.lock().get(reference).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    // a poisoned lock still holds a consistent map; every write is one insert or remove
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Identity>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Keeps a tag resolvable for exactly as long as its connection; dropping
+/// it is what stops a released name from resolving if someone rebinds it.
+pub(crate) struct Lease {
+    tag: ConnectionTag,
+    table: IdentityTable,
+}
+
+impl Lease {
+    pub(crate) fn reference(&self) -> &str {
+        self.tag.reference()
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.table.lock().remove(self.tag.reference());
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    #[test]
+    fn bound_tag_resolves_until_the_lease_drops() {
+        let table = IdentityTable::new();
+        let tag = ConnectionTag::generate().unwrap();
+        let reference = tag.reference().to_string();
+
+        let lease = table.bind(tag, Identity::new("api-key", "ci"));
+        assert_eq!(
+            table.resolve(&reference),
+            Some(Identity::new("api-key", "ci"))
+        );
+        assert_eq!(table.len(), 1);
+
+        drop(lease);
+        assert_eq!(table.resolve(&reference), None);
+        assert_eq!(table.len(), 0);
     }
 }

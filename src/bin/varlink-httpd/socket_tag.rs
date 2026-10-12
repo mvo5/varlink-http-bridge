@@ -52,7 +52,7 @@ impl std::fmt::Display for ConnectError {
 pub(crate) struct ConnectionTag(String);
 
 impl ConnectionTag {
-    fn generate() -> io::Result<Self> {
+    pub(crate) fn generate() -> io::Result<Self> {
         let mut bytes = [0u8; REFERENCE_BYTES];
         let n = rustix::rand::getrandom(&mut bytes[..], rustix::rand::GetRandomFlags::empty())?;
         // a full fill is guaranteed below 256 bytes, so this only guards the constant growing
