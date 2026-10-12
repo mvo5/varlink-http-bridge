@@ -205,9 +205,9 @@ fn relay_only_instance_with_auth_none() {
         .connect(&update_id, stream)
         .expect("TLS handshake with the bridge through the tunnel");
 
-    // /sockets sits behind the auth middleware, so a 200 proves
+    // /services sits behind the auth middleware, so a 200 proves
     // --auth=none actually authenticates the anonymous caller
-    tls.write_all(b"GET /sockets HTTP/1.1\r\nHost: node\r\nConnection: close\r\n\r\n")
+    tls.write_all(b"GET /services HTTP/1.1\r\nHost: node\r\nConnection: close\r\n\r\n")
         .unwrap();
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
