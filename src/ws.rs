@@ -23,6 +23,11 @@ pub struct WsByteStream<S> {
     ws: WebSocketStream<S>,
     readbuf: Bytes,
     abrupt_close_is_eof: bool,
+    /// The peer's close frame is in, so from now on a write goes
+    /// nowhere, as one after the peer's FIN does on TCP. h2 answers EOF
+    /// with a GOAWAY before it shuts down, and an error there would turn
+    /// a clean close into a failed one.
+    peer_closed: bool,
 }
 
 impl<S> WsByteStream<S>
@@ -36,6 +41,7 @@ where
             ws,
             readbuf: Bytes::new(),
             abrupt_close_is_eof: false,
+            peer_closed: false,
         }
     }
 
@@ -61,9 +67,7 @@ where
         let this = self.get_mut();
         loop {
             if !this.readbuf.is_empty() {
-                let n = this.readbuf.len().min(buf.remaining());
-                buf.put_slice(&this.readbuf[..n]);
-                this.readbuf.advance(n);
+                drain(&mut this.readbuf, buf);
                 return Poll::Ready(Ok(()));
             }
             let abrupt = match ready!(Pin::new(&mut this.ws).poll_next(cx)) {
@@ -81,7 +85,10 @@ where
                 // on a blocked socket; flushing here would bypass that
                 // retry and could strand the pong
                 Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
-                Some(Ok(Message::Close(_))) | None => return Poll::Ready(Ok(())),
+                Some(Ok(Message::Close(_))) | None => {
+                    this.peer_closed = true;
+                    return Poll::Ready(Ok(()));
+                }
                 Some(Err(
                     e @ (WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake)
                     | WsError::ConnectionClosed),
@@ -115,6 +122,9 @@ where
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if this.peer_closed {
+            return Poll::Ready(Ok(buf.len()));
+        }
         ready!(Pin::new(&mut this.ws).poll_ready(cx)).map_err(io::Error::other)?;
         Pin::new(&mut this.ws)
             .start_send(Message::Binary(Bytes::copy_from_slice(buf)))
@@ -134,6 +144,9 @@ where
             return Poll::Ready(Ok(0));
         }
         let this = self.get_mut();
+        if this.peer_closed {
+            return Poll::Ready(Ok(total));
+        }
         ready!(Pin::new(&mut this.ws).poll_ready(cx)).map_err(io::Error::other)?;
         let mut data = bytes::BytesMut::with_capacity(total);
         for buf in bufs {
@@ -150,28 +163,42 @@ where
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().ws)
-            .poll_flush(cx)
-            .map_err(io::Error::other)
+        let this = self.get_mut();
+        match ready!(Pin::new(&mut this.ws).poll_flush(cx)) {
+            Ok(()) => Poll::Ready(Ok(())),
+            // only our close reply can be left to send, and only a peer
+            // that is gone already could miss it
+            Err(_) if this.peer_closed => Poll::Ready(Ok(())),
+            Err(e) => Poll::Ready(Err(io::Error::other(e))),
+        }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match ready!(Pin::new(&mut self.get_mut().ws).poll_close(cx)) {
+        let this = self.get_mut();
+        match ready!(Pin::new(&mut this.ws).poll_close(cx)) {
             // the peer closed first and tungstenite already answered
             Ok(()) | Err(WsError::ConnectionClosed | WsError::AlreadyClosed) => Poll::Ready(Ok(())),
+            Err(_) if this.peer_closed => Poll::Ready(Ok(())),
             Err(e) => Poll::Ready(Err(io::Error::other(e))),
         }
     }
 }
 
+pub(crate) fn drain(readbuf: &mut Bytes, buf: &mut ReadBuf<'_>) {
+    let n = readbuf.len().min(buf.remaining());
+    buf.put_slice(&readbuf[..n]);
+    readbuf.advance(n);
+}
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use futures_util::SinkExt as _;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+pub(crate) mod test_helpers {
+    use super::WsByteStream;
+    use tokio::io::{DuplexStream, duplex};
+    use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::protocol::Role;
 
-    async fn raw_pair() -> (WebSocketStream<DuplexStream>, WebSocketStream<DuplexStream>) {
+    pub(crate) async fn raw_pair() -> (WebSocketStream<DuplexStream>, WebSocketStream<DuplexStream>)
+    {
         let (a, b) = duplex(4096);
         tokio::join!(
             WebSocketStream::from_raw_socket(a, Role::Client, None),
@@ -179,10 +206,18 @@ mod tests {
         )
     }
 
-    async fn ws_pair() -> (WsByteStream<DuplexStream>, WsByteStream<DuplexStream>) {
+    pub(crate) async fn ws_pair() -> (WsByteStream<DuplexStream>, WsByteStream<DuplexStream>) {
         let (client, server) = raw_pair().await;
         (WsByteStream::new(client), WsByteStream::new(server))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_helpers::{raw_pair, ws_pair};
+    use super::*;
+    use futures_util::SinkExt as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn text_frames_are_an_error() {
@@ -231,6 +266,24 @@ mod tests {
         server.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"");
         server.shutdown().await.unwrap();
+    }
+
+    /// Whether the peer lingers after its close frame or is gone, what
+    /// is written after it is nobody's loss.
+    #[tokio::test]
+    async fn a_write_after_the_peer_closed_goes_nowhere() {
+        for linger in [true, false] {
+            let (mut client, mut server) = ws_pair().await;
+            client.shutdown().await.unwrap();
+            if !linger {
+                drop(client);
+            }
+            let mut got = Vec::new();
+            server.read_to_end(&mut got).await.unwrap();
+            server.write_all(b"too late").await.unwrap();
+            server.flush().await.unwrap();
+            server.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
