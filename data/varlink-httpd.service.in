@@ -23,11 +23,13 @@ Restart=on-failure
 RestartSec=5
 StateDirectory=varlink-httpd
 
-# Pass the FDs from both socket units in a single service start. Without
+# Pass the FDs from all socket units in a single service start. Without
 # this, whichever socket triggers activation first wins the race; the
-# other socket's FD stays held by systemd and connections on that
-# transport never reach varlink-httpd.
-Sockets=varlink-httpd.socket varlink-httpd-vsock.socket
+# other sockets' FDs stay held by systemd and connections on those
+# transports never reach varlink-httpd. The caller-tag socket is the
+# provider polkitd queries; it has to come from a socket unit because its
+# directory is root-only (see varlink-httpd-caller-tag.socket).
+Sockets=varlink-httpd.socket varlink-httpd-vsock.socket varlink-httpd-caller-tag.socket
 
 # Hardening
 ProtectSystem=strict

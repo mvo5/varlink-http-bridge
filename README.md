@@ -257,7 +257,7 @@ $ varlink --bridge "websocat --binary ws://localhost:1031/ws/services/io.systemd
 
 ## Systemd services
 
-Two socket units are shipped, both backed by the same
+Three socket units are shipped, all backed by the same
 `varlink-httpd.service`:
 
 - `varlink-httpd.socket` listens on TCP `0.0.0.0:1031`.
@@ -265,18 +265,84 @@ Two socket units are shipped, both backed by the same
   `ConditionVirtualization=vm`, so it only activates inside a VM. On
   bare metal or the host it is silently skipped, which makes it safe
   to enable unconditionally.
+- `varlink-httpd-caller-tag.socket` is not a client-facing transport. It
+  is the provider socket polkit queries to learn who is behind a request,
+  see [Caller tags](#caller-tags-telling-polkit-who-is-asking). Without it
+  polkit rules cannot see the authenticated identity.
 
-Both sockets can be enabled at the same time.
-If both are enabled, systemd passes two fds to the service on activation.
-The daemon starts on demand when the first connection arrives
-and listens on boths sockets, regardless of which connection came first.
+All sockets can be enabled at the same time. systemd then passes every
+fd to the service on activation. The daemon starts on demand when the
+first connection arrives and listens on all sockets, regardless of
+which connection came first.
 
 The daemon binary and unit files can be installed with `just install_server`.
 
 After installation, enable with:
 ```console
-# systemctl enable --now varlink-httpd.socket varlink-httpd-vsock.socket
+# systemctl enable --now varlink-httpd.socket varlink-httpd-vsock.socket varlink-httpd-caller-tag.socket
 ```
+
+## Caller tags: telling polkit who is asking
+
+The bridge talks to varlink services on behalf of its HTTP clients, so
+all a service sees is the bridge's own pid and uid. Services that gate
+operations through polkit would then authorize every client alike. To
+let polkit rules see the authenticated client instead, the bridge tags
+each varlink connection and offers polkit a way to resolve that tag.
+
+How it fits together:
+
+1. Before connecting to a service, the bridge binds the client end of the
+   socket to an abstract name of the form
+   `<16 hex digits>/caller-tag/io.systemd.VarlinkBridge` (the same shape
+   sd-bus uses for its own connections). The hex part is random and unique
+   per connection.
+2. The service reads that name with `getpeername()` and passes it to
+   polkit as the `on-behalf-of` key of the subject.
+3. polkit connects to the provider named in the tag, the socket
+   `/run/polkit-1/caller-tag-providers/io.systemd.VarlinkBridge`, and
+   calls `io.systemd.VarlinkBridge.Resolve` with the hex reference. The
+   bridge answers with the identity it authenticated for that connection.
+4. Rules see it as `subject.on_behalf_of`, an object with `mechanism`
+   (`ssh`, `api-key`, `mtls`, ...) and `caller` (the key's label, the
+   certificate's CN, ...):
+
+```js
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.on_behalf_of &&
+        subject.on_behalf_of.mechanism == "ssh" &&
+        subject.on_behalf_of.caller == "ci@example.org")
+        return polkit.Result.YES;
+});
+```
+
+The tag is a lookup key, not a credential. Abstract socket names are
+visible to everyone and can be rebound once released, so polkit does not
+trust the name itself. It verifies through the kernel that the process
+listening on the provider socket is the very process that presented
+the tag (or at least shares its cgroup), and the bridge only answers for
+references it bound itself, for as long as that connection is open.
+
+Two consequences for running the bridge:
+
+- The providers directory is root-owned, so an unprivileged bridge cannot
+  create the socket. `varlink-httpd-caller-tag.socket` has systemd bind
+  it instead, with mode `0660` and group `polkitd` so that only polkitd
+  can connect. This is what makes `DynamicUser=` possible for the service.
+- polkit identifies the provider by whoever last called `listen()` on
+  the socket. For an activated socket that is pid 1, so the bridge calls
+  `listen()` again on the inherited fd before serving its first client.
+  Without that, every tag would be refused as coming from init.
+
+Without socket activation the bridge binds the socket itself, which needs
+root; `--caller-tag-socket=PATH` moves it, mainly for tests. If the socket
+cannot be set up the bridge keeps working, and polkit simply sees the
+bridge's own identity as it would for any client.
+
+A tag only ever adds information. polkit makes no decision on its own
+from it; a rule has to ask for `subject.on_behalf_of` explicitly, and
+requests without a resolvable tag look exactly as they did before.
 
 ## Authentication
 

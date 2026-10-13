@@ -13,6 +13,7 @@ install_server: (build "release")
 	sed 's|@bindir@|{{bindir}}|g' data/varlink-httpd.service.in > {{destdir}}{{unitdir}}/varlink-httpd.service
 	install -m644 data/varlink-httpd.socket {{destdir}}{{unitdir}}/varlink-httpd.socket
 	install -m644 data/varlink-httpd-vsock.socket {{destdir}}{{unitdir}}/varlink-httpd-vsock.socket
+	install -m644 data/varlink-httpd-caller-tag.socket {{destdir}}{{unitdir}}/varlink-httpd-caller-tag.socket
 
 install_client: (build "release")
 	install -Dm755 {{helper_binary}} {{destdir}}{{bridgedir}}/http

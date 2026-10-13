@@ -1587,17 +1587,20 @@ async fn serve_listener(
 
 /// Best effort: a bridge that cannot publish its resolver still works, polkit
 /// just cannot resolve its tags and treats them as any unprivileged subject.
-fn start_resolver(path: &str, identities: &IdentityTable) {
-    // a socket file left by a previous run makes bind() fail
-    if let Err(e) = std::fs::remove_file(path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!("resolver: cannot clear {path}: {e}");
-        return;
-    }
-    match tokio::net::UnixListener::bind(path) {
+fn start_resolver(activated: Option<OwnedFd>, path: &str, identities: &IdentityTable) {
+    let listener = match activated {
+        Some(fd) => resolver::adopt_activated(fd),
+        None => resolver::bind(path),
+    };
+    match listener {
         Ok(listener) => {
-            info!("resolver listening on {path}");
+            let addr = listener.local_addr().ok();
+            info!(
+                "resolver listening on {}",
+                addr.as_ref()
+                    .and_then(|a| a.as_pathname())
+                    .map_or(path, |p| p.to_str().unwrap_or(path))
+            );
             tokio::spawn(resolver::serve(listener, identities.clone()));
         }
         Err(e) => warn!("resolver: not listening on {path}: {e} (caller tags will not resolve)"),
@@ -1749,8 +1752,9 @@ fn print_help() {
                                             Until then every client is rejected
           --authorized-keys=PATH            authorized SSH public keys file
           --api-keys=PATH                   API key hashes file (see gen-api-key)
-          --caller-tag-socket=PATH          where polkit resolves caller tags
-                                            (default: /run/polkit/trusted-caller-tag-providers/io.systemd.VarlinkBridge)
+          --caller-tag-socket=PATH          where polkit resolves caller tags; needs root
+                                            to bind, a socket unit can pass it in instead
+                                            (default: /run/polkit-1/caller-tag-providers/io.systemd.VarlinkBridge)
           --insecure                        run over plain HTTP without any
                                             authentication (DANGEROUS)
           --help                            display this help and exit
@@ -2182,26 +2186,40 @@ async fn main() -> anyhow::Result<()> {
         "HTTP"
     };
 
+    // Socket activation: consume all activated fds, or fall back to explicit --bind
+    // run with e.g. "systemd-socket-activate -l 127.0.0.1:1031 -- varlink-httpd"
+    let mut listeners: Vec<(Transport, Option<TlsConfig>)> = Vec::new();
+    let mut resolver_fd: Option<OwnedFd> = None;
+    let mut listenfd = ListenFd::from_env();
+    for idx in 0..listenfd.len() {
+        if let Some(raw_fd) = listenfd.take_raw_fd(idx)? {
+            // SAFETY: listenfd.take_raw_fd() returns a valid, owned fd from socket activation
+            let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+            // the one AF_UNIX socket systemd hands us is the caller-tag provider
+            // (varlink-httpd-caller-tag.socket); HTTP never listens on AF_UNIX
+            if rustix::net::getsockname(fd.as_fd())?.address_family()
+                == rustix::net::AddressFamily::UNIX
+            {
+                if resolver_fd.replace(fd).is_some() {
+                    bail!("more than one AF_UNIX socket from socket activation");
+                }
+                continue;
+            }
+            listeners.push(listener_from_activated_fd(fd, tls_config.clone())?);
+        }
+    }
+
     let identities = IdentityTable::new();
+    // before any client is served: a tag issued earlier would be checked by
+    // polkit against whoever listened on the provider socket before us
     start_resolver(
+        resolver_fd,
         cli.caller_tag_socket
             .as_deref()
             .unwrap_or(resolver::DEFAULT_SOCKET),
         &identities,
     );
     let app = create_router(&cli.varlink_sockets_path, authenticators, identities)?;
-
-    // Socket activation: consume all activated fds, or fall back to explicit --bind
-    // run with e.g. "systemd-socket-activate -l 127.0.0.1:1031 -- varlink-httpd"
-    let mut listeners: Vec<(Transport, Option<TlsConfig>)> = Vec::new();
-    let mut listenfd = ListenFd::from_env();
-    for idx in 0..listenfd.len() {
-        if let Some(raw_fd) = listenfd.take_raw_fd(idx)? {
-            // SAFETY: listenfd.take_raw_fd() returns a valid, owned fd from socket activation
-            let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-            listeners.push(listener_from_activated_fd(fd, tls_config.clone())?);
-        }
-    }
 
     if listeners.is_empty() {
         // No socket activation: bind explicitly based on --bind (or default)

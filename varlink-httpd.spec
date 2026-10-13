@@ -46,19 +46,20 @@ just build release
 DESTDIR=%{buildroot} SYSCONFDIR=%{_sysconfdir} just install
 
 %post
-%systemd_post varlink-httpd.service varlink-httpd.socket varlink-httpd-vsock.socket
+%systemd_post varlink-httpd.service varlink-httpd.socket varlink-httpd-vsock.socket varlink-httpd-caller-tag.socket
 
 %preun
-%systemd_preun varlink-httpd.service varlink-httpd.socket varlink-httpd-vsock.socket
+%systemd_preun varlink-httpd.service varlink-httpd.socket varlink-httpd-vsock.socket varlink-httpd-caller-tag.socket
 
 %postun
-%systemd_postun_with_restart varlink-httpd.service varlink-httpd.socket varlink-httpd-vsock.socket
+%systemd_postun_with_restart varlink-httpd.service varlink-httpd.socket varlink-httpd-vsock.socket varlink-httpd-caller-tag.socket
 
 %files
 %{_bindir}/varlink-httpd
 %{_unitdir}/varlink-httpd.service
 %{_unitdir}/varlink-httpd.socket
 %{_unitdir}/varlink-httpd-vsock.socket
+%{_unitdir}/varlink-httpd-caller-tag.socket
 %dir %{_sysconfdir}/varlink-httpd
 
 %files -n varlinkctl-http

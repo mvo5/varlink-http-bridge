@@ -3,13 +3,14 @@
 //! Give each varlink connection a kernel "socket-tag" by creating an
 //! abstract unix socket with a "$random/caller-tag/io.systemd.VarlinkBridge"
 //! name (the same shape sd-bus uses in bind_description()) and use
-//! that socket to connect to the actual varlink socket path. This
-//! means that every varlink connection by the bridge to the varlink
-//! service is now uniquely identifiable via (pid, tag).
+//! that socket to connect to the actual varlink socket path. The service
+//! reads the name with getpeername() and passes it to polkit as the
+//! subject's "on-behalf-of" key; polkit asks our resolver what it means.
 //!
-//! It must be random because anyone can create/observe/reuse the
-//! abstract socket names. This also means we always need the tuple of
-//! (pid, tag) to identify a connection.
+//! The name is a lookup key, not a credential: anyone can create, observe
+//! or reuse abstract socket names. What makes it safe is polkit checking
+//! that the subject presenting a tag is the process serving the resolver,
+//! i.e. us; the random part only keeps our own names from colliding.
 
 use std::io;
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -23,8 +24,9 @@ use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 pub(crate) const PROVIDER_NAME: &str = "io.systemd.VarlinkBridge";
 
 /// For uniqueness, not secrecy: the name is world-readable in
-/// /proc/net/unix, and the pid check is what carries the security. 64 bits
-/// matches sd-bus and is far above the collision floor at host scale.
+/// /proc/net/unix, and polkit's peer check is what carries the security.
+/// 64 bits matches sd-bus and is the minimum polkit accepts; the encoding
+/// below always yields all 16 hex digits.
 const REFERENCE_BYTES: usize = 8;
 
 /// Why [`connect_tagged`] failed.

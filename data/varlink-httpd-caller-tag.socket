@@ -1,0 +1,22 @@
+#  SPDX-License-Identifier: LGPL-2.1-or-later
+#
+#  This file is part of varlink-http-bridge.
+
+[Unit]
+Description=Varlink HTTP Bridge (polkit caller-tag provider)
+DefaultDependencies=no
+Before=sockets.target
+Conflicts=shutdown.target
+
+[Socket]
+# polkitd resolves the bridge's caller tags through this socket. systemd binds
+# it as root, which is what the root-owned providers directory requires, so the
+# service itself can run unprivileged. Only polkitd may connect.
+ListenStream=/run/polkit-1/caller-tag-providers/io.systemd.VarlinkBridge
+SocketMode=0660
+SocketGroup=polkitd
+FileDescriptorName=caller-tag
+Service=varlink-httpd.service
+
+[Install]
+WantedBy=sockets.target
