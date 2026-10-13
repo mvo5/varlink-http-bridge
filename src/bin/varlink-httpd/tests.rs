@@ -968,7 +968,13 @@ async fn test_varlink_conn_cache_reuses_connection() {
         authenticators: Arc::new(Vec::new()),
         identities: IdentityTable::new(),
     };
-    let cache = VarlinkConnCache::new(None);
+    let cache = VarlinkConnCache::new(
+        None,
+        "127.0.0.1:0"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into(),
+    );
     let id = Identity::new("api-key", "test");
 
     let conn1 = get_varlink_connection("io.systemd.Hostname", &state, &cache, &id)

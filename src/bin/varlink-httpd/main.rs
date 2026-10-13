@@ -48,7 +48,7 @@ mod socket_tag;
 mod tls_cert;
 mod ws_framing;
 
-use identity::{Identity, IdentityTable, Lease};
+use identity::{Identity, IdentityTable, Lease, Peer};
 use ws_framing::VarlinkFramer;
 
 #[cfg(feature = "sshauth")]
@@ -318,13 +318,15 @@ type VarlinkConns = HashMap<
 struct VarlinkConnCache {
     conns: Arc<tokio::sync::Mutex<VarlinkConns>>,
     tls_channel_binding: Option<TlsChannelBinding>,
+    transport: Peer,
 }
 
 impl VarlinkConnCache {
-    fn new(tls_channel_binding: Option<TlsChannelBinding>) -> Self {
+    fn new(tls_channel_binding: Option<TlsChannelBinding>, transport: Peer) -> Self {
         Self {
             conns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             tls_channel_binding,
+            transport,
         }
     }
 }
@@ -332,7 +334,7 @@ impl VarlinkConnCache {
 impl Connected<IncomingStream<'_, PlainListener>> for VarlinkConnCache {
     fn connect_info(target: IncomingStream<'_, PlainListener>) -> Self {
         info!("New connection from {}", target.remote_addr());
-        Self::new(None)
+        Self::new(None, (*target.remote_addr()).into())
     }
 }
 
@@ -502,7 +504,14 @@ impl Connected<IncomingStream<'_, AsyncTlsListener<PlainListener>>> for VarlinkC
         let ssl = target.io().ssl();
         log_tls_connection(ssl, target.remote_addr());
         let tls_channel_binding = varlink_http_bridge::export_tls_channel_binding(ssl);
-        Self::new(Some(tls_channel_binding))
+        Self::new(Some(tls_channel_binding), (*target.remote_addr()).into())
+    }
+}
+
+fn vsock_peer(peer: &tokio_vsock::VsockAddr) -> Peer {
+    Peer::Vsock {
+        cid: peer.cid(),
+        port: peer.port(),
     }
 }
 
@@ -510,7 +519,7 @@ impl Connected<IncomingStream<'_, VsockListener>> for VarlinkConnCache {
     fn connect_info(target: IncomingStream<'_, VsockListener>) -> Self {
         let peer = target.remote_addr();
         info!("New vsock connection from CID {}", peer.cid());
-        Self::new(None)
+        Self::new(None, vsock_peer(peer))
     }
 }
 
@@ -520,7 +529,7 @@ impl Connected<IncomingStream<'_, AsyncTlsListener<VsockListener>>> for VarlinkC
         let peer = target.remote_addr();
         info!("New TLS vsock connection from CID {}", peer.cid());
         let tls_channel_binding = varlink_http_bridge::export_tls_channel_binding(ssl);
-        Self::new(Some(tls_channel_binding))
+        Self::new(Some(tls_channel_binding), vsock_peer(peer))
     }
 }
 
@@ -887,10 +896,13 @@ async fn auth_middleware(
     mut request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let tls_channel_binding: Option<TlsChannelBinding> = request
+    let conn = request
         .extensions()
         .get::<ConnectInfo<VarlinkConnCache>>()
-        .and_then(|ci| ci.0.tls_channel_binding.clone());
+        .map(|ci| ci.0.clone());
+    let tls_channel_binding: Option<TlsChannelBinding> =
+        conn.as_ref().and_then(|c| c.tls_channel_binding.clone());
+    let transport = conn.map(|c| c.transport);
 
     let auth_request = AuthRequest {
         method: request.method().as_str(),
@@ -924,7 +936,8 @@ async fn auth_middleware(
             Err(e) => errors.push(e.to_string()),
         }
     }
-    if let Some(identity) = accepted {
+    if let Some(mut identity) = accepted {
+        identity.transport = transport;
         request.extensions_mut().insert(identity);
         return next.run(request).await;
     }

@@ -9,6 +9,32 @@ use std::sync::{Arc, Mutex};
 
 use crate::socket_tag::ConnectionTag;
 
+/// Where the HTTP connection came from, as the bridge saw it. A fact, not a
+/// credential: NAT and roaming clients make an address a poor identity, so a
+/// rule may narrow on it but should never grant on it alone. Tagged by `kind`
+/// because the bridge also listens on vsock, where there is no IP address.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub(crate) enum Peer {
+    Tcp {
+        address: std::net::IpAddr,
+        port: u16,
+    },
+    Vsock {
+        cid: u32,
+        port: u32,
+    },
+}
+
+impl From<std::net::SocketAddr> for Peer {
+    fn from(addr: std::net::SocketAddr) -> Self {
+        Self::Tcp {
+            address: addr.ip(),
+            port: addr.port(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Identity {
     /// `api-key`, `ssh`, `mtls`, or `anonymous` when auth was disabled.
@@ -16,6 +42,10 @@ pub(crate) struct Identity {
     /// Named as the mechanism names them: an API key's label, an SSH key
     /// fingerprint, a certificate subject. `None` only for anonymous.
     pub(crate) caller: Option<String>,
+    /// Attached by the request pipeline, not the authenticator, which only
+    /// sees headers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) transport: Option<Peer>,
 }
 
 impl Identity {
@@ -23,6 +53,7 @@ impl Identity {
         Self {
             mechanism,
             caller: Some(caller.into()),
+            transport: None,
         }
     }
 
@@ -33,6 +64,7 @@ impl Identity {
         Self {
             mechanism: "anonymous",
             caller: None,
+            transport: None,
         }
     }
 }
@@ -49,6 +81,32 @@ mod tests {
             Identity::new("ssh", "alice")
         );
         assert_eq!(Identity::anonymous().caller, None);
+    }
+
+    /// The shape polkit rules see, so a rename here is a visible API change.
+    #[test]
+    fn transport_serializes_tagged_by_kind() {
+        let tcp = "10.12.0.7:51234".parse::<std::net::SocketAddr>().unwrap();
+        let mut identity = Identity::new("ssh", "SHA256:x");
+        identity.transport = Some(tcp.into());
+        assert_eq!(
+            serde_json::to_value(&identity).unwrap(),
+            serde_json::json!({
+                "mechanism": "ssh",
+                "caller": "SHA256:x",
+                "transport": {"kind": "tcp", "address": "10.12.0.7", "port": 51234},
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(Peer::Vsock { cid: 3, port: 1031 }).unwrap(),
+            serde_json::json!({"kind": "vsock", "cid": 3, "port": 1031})
+        );
+        assert!(
+            serde_json::to_value(Identity::anonymous())
+                .unwrap()
+                .get("transport")
+                .is_none()
+        );
     }
 }
 

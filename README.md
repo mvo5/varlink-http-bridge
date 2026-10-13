@@ -304,8 +304,12 @@ How it fits together:
    calls `io.systemd.VarlinkBridge.Resolve` with the hex reference. The
    bridge answers with the identity it authenticated for that connection.
 4. Rules see it as `subject.on_behalf_of`, an object with `mechanism`
-   (`ssh`, `api-key`, `mtls`, ...) and `caller` (the key's label, the
-   certificate's CN, ...):
+   (`ssh`, `api-key`, `mtls`, ...), `caller` (the key's label, the
+   certificate's CN, ...) and `transport`, where the HTTP connection came
+   from as the bridge saw it: `{"kind": "tcp", "address": "10.12.0.7",
+   "port": 51234}` or `{"kind": "vsock", "cid": 3, "port": 51234}`. The
+   transport is a fact about the peer, not a credential: rules may narrow
+   on it, never grant on it alone, and `X-Forwarded-For` plays no part.
 
 ```js
 polkit.addRule(function(action, subject) {
