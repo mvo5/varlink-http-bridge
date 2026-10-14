@@ -9,6 +9,7 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use varlink_http_bridge::node_id::MachineId;
 
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -65,16 +66,24 @@ fn spawn_relayd() -> (Daemon, String, String) {
     (Daemon(child), node_addr, connect_addr)
 }
 
+/// A relay-only bridge with the self-signed certificate it generates
+/// into `state_dir`. `--relay` refuses to serve plaintext, and api-key
+/// auth with an empty key file is the cheapest way to satisfy `--auth`;
+/// `/health` is open anyway.
 fn spawn_httpd(
     node_addr: &str,
     socket_dir: &std::path::Path,
+    state_dir: &std::path::Path,
     instance: Option<&str>,
-    args: &[&str],
 ) -> Daemon {
+    let api_keys = state_dir.join("api-keys");
+    std::fs::write(&api_keys, "").unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_varlink-httpd"));
-    cmd.args(args)
-        .arg("--relay")
+    cmd.args(["--auth", "api-key", "--api-keys"])
+        .arg(&api_keys)
+        .args(["--bind", "none", "--relay"])
         .arg(format!("ws://{node_addr}"))
+        .env("STATE_DIRECTORY", state_dir)
         .stderr(Stdio::null())
         .stdout(Stdio::null());
     if let Some(label) = instance {
@@ -116,16 +125,25 @@ fn connect_via_relay(connect_addr: &str, id: &str) -> TcpStream {
     }
 }
 
-/// GET a path from the bridge through an established CONNECT tunnel.
-fn get_via(mut stream: TcpStream, path: &str) -> String {
-    stream
-        .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: node\r\nConnection: close\r\n\r\n").as_bytes(),
-        )
-        .unwrap();
+/// GET a path from the bridge through an established CONNECT tunnel,
+/// inside the end-to-end TLS session the relay never sees. The
+/// certificate is self-signed and nothing pins it here.
+fn get_via(stream: TcpStream, id: &str, path: &str) -> String {
+    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    builder.set_verify(SslVerifyMode::NONE);
+    let mut tls = builder
+        .build()
+        .configure()
+        .unwrap()
+        .verify_hostname(false)
+        .connect(id, stream)
+        .expect("TLS handshake through the tunnel");
+    tls.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: {id}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .unwrap();
     let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
+    tls.read_to_string(&mut response)
         .expect("reading bridge response");
     response
 }
@@ -144,15 +162,21 @@ fn caller_reaches_the_bridge_through_the_relay() {
 
     let (_relayd, node_addr, connect_addr) = spawn_relayd();
     let sockets = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let update_state = tempfile::tempdir().unwrap();
 
     // the default instance and a second one on the same host
-    let insecure = ["--insecure", "--bind", "127.0.0.1:0"];
-    let _bridge = spawn_httpd(&node_addr, sockets.path(), None, &insecure);
-    let _update_bridge = spawn_httpd(&node_addr, sockets.path(), Some("update"), &insecure);
+    let _bridge = spawn_httpd(&node_addr, sockets.path(), state.path(), None);
+    let _update_bridge = spawn_httpd(
+        &node_addr,
+        sockets.path(),
+        update_state.path(),
+        Some("update"),
+    );
 
     for id in [&default_id, &update_id] {
         let stream = connect_via_relay(&connect_addr, id);
-        let response = get_via(stream, "/health");
+        let response = get_via(stream, id, "/health");
         assert!(
             response.starts_with("HTTP/1.1 200"),
             "unexpected response for {id}: {}",
@@ -179,12 +203,8 @@ fn concurrent_callers_share_one_tunnel() {
 
     let (_relayd, node_addr, connect_addr) = spawn_relayd();
     let sockets = tempfile::tempdir().unwrap();
-    let _bridge = spawn_httpd(
-        &node_addr,
-        sockets.path(),
-        None,
-        &["--insecure", "--bind", "127.0.0.1:0"],
-    );
+    let state = tempfile::tempdir().unwrap();
+    let _bridge = spawn_httpd(&node_addr, sockets.path(), state.path(), None);
 
     // all open at once, and more than the node's connection channel holds
     let streams: Vec<TcpStream> = (0..24)
@@ -194,7 +214,10 @@ fn concurrent_callers_share_one_tunnel() {
     let responses: Vec<String> = std::thread::scope(|scope| {
         let callers: Vec<_> = streams
             .into_iter()
-            .map(|stream| scope.spawn(move || get_via(stream, "/health")))
+            .map(|stream| {
+                let id = &id;
+                scope.spawn(move || get_via(stream, id, "/health"))
+            })
             .collect();
         callers.into_iter().map(|c| c.join().unwrap()).collect()
     });

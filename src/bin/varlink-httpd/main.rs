@@ -1686,7 +1686,8 @@ fn print_help() {
                                             otherwise
           --relay=URL                       additionally serve through a
                                             varlink-relayd tunnel; ws://HOST[:PORT]
-                                            or wss://HOST[:PORT]
+                                            or wss://HOST[:PORT]; TLS only, refused
+                                            together with --insecure
           --instance=LABEL                  register the tunnel under a
                                             per-instance node id (with --relay)
           --help                            display this help and exit
@@ -1833,6 +1834,11 @@ fn parse_cli() -> anyhow::Result<Command> {
             if set {
                 bail!("--insecure serves plain HTTP and can't be combined with {name}");
             }
+        }
+        // plaintext through the relay is readable and forgeable by
+        // anyone who knows the node id, and node ids are not secret
+        if relay.is_some() {
+            bail!("--insecure serves plain HTTP and can't be combined with --relay=");
         }
     }
 
