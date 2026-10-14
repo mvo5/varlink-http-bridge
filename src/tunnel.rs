@@ -192,6 +192,9 @@ pub type RelayEnd<T> = (
     h2::client::Connection<T, Bytes>,
 );
 
+/// The path on the relay a node dials to open its tunnel.
+pub const TUNNEL_PATH: &str = "/v1/tunnel";
+
 #[cfg(test)]
 mod tests {
     use super::*;
