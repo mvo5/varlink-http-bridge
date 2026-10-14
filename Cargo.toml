@@ -5,7 +5,7 @@ edition = "2024"
 license = "LGPL-2.1-or-later"
 
 [workspace]
-members = [".", "crates/ssh-key-import"]
+members = [".", "crates/http-fetch", "crates/ssh-key-import"]
 
 [[bin]]
 name = "varlink-httpd"
