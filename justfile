@@ -31,9 +31,9 @@ build profile:
 
 check: check_srv_binary_size check_helper_binary_size
 	cargo fmt --check
-	cargo clippy --all-targets --locked -- -W clippy::pedantic
+	cargo clippy --all-targets --locked -- -W clippy::pedantic -D warnings
 	# without default features we catch misplaced cfg(feature) attribute
-	cargo clippy --all-targets --no-default-features --locked -- -W clippy::pedantic
+	cargo clippy --all-targets --no-default-features --locked -- -W clippy::pedantic -D warnings
 
 test:
 	cargo test --locked
