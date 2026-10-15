@@ -157,6 +157,7 @@ const ONEWAY_NOTE: &str = "Send the call with the varlink 'oneway' flag: the \
      service is still reported as 502 Bad Gateway, but errors raised by the \
      service itself, including an unknown method, are not.";
 
+#[allow(clippy::too_many_lines)]
 pub fn idl_to_openapi(address: &str, iface: &Interface) -> Value {
     let mut paths = serde_json::Map::new();
 

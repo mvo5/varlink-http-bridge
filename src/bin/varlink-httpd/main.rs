@@ -1699,6 +1699,7 @@ fn default_bind(insecure: bool) -> (String, Option<String>) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_cli() -> anyhow::Result<Command> {
     use lexopt::prelude::*;
 

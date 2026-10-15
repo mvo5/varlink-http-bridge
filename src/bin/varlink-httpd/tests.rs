@@ -2189,6 +2189,12 @@ fn test_call_mode_from_params() {
             .unwrap_or_default()
     }
 
+    fn oneway(oneway: &str, more: Option<&str>) -> HashMap<String, String> {
+        let mut p = params(more);
+        p.insert("oneway".to_string(), oneway.to_string());
+        p
+    }
+
     assert_eq!(
         CallMode::from_params(&params(None)).unwrap(),
         CallMode::Call
@@ -2205,11 +2211,6 @@ fn test_call_mode_from_params() {
     assert!(CallMode::from_params(&params(Some(""))).is_err());
     assert!(CallMode::from_params(&params(Some("1"))).is_err());
 
-    fn oneway(oneway: &str, more: Option<&str>) -> HashMap<String, String> {
-        let mut p = params(more);
-        p.insert("oneway".to_string(), oneway.to_string());
-        p
-    }
     assert_eq!(
         CallMode::from_params(&oneway("true", None)).unwrap(),
         CallMode::Oneway
@@ -3121,6 +3122,7 @@ method CountItems() -> (count: int)
 ";
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_idl_to_openapi() {
     let iface: zlink::idl::Interface = TEST_IDL.try_into().expect("failed to parse test IDL");
     let doc = openapi::idl_to_openapi("com.example.test", &iface);
