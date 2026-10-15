@@ -197,15 +197,14 @@ mod tests {
         );
 
         let missing = CredentialsLoader::from_dir(dir.path().join("nonexistent"));
-        assert!(
-            missing.find(PATTERNS).unwrap().is_empty(),
+        assert_eq!(
+            missing.find(PATTERNS).unwrap(),
+            Vec::<PathBuf>::new(),
             "a missing credentials directory means no credentials"
         );
-        assert!(
-            missing
-                .find_with(PATTERNS, str::to_string)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            missing.find_with(PATTERNS, str::to_string).unwrap(),
+            Vec::<String>::new()
         );
     }
 

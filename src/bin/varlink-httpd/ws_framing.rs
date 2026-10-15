@@ -94,8 +94,8 @@ mod tests {
     #[test]
     fn test_message_split_across_reads() {
         let mut f = VarlinkFramer::new();
-        assert!(f.push_varlink_bytes(b"{\"met").is_empty());
-        assert!(f.push_varlink_bytes(b"hod\":\"x\"}").is_empty());
+        assert_eq!(f.push_varlink_bytes(b"{\"met"), Vec::<Vec<u8>>::new());
+        assert_eq!(f.push_varlink_bytes(b"hod\":\"x\"}"), Vec::<Vec<u8>>::new());
         assert_eq!(
             f.push_varlink_bytes(b"\0{\"next").as_slice(),
             &[b"{\"method\":\"x\"}\0".to_vec()]
@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn test_empty_push_yields_no_frames() {
         let mut f = VarlinkFramer::new();
-        assert!(f.push_varlink_bytes(b"").is_empty());
+        assert_eq!(f.push_varlink_bytes(b""), Vec::<Vec<u8>>::new());
         assert_eq!(f.finish(), None);
     }
 
@@ -143,7 +143,7 @@ mod tests {
             f.push_varlink_bytes(b"raw\0bytes\0no framing"),
             vec![b"raw\0bytes\0no framing".to_vec()]
         );
-        assert!(f.push_varlink_bytes(b"").is_empty());
+        assert_eq!(f.push_varlink_bytes(b""), Vec::<Vec<u8>>::new());
 
         // post-upgrade client bytes must not be parsed (or warned about)
         f.detect_protocol_upgrade_request(b"\xff\xfe raw upload data");
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn test_buffered_partial_flushed_on_upgrade() {
         let mut f = VarlinkFramer::new();
-        assert!(f.push_varlink_bytes(b"{\"reply\"").is_empty());
+        assert_eq!(f.push_varlink_bytes(b"{\"reply\""), Vec::<Vec<u8>>::new());
         f.detect_protocol_upgrade_request(b"{\"upgrade\":true}\0");
         assert_eq!(
             f.push_varlink_bytes(b":42}\0raw"),

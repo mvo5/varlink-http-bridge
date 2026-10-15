@@ -229,7 +229,7 @@ mod tests {
         client.shutdown().await.unwrap();
         let mut got = Vec::new();
         server.read_to_end(&mut got).await.unwrap();
-        assert!(got.is_empty());
+        assert_eq!(got, b"");
         server.shutdown().await.unwrap();
     }
 
