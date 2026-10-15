@@ -33,7 +33,7 @@ fn default_authorized_keys_path() -> String {
         .into_owned()
 }
 
-/// Write `text` as the authorized_keys at `out`. Mode 0644 because the
+/// Write `text` as the `authorized_keys` at `out`. Mode 0644 because the
 /// bridge can run as non-root.
 fn write_authorized_keys(out: &std::path::Path, text: &str) -> anyhow::Result<()> {
     let parent = out

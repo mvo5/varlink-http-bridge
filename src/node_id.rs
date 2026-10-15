@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 //! Handle the node-id for the varlink relayd tunnel. Uses the
-//! /etc/machine-id and sd_id128_get_machine_app_specific() to get
+//! /etc/machine-id and `sd_id128_get_machine_app_specific()` to get
 //! a per-machine stable node identifier (see `man machine-id`).
 
 use anyhow::{Context, bail};
