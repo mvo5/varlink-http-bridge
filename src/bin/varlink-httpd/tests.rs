@@ -2093,11 +2093,14 @@ fn test_unit_imports_every_mechanism_credential() {
         .map(|value| value.split_once(':').map_or(value, |(id, _alias)| id))
         .collect();
 
-    let mut looked_for: Vec<&str> = crate::auth_api_key::API_KEY_CREDENTIALS.to_vec();
     #[cfg(feature = "sshauth")]
-    {
-        looked_for.extend(crate::auth_ssh::SSH_AUTHORIZED_KEYS_CREDENTIALS);
-    }
+    let ssh_credentials = crate::auth_ssh::SSH_AUTHORIZED_KEYS_CREDENTIALS;
+    #[cfg(not(feature = "sshauth"))]
+    let ssh_credentials: &[&str] = &[];
+    let looked_for = crate::auth_api_key::API_KEY_CREDENTIALS
+        .iter()
+        .chain(ssh_credentials)
+        .copied();
     for pattern in looked_for {
         assert!(
             imported.contains(&pattern),
