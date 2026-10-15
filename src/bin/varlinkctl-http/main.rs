@@ -410,6 +410,7 @@ fn resp_body_text(resp: &tungstenite::http::Response<Option<Vec<u8>>>) -> Option
 /// Schemes are case-insensitive (RFC 3986 section 3.1), so `HTTPS://` has
 /// to count as TLS here too.
 /// <https://www.rfc-editor.org/rfc/rfc3986#section-3.1>
+#[cfg(feature = "sshauth")]
 fn url_is_tls(url: &str) -> bool {
     let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
     ["https", "wss", "vsock+tls"]
