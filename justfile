@@ -37,6 +37,8 @@ check: check_srv_binary_size check_helper_binary_size
 
 test:
 	cargo test --locked
+	# without default features so that cfg(not(feature)) tests run too
+	cargo test --no-default-features --locked
 
 # the httpd service
 srv_binary := "target/release/varlink-httpd"
