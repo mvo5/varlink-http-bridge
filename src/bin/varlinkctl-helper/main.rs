@@ -126,7 +126,7 @@ fn connect_ws(url: &str) -> Result<Ws> {
     let host = uri.host().context("URL has no host")?;
     let port = uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
 
-    let tcp = TcpStream::connect((host, port))
+    let tcp = varlink_http_bridge::mptcp::connect((host, port))
         .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
 
     let stream =

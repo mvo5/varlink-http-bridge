@@ -796,13 +796,13 @@ async fn main() -> anyhow::Result<()> {
 
     // run with e.g. "systemd-socket-activate -l 127.0.0.1:1031 -- varlink-http-bridge"
     let mut listenfd = ListenFd::from_env();
-    let listener = if let Some(std_listener) = listenfd.take_tcp_listener(0)? {
-        // needed or tokio panics, see https://github.com/mitsuhiko/listenfd/pull/23
-        std_listener.set_nonblocking(true)?;
-        TcpListener::from_std(std_listener)?
-    } else {
-        TcpListener::bind(&cli.bind).await?
+    let std_listener = match listenfd.take_tcp_listener(0)? {
+        Some(std_listener) => std_listener,
+        None => varlink_http_bridge::mptcp::bind(&cli.bind)?,
     };
+    // needed or tokio panics, see https://github.com/mitsuhiko/listenfd/pull/23
+    std_listener.set_nonblocking(true)?;
+    let listener = TcpListener::from_std(std_listener)?;
 
     let creds_dir = std::env::var_os("CREDENTIALS_DIRECTORY").map(std::path::PathBuf::from);
 
