@@ -24,11 +24,18 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::ws::drain;
 
-/// What a stream's CONNECT names. [`TunnelStream::server`] refuses any
-/// other request, so a relay and a node from different protocol
-/// generations fail at the first stream instead of talking past each
-/// other.
-pub const TUNNEL_PROTOCOL: &str = "varlink-tunnel-v1";
+// a macro so that the paths derived from it are built at compile time
+macro_rules! tunnel_protocol {
+    () => {
+        "varlink-tunnel-v1"
+    };
+}
+
+/// The tunnel protocol's name and version, which every stream's
+/// CONNECT names. [`TunnelStream::server`] refuses any other request,
+/// so a relay and a node from different protocol generations fail at
+/// the first stream instead of talking past each other.
+pub const TUNNEL_PROTOCOL: &str = tunnel_protocol!();
 
 /// Per-stream h2 receive window. It caps what one caller can push
 /// through a stream at roughly window/RTT. Measured copying 16MiB one
@@ -118,6 +125,10 @@ pub type ClientEnd<T> = (
     h2::client::SendRequest<Bytes>,
     h2::client::Connection<T, Bytes>,
 );
+
+/// The path on the relay a node dials to open its tunnel, named after
+/// [`TUNNEL_PROTOCOL`] so that the two ends agree on one version.
+pub const TUNNEL_PATH: &str = concat!("/", tunnel_protocol!());
 
 /// One h2 stream of a tunnel, carrying one caller, as a byte stream.
 /// The relay pipes the caller's TCP connection through it with
