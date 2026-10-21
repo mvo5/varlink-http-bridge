@@ -698,3 +698,23 @@ $ varlink-httpd gen-api-key --name=deploy-script api-keys
 vhb_9f8e7d6c5b4a...
 $ scp api-keys myhost:/etc/credstore/varlink-httpd.api-keys
 ```
+
+## Relay (experimental)
+
+`varlink-relayd` makes a `varlink-httpd` reachable when it runs behind
+NAT or a firewall that only lets outgoing connections through. The
+node dials out to the relay and keeps the connection open, callers
+then reach the node via `CONNECT <node-id>` to the relay. The relay
+only copies bytes, the TLS session is between the caller and the
+node's bridge.
+
+This component is experimental and subject to change without advance
+notice. It will be stabilized and given a backward-compatibility
+guarantee in a future release, but may also possibly be removed.
+
+```console
+$ varlink-relayd --insecure --cert relay.pem --key relay-key.pem
+```
+
+There is no node authentication yet, so `--insecure` is required and
+any node can claim any id.

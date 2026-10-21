@@ -29,7 +29,7 @@ install_config:
 build profile:
 	cargo build --profile {{profile}} --locked
 
-check: (check_binary_size srv_binary srv_max_size) (check_binary_size helper_binary helper_max_size)
+check: (check_binary_size srv_binary srv_max_size) (check_binary_size helper_binary helper_max_size) (check_binary_size relay_binary relay_max_size)
 	cargo fmt --check
 	cargo clippy --all-targets --locked -- -W clippy::pedantic -D warnings
 	# without default features we catch misplaced cfg(feature) attribute
@@ -50,6 +50,10 @@ srv_max_size := "4 * 1024 * 1024"
 helper_binary := "target/release/varlinkctl-http"
 helper_max_size := "2 * 1024 * 1024"
 
+# the relay for varlink-httpd nodes behind NAT
+relay_binary := "target/release/varlink-relayd"
+relay_max_size := "3 * 1024 * 1024"
+
 [script]
 check_binary_size binary max_size: (build "release")
 	max_size_kb="$(({{max_size}} / 1024 ))"
@@ -59,3 +63,7 @@ check_binary_size binary max_size: (build "release")
 	  echo "ERROR: release {{binary}} exceeds limit"
 	  exit 1
 	fi
+
+# not part of `just install`, a relay runs on its own host rather than on every node
+install_relay: (build "release")
+	install -Dm755 {{relay_binary}} {{destdir}}{{bindir}}/varlink-relayd
