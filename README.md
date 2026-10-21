@@ -718,3 +718,36 @@ $ varlink-relayd --insecure --cert relay.pem --key relay-key.pem
 
 There is no node authentication yet, so `--insecure` is required and
 any node can claim any id.
+
+A `varlink-httpd` dials out to the relay with `--relay=`. Its node id
+is derived from `/etc/machine-id` and shown at startup. TLS and auth
+work as usual, the caller's TLS session goes through the relay
+end-to-end. `--relay` is refused together with `--insecure` because
+the plain HTTP would be readable by the relay (and anyone claiming the
+node id).
+
+```console
+$ varlink-httpd --relay=wss://relay.example:2062 --auth=ssh
+Forwarding HTTPS relay wss://relay.example:2062 as node 8ee4ca1065ae4821b1038fe7b5fb2a9c -> Varlink: /run/varlink/registry
+```
+
+A second bridge on the same machine needs its own node id via
+`--instance=`, e.g. to make a single socket reachable without auth
+(see `--auth=none` above). `--bind=none` makes it reachable only via
+the relay:
+
+```console
+$ varlink-httpd --relay=wss://relay.example:2062 --instance=ping --bind=none \
+    --auth=none /run/varlink/registry/com.example.Ping
+Forwarding HTTPS relay wss://relay.example:2062 as node 5c0e2f7a9b1d4e638a2f6c4d9e0b7a13 -> Varlink: /run/varlink/registry/com.example.Ping
+```
+
+Callers use the relay as an HTTP proxy with `CONNECT`, so curl works
+with `-p -x`. The bridge's certificate is self-signed, so pin it with
+the `sha256//...` value the bridge prints at startup (`-k` skips the
+CA check, the pin is still enforced):
+
+```console
+$ curl -k --pinnedpubkey 'sha256//...' -p -x http://relay.example:2063 -X POST \
+    https://5c0e2f7a9b1d4e638a2f6c4d9e0b7a13/call/com.example.Ping.Ping -d '{}'
+```
