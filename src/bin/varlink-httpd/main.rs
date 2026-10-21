@@ -187,6 +187,17 @@ enum VarlinkSockets {
 }
 
 impl VarlinkSockets {
+    fn from_path(path: &str) -> anyhow::Result<Self> {
+        let metadata = std::fs::metadata(path).with_context(|| format!("failed to stat {path}"))?;
+        if metadata.is_dir() {
+            Self::from_socket_dir(path)
+        } else if metadata.file_type().is_socket() {
+            Self::from_socket(path)
+        } else {
+            bail!("path {path} is neither a directory nor a socket")
+        }
+    }
+
     fn from_socket_dir(dir_path: &str) -> anyhow::Result<Self> {
         let dir_file =
             std::fs::File::open(dir_path).with_context(|| format!("failed to open {dir_path}"))?;
@@ -1340,20 +1351,11 @@ async fn handle_ws(mut ws: WebSocket, unix: UnixStream) {
 }
 
 fn create_router(
-    varlink_sockets_path: &str,
+    varlink_sockets: VarlinkSockets,
     authenticators: Vec<Box<dyn Authenticator>>,
-) -> anyhow::Result<Router> {
-    let metadata = std::fs::metadata(varlink_sockets_path)
-        .with_context(|| format!("failed to stat {varlink_sockets_path}"))?;
-
+) -> Router {
     let shared_state = AppState {
-        varlink_sockets: Arc::new(if metadata.is_dir() {
-            VarlinkSockets::from_socket_dir(varlink_sockets_path)?
-        } else if metadata.file_type().is_socket() {
-            VarlinkSockets::from_socket(varlink_sockets_path)?
-        } else {
-            bail!("path {varlink_sockets_path} is neither a directory nor a socket");
-        }),
+        varlink_sockets: Arc::new(varlink_sockets),
         authenticators: Arc::new(authenticators),
     };
 
@@ -1380,12 +1382,10 @@ fn create_router(
         .with_state(shared_state.clone());
 
     // Health endpoint is always open (no auth)
-    let app = Router::new()
+    Router::new()
         .route("/health", get(|| async { StatusCode::OK }))
         .merge(api)
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024));
-
-    Ok(app)
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
 }
 
 async fn shutdown_signal() {
@@ -1496,10 +1496,10 @@ async fn serve_listener(
 async fn start_server(
     listener: Transport,
     tls_config: Option<TlsConfig>,
-    varlink_sockets_path: &str,
+    varlink_sockets: VarlinkSockets,
     authenticators: Vec<Box<dyn Authenticator>>,
 ) -> anyhow::Result<()> {
-    let app = create_router(varlink_sockets_path, authenticators)?;
+    let app = create_router(varlink_sockets, authenticators);
     serve_listener(listener, tls_config, app).await
 }
 
@@ -1625,7 +1625,10 @@ fn print_help() {
           --auth=MECHANISMS                 comma-separated per-request authentication
                                             ({auth}); required unless --insecure.
                                             mTLS is enabled separately and applies
-                                            on top of whatever is selected here
+                                            on top of whatever is selected here.
+                                            none needs mTLS or a single socket
+                                            as VARLINK_SOCKETS_PATH (absolute
+                                            path, no symlinks)
           --cert=PATH                       TLS certificate PEM file
                                             (default: self-signed, generated
                                             and persisted on first start)
@@ -1952,6 +1955,44 @@ fn unread_credentials_warning(creds: &CredentialsLoader, cli: &BridgeCli) -> Opt
     ))
 }
 
+/// What makes serving without per-request authentication acceptable.
+#[derive(Clone, Debug)]
+enum AuthNoneAllowedBecause {
+    Insecure,
+    /// the client is authenticated by mTLS instead
+    Mtls,
+    /// only this one socket is served, by its real path (no symlinks).
+    /// Whoever can write to its directory decides what is reachable
+    /// without auth, so that directory must be trusted (e.g. root-owned)
+    Socket(std::path::PathBuf),
+}
+
+impl AuthNoneAllowedBecause {
+    /// `sockets` must be the ones served, so that the check below and the
+    /// service share one open directory
+    fn new(cli: &BridgeCli, sockets: &VarlinkSockets) -> Option<Self> {
+        if cli.insecure {
+            Some(Self::Insecure)
+        } else if cli.require_mtls {
+            Some(Self::Mtls)
+        } else {
+            let VarlinkSockets::SingleSocket { dirfd, name } = sockets else {
+                return None;
+            };
+            let path = std::path::Path::new(&cli.varlink_sockets_path);
+            let dir = format!("/proc/self/fd/{}", dirfd.as_raw_fd());
+            // the kernel reports the real path of the open directory, so a
+            // symlink in any component (which could later point elsewhere)
+            // makes it differ from the path given
+            let is_plain_socket = std::fs::read_link(&dir)
+                .is_ok_and(|real| Some(real.as_path()) == path.parent())
+                && std::fs::symlink_metadata(format!("{dir}/{name}"))
+                    .is_ok_and(|m| m.file_type().is_socket());
+            is_plain_socket.then(|| Self::Socket(path.to_path_buf()))
+        }
+    }
+}
+
 /// The middleware accepts a request as soon as one of these accepts it, so an
 /// empty list rejects everything.
 ///
@@ -1960,8 +2001,7 @@ fn unread_credentials_warning(creds: &CredentialsLoader, cli: &BridgeCli) -> Opt
 #[cfg_attr(not(feature = "sshauth"), allow(unused_variables))]
 fn build_authenticators(
     auth: &[AuthMechanism],
-    insecure: bool,
-    require_mtls: bool,
+    auth_none_allowed_because: Option<&AuthNoneAllowedBecause>,
     authorized_keys: Option<&std::path::Path>,
     api_keys: Option<&std::path::Path>,
     creds: Option<&CredentialsLoader>,
@@ -1987,23 +2027,26 @@ fn build_authenticators(
                      /etc/varlink-httpd/api-keys (see gen-api-key)",
                 )?,
             )),
-            AuthMechanism::None if insecure => {
-                warn!("running without authentication");
-                authenticators.push(Box::new(AllowAllAuthenticator {
-                    reason: "--insecure",
-                }));
-            }
-            // Every other way of having no per-request mechanism needs mTLS to
-            // carry the authentication, so refuse to serve without it.
-            AuthMechanism::None if require_mtls => {
-                authenticators.push(Box::new(AllowAllAuthenticator {
-                    reason: "--auth=none, client verified at TLS layer",
-                }));
-            }
             AuthMechanism::None => {
-                bail!(
-                    "--auth=none needs mTLS (--require-mtls) to authenticate clients, or --insecure"
-                );
+                let reason = match auth_none_allowed_because {
+                    Some(AuthNoneAllowedBecause::Insecure) => {
+                        warn!("running without authentication");
+                        "--insecure"
+                    }
+                    Some(AuthNoneAllowedBecause::Mtls) => {
+                        "--auth=none, client verified at TLS layer"
+                    }
+                    Some(AuthNoneAllowedBecause::Socket(socket)) => {
+                        warn!("running without authentication for {}", socket.display());
+                        "--auth=none for a single socket"
+                    }
+                    None => bail!(
+                        "--auth=none needs mTLS (--require-mtls) to authenticate clients, \
+                         a single socket (absolute path, no directory, no symlinks) as \
+                         VARLINK_SOCKETS_PATH, or --insecure"
+                    ),
+                };
+                authenticators.push(Box::new(AllowAllAuthenticator { reason }));
             }
         }
     }
@@ -2033,10 +2076,10 @@ async fn main() -> anyhow::Result<()> {
         warn!("{warning}");
     }
 
+    let varlink_sockets = VarlinkSockets::from_path(&cli.varlink_sockets_path)?;
     let authenticators = build_authenticators(
         &cli.auth,
-        cli.insecure,
-        cli.require_mtls,
+        AuthNoneAllowedBecause::new(&cli, &varlink_sockets).as_ref(),
         cli.authorized_keys.as_deref(),
         cli.api_keys.as_deref(),
         creds.as_ref(),
@@ -2060,7 +2103,7 @@ async fn main() -> anyhow::Result<()> {
         "HTTP"
     };
 
-    let app = create_router(&cli.varlink_sockets_path, authenticators)?;
+    let app = create_router(varlink_sockets, authenticators);
 
     // Socket activation: consume all activated fds, or fall back to explicit --bind
     // run with e.g. "systemd-socket-activate -l 127.0.0.1:1031 -- varlink-httpd"

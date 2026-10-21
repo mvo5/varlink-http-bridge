@@ -158,6 +158,10 @@ fn expected_kernel_release() -> String {
         .to_string()
 }
 
+fn varlink_sockets_at(path: &str) -> VarlinkSockets {
+    VarlinkSockets::from_path(path).expect("varlink sockets")
+}
+
 async fn run_test_server(varlink_sockets_path: &str) -> TestServer<std::net::SocketAddr> {
     run_test_server_with_auth(
         varlink_sockets_path,
@@ -186,7 +190,7 @@ async fn run_test_server_with_auth(
         start_server(
             Transport::Tcp(listener),
             None,
-            &varlink_sockets_path,
+            varlink_sockets_at(&varlink_sockets_path),
             authenticators,
         )
         .await
@@ -558,26 +562,14 @@ async fn test_health_endpoint() {
     assert_eq!(res.status(), 200);
 }
 
-#[tokio::test]
-async fn test_varlink_sockets_dir_or_file_missing() {
-    let varlink_sockets_dir_or_file = "/does-not-exist".to_string();
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind to random port failed");
-    let res = start_server(
-        Transport::Tcp(listener),
-        None,
-        &varlink_sockets_dir_or_file,
-        Vec::new(),
-    )
-    .await;
-
-    assert!(res.is_err());
+#[test]
+fn test_varlink_sockets_dir_or_file_missing() {
+    let Err(err) = VarlinkSockets::from_path("/does-not-exist") else {
+        panic!("a missing path must be refused");
+    };
     assert!(
-        res.unwrap_err()
-            .to_string()
-            .contains("failed to stat /does-not-exist"),
+        err.to_string().contains("failed to stat /does-not-exist"),
+        "{err}"
     );
 }
 
@@ -1236,7 +1228,7 @@ async fn run_test_tls_server_with_auth(
         start_server(
             Transport::Tcp(listener),
             Some(tls_config),
-            &varlink_sockets_path,
+            varlink_sockets_at(&varlink_sockets_path),
             authenticators,
         )
         .await
@@ -1810,7 +1802,7 @@ fn run_test_vsock_server(varlink_sockets_path: &str) -> TestServer<u32> {
         start_server(
             Transport::Vsock(listener),
             None,
-            &varlink_sockets_path,
+            varlink_sockets_at(&varlink_sockets_path),
             Vec::new(),
         )
         .await
@@ -2114,11 +2106,10 @@ fn test_unit_imports_every_mechanism_credential() {
 /// Every `build_authenticators()` case, with `/` never touched.
 fn build_authenticators_in(
     auth: &[AuthMechanism],
-    insecure: bool,
-    require_mtls: bool,
+    auth_none_allowed_because: Option<&AuthNoneAllowedBecause>,
     etc_root: &std::path::Path,
 ) -> anyhow::Result<Vec<Box<dyn Authenticator>>> {
-    crate::build_authenticators(auth, insecure, require_mtls, None, None, None, etc_root)
+    crate::build_authenticators(auth, auth_none_allowed_because, None, None, None, etc_root)
 }
 
 #[test]
@@ -2146,8 +2137,7 @@ fn test_parse_auth_rejects_none_combined_with_mechanism() {
 #[test]
 fn test_build_authenticators_none_without_mtls_is_rejected() {
     let root = tempfile::tempdir().unwrap();
-    let Err(err) = build_authenticators_in(&[AuthMechanism::None], false, false, root.path())
-    else {
+    let Err(err) = build_authenticators_in(&[AuthMechanism::None], None, root.path()) else {
         panic!("--auth=none without mTLS must not produce an authenticator");
     };
     assert!(err.to_string().contains("--auth=none needs mTLS"), "{err}");
@@ -2156,15 +2146,92 @@ fn test_build_authenticators_none_without_mtls_is_rejected() {
 #[test]
 fn test_build_authenticators_none_with_mtls_accepts() {
     let root = tempfile::tempdir().unwrap();
-    let auths = build_authenticators_in(&[AuthMechanism::None], false, true, root.path()).unwrap();
+    let auths = build_authenticators_in(
+        &[AuthMechanism::None],
+        Some(&AuthNoneAllowedBecause::Mtls),
+        root.path(),
+    )
+    .unwrap();
     assert_eq!(auths.len(), 1);
     check_request(auths[0].as_ref(), "GET", "/health", None, None, None).unwrap();
 }
 
 #[test]
+fn test_build_authenticators_none_for_single_socket_accepts() {
+    let root = tempfile::tempdir().unwrap();
+    let auths = build_authenticators_in(
+        &[AuthMechanism::None],
+        Some(&AuthNoneAllowedBecause::Socket(
+            "/run/varlink/registry/a.b.C".into(),
+        )),
+        root.path(),
+    )
+    .unwrap();
+    assert_eq!(auths.len(), 1);
+    check_request(auths[0].as_ref(), "POST", "/call/a.b.C", None, None, None).unwrap();
+}
+
+#[test]
+fn test_auth_none_allowed_because() {
+    let none = [AuthMechanism::None];
+    let tmp = tempfile::tempdir().unwrap();
+    // the tempdir itself may sit behind a symlink (e.g. /tmp on some systems)
+    let dir = std::fs::canonicalize(tmp.path()).unwrap().join("real");
+    std::fs::create_dir(&dir).unwrap();
+    let socket = dir.join("a.b.C");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let cli_for = |insecure: bool, require_mtls: bool, path: &std::path::Path| crate::BridgeCli {
+        varlink_sockets_path: path.to_str().unwrap().to_string(),
+        ..cli_looking_up_credentials(insecure, require_mtls, &none, None)
+    };
+    let allowed = |cli: &crate::BridgeCli| {
+        let sockets = VarlinkSockets::from_path(&cli.varlink_sockets_path).ok()?;
+        AuthNoneAllowedBecause::new(cli, &sockets)
+    };
+
+    assert!(matches!(
+        allowed(&cli_for(true, false, &dir)),
+        Some(AuthNoneAllowedBecause::Insecure)
+    ));
+    assert!(matches!(
+        allowed(&cli_for(false, true, &dir)),
+        Some(AuthNoneAllowedBecause::Mtls)
+    ));
+    assert!(allowed(&cli_for(false, false, &dir)).is_none());
+
+    let Some(AuthNoneAllowedBecause::Socket(path)) = allowed(&cli_for(false, false, &socket))
+    else {
+        panic!("a single socket allows --auth=none");
+    };
+    assert_eq!(path, socket);
+
+    let link_to_socket = dir.join("io.example.Link");
+    std::os::unix::fs::symlink(&socket, &link_to_socket).unwrap();
+    let link_to_dir = dir.parent().unwrap().join("link");
+    std::os::unix::fs::symlink(&dir, &link_to_dir).unwrap();
+    for refused in [
+        link_to_socket,
+        link_to_dir.join("a.b.C"),
+        dir.join("../real/a.b.C"),
+        std::path::PathBuf::from("a.b.C"),
+    ] {
+        assert!(
+            allowed(&cli_for(false, false, &refused)).is_none(),
+            "{} must not allow --auth=none",
+            refused.display()
+        );
+    }
+}
+
+#[test]
 fn test_build_authenticators_insecure_accepts() {
     let root = tempfile::tempdir().unwrap();
-    let auths = build_authenticators_in(&[AuthMechanism::None], true, false, root.path()).unwrap();
+    let auths = build_authenticators_in(
+        &[AuthMechanism::None],
+        Some(&AuthNoneAllowedBecause::Insecure),
+        root.path(),
+    )
+    .unwrap();
     assert_eq!(auths.len(), 1);
     check_request(auths[0].as_ref(), "GET", "/health", None, None, None).unwrap();
 }
@@ -2175,7 +2242,7 @@ fn test_build_authenticators_insecure_accepts() {
 #[test]
 fn test_build_authenticators_ssh_without_keys_rejects() {
     let root = tempfile::tempdir().unwrap();
-    let auths = build_authenticators_in(&[AuthMechanism::Ssh], false, false, root.path()).unwrap();
+    let auths = build_authenticators_in(&[AuthMechanism::Ssh], None, root.path()).unwrap();
     assert_eq!(auths.len(), 1);
     assert!(check_request(auths[0].as_ref(), "GET", "/health", None, None, None).is_err());
 }
@@ -2287,7 +2354,10 @@ mod sshauth_tests {
         let tmpdir = tempfile::tempdir().unwrap();
         // Keep tmpdir so it lives for the test duration (but gets cleaned up eventually)
         let path = tmpdir.keep();
-        create_router(path.to_str().unwrap(), authenticators).unwrap()
+        create_router(
+            VarlinkSockets::from_path(path.to_str().unwrap()).unwrap(),
+            authenticators,
+        )
     }
 
     #[test]
@@ -3660,7 +3730,10 @@ mod apikey_tests {
     fn make_api_key_test_router(authenticators: Vec<Box<dyn Authenticator>>) -> Router {
         let tmpdir = tempfile::tempdir().unwrap();
         let path = tmpdir.keep();
-        create_router(path.to_str().unwrap(), authenticators).unwrap()
+        create_router(
+            VarlinkSockets::from_path(path.to_str().unwrap()).unwrap(),
+            authenticators,
+        )
     }
 
     #[test]
