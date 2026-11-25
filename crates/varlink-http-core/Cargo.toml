@@ -6,8 +6,13 @@ license = "LGPL-2.1-or-later"
 description = "What the varlink-http-bridge daemons and their client share: the WebSocket byte stream, TLS channel binding, sshauth tokens and secret file checks"
 
 [features]
-default = ["sshauth"]
+default = ["sshauth", "tls-openssl"]
 sshauth = ["dep:sshauth"]
+# The TLS library behind the tls module. One of the two is needed and
+# tls-rustls wins if both are on. openssl is the default because it keeps
+# the binaries small, rustls adds ~1.5MB to each of them.
+tls-openssl = ["dep:openssl", "dep:tokio-openssl"]
+tls-rustls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-native-certs", "dep:webpki", "dep:ring", "dep:subtle", "dep:x509-cert"]
 # never enable directly: pulled in via the dev-dependency so that
 # test-only constructors exist in test builds but not in release builds
 test-helpers = []
@@ -21,11 +26,17 @@ futures-util = { version = "0.3", features = ["sink"] }
 bytes = "1"
 rustix = { version = "1.0", features = ["process"] }
 socket2 = "0.6"
-# using openssl here to keep size small, rusttls adds ~1.8MB binary size
-# and nativetls does not support mTLS
+# not native-tls as it does not support mTLS
 # 0.10.81: Asn1StringRef::to_string (tls::Certificate::subject)
-openssl = "0.10.81"
-tokio-openssl = "0.6"
+openssl = { version = "0.10.81", optional = true }
+tokio-openssl = { version = "0.6", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring"] }
+rustls-native-certs = { version = "0.8", optional = true }
+webpki = { package = "rustls-webpki", version = "0.103", optional = true, default-features = false, features = ["ring", "std"] }
+ring = { version = "0.17", optional = true }
+subtle = { version = "2", optional = true }
+x509-cert = { version = "0.2", optional = true, default-features = false }
 data-encoding = "2"
 sshauth = { workspace = true, optional = true }
 

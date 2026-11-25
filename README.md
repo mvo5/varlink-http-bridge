@@ -295,6 +295,16 @@ After installation, enable with:
 # systemctl enable --now varlink-httpd.socket varlink-httpd-vsock.socket
 ```
 
+## Building without OpenSSL
+
+OpenSSL is the default TLS library. To build without it the
+`tls-rustls` feature uses [rustls](https://github.com/rustls/rustls)
+instead, at the cost of about 1.5MB per binary:
+
+```console
+$ cargo build --release --no-default-features --features tls-rustls,sshauth
+```
+
 ## Authentication
 
 Since `varlink-httpd` runs as root, allows connections over the

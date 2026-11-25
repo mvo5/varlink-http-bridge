@@ -48,6 +48,7 @@ fn default_sans() -> Vec<String> {
 
 /// Generates a P-256 key and a self-signed certificate for `sans`, returned
 /// as `(certificate, key)` in PEM, the key as PKCS#8.
+#[cfg(not(feature = "tls-rustls"))]
 fn generate_self_signed(sans: &[String]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     use openssl::asn1::Asn1Time;
     use openssl::bn::{BigNum, MsbOption};
@@ -113,6 +114,38 @@ fn generate_self_signed(sans: &[String]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
         key.private_key_to_pem_pkcs8()
             .context("encoding private key")?,
     ))
+}
+
+/// Generates a P-256 key and a self-signed certificate for `sans`, returned
+/// as `(certificate, key)` in PEM, the key as PKCS#8.
+#[cfg(feature = "tls-rustls")]
+fn generate_self_signed(sans: &[String]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    use rcgen::{DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
+
+    // P-256 rather than Ed25519: the certificate has to be accepted by
+    // whatever HTTP client a user reaches for, and ECDSA support is
+    // universal where Ed25519 certificate support still is not.
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .context("generating P-256 key")?;
+
+    let mut params =
+        rcgen::CertificateParams::new(sans.to_vec()).context("setting the certificate names")?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "varlink-httpd");
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now;
+    params.not_after = now + time::Duration::days(i64::from(VALIDITY_DAYS));
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+
+    let cert = params.self_signed(&key).context("signing certificate")?;
+    Ok((cert.pem().into_bytes(), key.serialize_pem().into_bytes()))
 }
 
 pub(crate) fn state_dir() -> anyhow::Result<PathBuf> {
@@ -274,6 +307,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "tls-rustls"))]
     #[test]
     fn cert_carries_the_loopback_sans() {
         use openssl::x509::X509;

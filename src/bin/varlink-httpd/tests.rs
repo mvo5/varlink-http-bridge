@@ -2,6 +2,7 @@
 
 use super::*;
 use futures_util::{SinkExt, StreamExt};
+#[cfg(not(feature = "tls-rustls"))]
 use reqwest::Client;
 use std::os::fd::OwnedFd;
 use tokio::task::JoinSet;
@@ -1203,6 +1204,36 @@ fn make_test_pki() -> TestPki {
     }
 }
 
+/// Stands in for `reqwest::Client`, which with rustls panics unless a
+/// crypto provider was installed first.
+#[cfg(feature = "tls-rustls")]
+struct Client;
+
+#[cfg(feature = "tls-rustls")]
+impl Client {
+    #[allow(clippy::new_ret_no_self)]
+    fn new() -> reqwest::Client {
+        Self::builder().build().unwrap()
+    }
+
+    fn builder() -> reqwest::ClientBuilder {
+        tls::install_default_provider();
+        reqwest::Client::builder()
+    }
+}
+
+/// The client certificate of `pki` in the form the TLS backend of
+/// reqwest takes it.
+fn client_identity(pki: &TestPki) -> reqwest::Identity {
+    #[cfg(feature = "tls-rustls")]
+    return reqwest::Identity::from_pem(
+        &[&pki.client_key_pem[..], &pki.client_cert_pem[..]].concat(),
+    )
+    .unwrap();
+    #[cfg(not(feature = "tls-rustls"))]
+    return reqwest::Identity::from_pkcs8_pem(&pki.client_cert_pem, &pki.client_key_pem).unwrap();
+}
+
 async fn run_test_tls_server(
     varlink_sockets_path: &str,
     tls_config: TlsConfig,
@@ -1310,8 +1341,7 @@ async fn test_mtls_accepts_client_cert_and_rejects_without() {
 
     // With a valid client certificate the request succeeds
     let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();
-    let identity =
-        reqwest::Identity::from_pkcs8_pem(&pki.client_cert_pem, &pki.client_key_pem).unwrap();
+    let identity = client_identity(&pki);
     let client_with_cert = Client::builder()
         .add_root_certificate(ca_cert)
         .identity(identity)
@@ -1444,10 +1474,7 @@ async fn test_mtls_trust_reloads_when_ca_appears_and_vanishes() {
     let client = || {
         Client::builder()
             .add_root_certificate(reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap())
-            .identity(
-                reqwest::Identity::from_pkcs8_pem(&pki.client_cert_pem, &pki.client_key_pem)
-                    .unwrap(),
-            )
+            .identity(client_identity(&pki))
             .resolve("localhost", server.addr)
             .build()
             .unwrap()
@@ -1496,10 +1523,7 @@ async fn test_mtls_without_ca_rejects_every_client() {
         ("no client cert", None),
         (
             "a client cert signed by the CA we have not been given",
-            Some(
-                reqwest::Identity::from_pkcs8_pem(&pki.client_cert_pem, &pki.client_key_pem)
-                    .unwrap(),
-            ),
+            Some(client_identity(&pki)),
         ),
     ] {
         let ca_cert = reqwest::Certificate::from_pem(&pki.ca_cert_pem).unwrap();

@@ -33,12 +33,14 @@ check: (check_binary_size srv_binary srv_max_size) (check_binary_size helper_bin
 	cargo fmt --check
 	cargo clippy --all-targets --locked -- -W clippy::pedantic -D warnings
 	# without default features we catch misplaced cfg(feature) attribute
-	cargo clippy --all-targets --no-default-features --locked -- -W clippy::pedantic -D warnings
+	cargo clippy --all-targets --no-default-features --features tls-openssl --locked -- -W clippy::pedantic -D warnings
+	cargo clippy --all-targets --no-default-features --features tls-rustls,sshauth --locked -- -W clippy::pedantic -D warnings
 
 test:
 	cargo test --workspace --locked
 	# without default features so that cfg(not(feature)) tests run too
-	cargo test --workspace --no-default-features --features ssh-key-import/native-tls --locked
+	cargo test --workspace --no-default-features --features tls-openssl,ssh-key-import/native-tls --locked
+	cargo test --workspace --no-default-features --features tls-rustls,sshauth --locked
 
 # the httpd service
 srv_binary := "target/release/varlink-httpd"

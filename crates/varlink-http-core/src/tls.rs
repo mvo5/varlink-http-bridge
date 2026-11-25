@@ -2,12 +2,24 @@
 
 //! Abstracts TLS and the crypto primitives we need.
 
-mod openssl;
+#[cfg(feature = "tls-rustls")]
+#[path = "tls/rustls.rs"]
+mod imp;
 
-pub use self::openssl::{
+#[cfg(all(feature = "tls-openssl", not(feature = "tls-rustls")))]
+#[path = "tls/openssl.rs"]
+mod imp;
+
+#[cfg(not(any(feature = "tls-openssl", feature = "tls-rustls")))]
+compile_error!("enable one of the features `tls-openssl` or `tls-rustls`");
+
+pub use imp::{
     Acceptor, Certificate, Connector, Stream, channel_binding, constant_time_eq, hmac_sha256,
     peer_certificate, random_bytes, sha256,
 };
+
+#[cfg(all(feature = "tls-rustls", any(test, feature = "test-helpers")))]
+pub use imp::install_default_provider;
 
 /// Who may vouch for a server certificate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
