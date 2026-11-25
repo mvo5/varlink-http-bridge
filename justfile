@@ -38,7 +38,7 @@ check: (check_binary_size srv_binary srv_max_size) (check_binary_size helper_bin
 test:
 	cargo test --workspace --locked
 	# without default features so that cfg(not(feature)) tests run too
-	cargo test --workspace --no-default-features --locked
+	cargo test --workspace --no-default-features --features ssh-key-import/native-tls --locked
 
 # the httpd service
 srv_binary := "target/release/varlink-httpd"

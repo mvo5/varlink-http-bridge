@@ -56,6 +56,13 @@ pub fn fetch(source: &str) -> anyhow::Result<AuthorizedKeys> {
 /// Fetch and validate the authorized keys at `url`, without the checks
 /// of [`resolve_key_url`].
 fn fetch_url(url: &str) -> anyhow::Result<AuthorizedKeys> {
+    #[cfg(feature = "rustls")]
+    let tls = ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::Rustls)
+        // the system CA store rather than the bundled Mozilla roots
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build();
+    #[cfg(not(feature = "rustls"))]
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::NativeTls)
         .build();

@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 license = "LGPL-2.1-or-later"
 
+[features]
+default = ["native-tls"]
+native-tls = ["ureq/native-tls"]
+rustls = ["ureq/rustls", "ureq/platform-verifier"]
+
 [dependencies]
 anyhow = "1.0.100"
 ed25519-dalek = { version = "2", default-features = false, features = ["pem", "zeroize"] }
@@ -11,4 +16,4 @@ p256 = { version = "0.13", default-features = false, features = ["arithmetic", "
 ssh-key = { version = "0.6", features = ["ed25519", "p256"] }
 sshauth = { workspace = true }
 tempfile = "3.27"
-ureq = { version = "3", default-features = false, features = ["native-tls"] }
+ureq = { version = "3", default-features = false }
