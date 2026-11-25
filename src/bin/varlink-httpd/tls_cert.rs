@@ -13,16 +13,6 @@
 //! key keeps every existing pin valid.
 
 use anyhow::{Context, bail};
-use openssl::asn1::Asn1Time;
-use openssl::bn::{BigNum, MsbOption};
-use openssl::ec::{EcGroup, EcKey};
-use openssl::hash::MessageDigest;
-use openssl::nid::Nid;
-use openssl::pkey::{PKey, Private};
-use openssl::x509::extension::{
-    BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
-};
-use openssl::x509::{X509, X509NameBuilder};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -31,15 +21,6 @@ use varlink_http_bridge::tls;
 
 /// Ten years. A self-signed certificate has no revocation story.
 const VALIDITY_DAYS: u32 = 3650;
-
-/// P-256 rather than Ed25519: the certificate has to be accepted by whatever
-/// HTTP client a user reaches for, and ECDSA support is universal where
-/// Ed25519 certificate support still is not.
-fn generate_keypair() -> anyhow::Result<PKey<Private>> {
-    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).context("selecting P-256 curve")?;
-    let ec = EcKey::generate(&group).context("generating P-256 key")?;
-    PKey::from_ec_key(ec).context("wrapping EC key")
-}
 
 /// Names this host is likely to be reached by.
 ///
@@ -65,7 +46,27 @@ fn default_sans() -> Vec<String> {
     sans
 }
 
-fn build_self_signed(key: &PKey<Private>, sans: &[String]) -> anyhow::Result<X509> {
+/// Generates a P-256 key and a self-signed certificate for `sans`, returned
+/// as `(certificate, key)` in PEM, the key as PKCS#8.
+fn generate_self_signed(sans: &[String]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    use openssl::asn1::Asn1Time;
+    use openssl::bn::{BigNum, MsbOption};
+    use openssl::ec::{EcGroup, EcKey};
+    use openssl::hash::MessageDigest;
+    use openssl::nid::Nid;
+    use openssl::pkey::PKey;
+    use openssl::x509::extension::{
+        BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
+    };
+    use openssl::x509::{X509, X509NameBuilder};
+
+    // P-256 rather than Ed25519: the certificate has to be accepted by
+    // whatever HTTP client a user reaches for, and ECDSA support is
+    // universal where Ed25519 certificate support still is not.
+    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).context("selecting P-256 curve")?;
+    let ec = EcKey::generate(&group).context("generating P-256 key")?;
+    let key = PKey::from_ec_key(ec).context("wrapping EC key")?;
+
     let mut name = X509NameBuilder::new()?;
     name.append_entry_by_nid(Nid::COMMONNAME, "varlink-httpd")?;
     let name = name.build();
@@ -74,7 +75,7 @@ fn build_self_signed(key: &PKey<Private>, sans: &[String]) -> anyhow::Result<X50
     builder.set_version(2)?; // X.509 v3
     builder.set_subject_name(&name)?;
     builder.set_issuer_name(&name)?;
-    builder.set_pubkey(key)?;
+    builder.set_pubkey(&key)?;
     let not_before = Asn1Time::days_from_now(0)?;
     let not_after = Asn1Time::days_from_now(VALIDITY_DAYS)?;
     builder.set_not_before(&not_before)?;
@@ -106,8 +107,12 @@ fn build_self_signed(key: &PKey<Private>, sans: &[String]) -> anyhow::Result<X50
     let ctx = builder.x509v3_context(None, None);
     builder.append_extension(san.build(&ctx)?)?;
 
-    builder.sign(key, MessageDigest::sha256())?;
-    Ok(builder.build())
+    builder.sign(&key, MessageDigest::sha256())?;
+    Ok((
+        builder.build().to_pem().context("encoding certificate")?,
+        key.private_key_to_pem_pkcs8()
+            .context("encoding private key")?,
+    ))
 }
 
 pub(crate) fn state_dir() -> anyhow::Result<PathBuf> {
@@ -163,20 +168,10 @@ pub(crate) fn load_or_generate(dir: &Path) -> anyhow::Result<(PathBuf, PathBuf)>
     }
 
     let sans = default_sans();
-    let key = generate_keypair()?;
-    let cert = build_self_signed(&key, &sans)?;
+    let (cert, key) = generate_self_signed(&sans)?;
 
-    write_private(
-        &key_path,
-        &key.private_key_to_pem_pkcs8()
-            .context("encoding private key")?,
-        0o600,
-    )?;
-    write_private(
-        &cert_path,
-        &cert.to_pem().context("encoding certificate")?,
-        0o644,
-    )?;
+    write_private(&key_path, &key, 0o600)?;
+    write_private(&cert_path, &cert, 0o644)?;
 
     eprintln!(
         "TLS: generated self-signed certificate {} (SAN: {})",
@@ -281,6 +276,8 @@ mod tests {
 
     #[test]
     fn cert_carries_the_loopback_sans() {
+        use openssl::x509::X509;
+
         let dir = tmpdir();
         let (cert_path, _) = load_or_generate(dir.path()).unwrap();
         let cert = X509::from_pem(&std::fs::read(cert_path).unwrap()).unwrap();
